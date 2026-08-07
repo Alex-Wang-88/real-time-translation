@@ -11,28 +11,46 @@ _ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
 _HEBREW_RE = re.compile(r"[\u0590-\u05ff]")
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097f]")
 _BENGALI_RE = re.compile(r"[\u0980-\u09ff]")
+_GURMUKHI_RE = re.compile(r"[\u0a00-\u0a7f]")
+_GUJARATI_RE = re.compile(r"[\u0a80-\u0aff]")
+_TAMIL_RE = re.compile(r"[\u0b80-\u0bff]")
+_TELUGU_RE = re.compile(r"[\u0c00-\u0c7f]")
+_KANNADA_RE = re.compile(r"[\u0c80-\u0cff]")
+_MALAYALAM_RE = re.compile(r"[\u0d00-\u0d7f]")
+_SINHALA_RE = re.compile(r"[\u0d80-\u0dff]")
 _THAI_RE = re.compile(r"[\u0e00-\u0e7f]")
+_LAO_RE = re.compile(r"[\u0e80-\u0eff]")
+_TIBETAN_RE = re.compile(r"[\u0f00-\u0fff]")
+_MYANMAR_RE = re.compile(r"[\u1000-\u109f]")
 _HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
 _HIRAGANA_KATAKANA_RE = re.compile(r"[\u3040-\u30ff]")
 _GREEK_RE = re.compile(r"[\u0370-\u03ff]")
+_ARMENIAN_RE = re.compile(r"[\u0530-\u058f]")
+_GEORGIAN_RE = re.compile(r"[\u10a0-\u10ff]")
+_ETHIOPIC_RE = re.compile(r"[\u1200-\u137f]")
+_KHMER_RE = re.compile(r"[\u1780-\u17ff]")
+_MONGOLIAN_RE = re.compile(r"[\u1800-\u18af]")
 _GERMAN_MARKERS = re.compile(
     r"[äöüßÄÖÜ]|\b(?:und|aber|nicht|ist|sind|wir|ich|das|der|die|ein|eine|mit|für|auf|auch|dass|haben|wird|egal|morgen|danke|guten|müssen|hallo|bitte|ja|nein|heute|treffen|bereit|willkommen|vielen)\b",
     re.I,
 )
 _ENGLISH_MARKERS = re.compile(
-    r"\b(?:and|but|not|is|are|we|i|the|a|an|with|for|on|also|that|have|will|hello|good|morning|thanks|thank|please|yes|no|today|meeting|ready|everyone|welcome|you|your|this|there|can|could|would)\b",
+    r"\b(?:and|but|not|is|are|we|i|it|the|a|an|with|for|on|also|that|have|will|hello|good|morning|thanks|thank|please|yes|no|today|meeting|ready|everyone|welcome|you|your|this|there|can|could|would|very|easy|to|sell)\b",
     re.I,
 )
-_WORD_RE = re.compile(r"[A-Za-zÄÖÜäöüß]+")
+# Include common Latin extension blocks so accents are not discarded before
+# text-level language detection.
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]+")
 _GERMAN_WORDS = frozenset(
     "und aber nicht ist sind wir ich das der die ein eine mit für auf auch dass haben wird "
-    "egal morgen danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank"
+    "egal morgen danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
+    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen"
     .casefold()
     .split()
 )
 _ENGLISH_WORDS = frozenset(
-    "and but not is are we the an with for on also that have will hello good morning thanks thank "
-    "please yes no today meeting ready everyone welcome you your this there can could would"
+    "and but not is are we i it the an with for on also that have will hello good morning thanks thank "
+    "please yes no today meeting ready everyone welcome you your this there can could would very easy to sell"
     .casefold()
     .split()
 )
@@ -54,7 +72,8 @@ _ENGLISH_SWITCH_WORDS = frozenset(
 )
 _GERMAN_HINT_WORDS = frozenset(
     "aber nicht sind wir ich das der die ein eine mit für auf auch dass haben wird egal morgen "
-    "danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank"
+    "danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
+    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen"
     .casefold()
     .split()
 )
@@ -80,7 +99,34 @@ _ITALIAN_WORDS = frozenset(
     .split()
 )
 _FRENCH_WORDS = frozenset(
-    "bonjour merci vous nous avec pour les une cette pourquoi"
+    "bonjour merci vous nous avec pour les une cette pourquoi comment allez "
+    "être suis sont dans des qui que quoi mais oui non aujourd'hui"
+    .casefold()
+    .split()
+)
+_DUTCH_WORDS = frozenset(
+    "hallo goedemorgen dank bedankt en niet een het de van voor met wij zijn "
+    "morgen vandaag hoe gaat u jullie"
+    .casefold()
+    .split()
+)
+_SWEDISH_WORDS = frozenset(
+    "hej tack god morgon och inte det den en ett vi är jag du hur mår idag"
+    .casefold()
+    .split()
+)
+_DANISH_WORDS = frozenset(
+    "hej tak godmorgen og ikke det den en et vi er jeg du hvordan i dag"
+    .casefold()
+    .split()
+)
+_NORWEGIAN_WORDS = frozenset(
+    "hei takk god morgen og ikke det den en et vi er jeg du hvordan i dag"
+    .casefold()
+    .split()
+)
+_TURKISH_WORDS = frozenset(
+    "merhaba teşekkür teşekkürler günaydın ve değil bir bu için nasıl bugün"
     .casefold()
     .split()
 )
@@ -94,7 +140,13 @@ class LanguageGuess:
 
 
 def _script_language(text: str, hint: str | None) -> LanguageGuess | None:
-    """Recognize scripts that the compact three-language Lingua model lacks."""
+    """Recognize writing systems before statistical language detection.
+
+    Script detection is deterministic and is especially valuable for short
+    utterances where Whisper's language probability is underdetermined. The
+    hint is used only to distinguish languages sharing a script; it can never
+    force an English label onto another script.
+    """
 
     if _HIRAGANA_KATAKANA_RE.search(text):
         return LanguageGuess("ja", 0.92)
@@ -107,11 +159,41 @@ def _script_language(text: str, hint: str | None) -> LanguageGuess | None:
     if _DEVANAGARI_RE.search(text):
         return LanguageGuess(hint if hint in {"hi", "mr", "ne", "sa"} else "hi", 0.88)
     if _BENGALI_RE.search(text):
-        return LanguageGuess("bn", 0.88)
+        return LanguageGuess(hint if hint in {"bn", "as"} else "bn", 0.88)
+    if _GURMUKHI_RE.search(text):
+        return LanguageGuess("pa", 0.88)
+    if _GUJARATI_RE.search(text):
+        return LanguageGuess("gu", 0.88)
+    if _TAMIL_RE.search(text):
+        return LanguageGuess("ta", 0.88)
+    if _TELUGU_RE.search(text):
+        return LanguageGuess("te", 0.88)
+    if _KANNADA_RE.search(text):
+        return LanguageGuess("kn", 0.88)
+    if _MALAYALAM_RE.search(text):
+        return LanguageGuess("ml", 0.88)
+    if _SINHALA_RE.search(text):
+        return LanguageGuess("si", 0.88)
+    if _LAO_RE.search(text):
+        return LanguageGuess("lo", 0.88)
     if _THAI_RE.search(text):
         return LanguageGuess("th", 0.88)
+    if _TIBETAN_RE.search(text):
+        return LanguageGuess("bo", 0.88)
+    if _MYANMAR_RE.search(text):
+        return LanguageGuess("my", 0.88)
     if _GREEK_RE.search(text):
         return LanguageGuess("el", 0.88)
+    if _ARMENIAN_RE.search(text):
+        return LanguageGuess("hy", 0.88)
+    if _GEORGIAN_RE.search(text):
+        return LanguageGuess("ka", 0.88)
+    if _ETHIOPIC_RE.search(text):
+        return LanguageGuess("am", 0.88)
+    if _KHMER_RE.search(text):
+        return LanguageGuess("km", 0.88)
+    if _MONGOLIAN_RE.search(text):
+        return LanguageGuess("mn", 0.88)
     if _CYRILLIC_RE.search(text):
         if hint in {"ru", "uk", "bg", "sr", "mk", "be", "kk", "tg", "tt"}:
             return LanguageGuess(hint, 0.88)
@@ -136,7 +218,7 @@ def _latin_foreign_language(
 
     if german_words or english_words:
         return None
-    foreign_words = [word.casefold() for word in re.findall(r"[A-Za-zÀ-ÿ]+", text)]
+    foreign_words = [word.casefold() for word in _WORD_RE.findall(text)]
     if not foreign_words:
         return None
     candidates = (
@@ -144,6 +226,11 @@ def _latin_foreign_language(
         ("es", _SPANISH_WORDS),
         ("it", _ITALIAN_WORDS),
         ("fr", _FRENCH_WORDS),
+        ("nl", _DUTCH_WORDS),
+        ("sv", _SWEDISH_WORDS),
+        ("da", _DANISH_WORDS),
+        ("no", _NORWEGIAN_WORDS),
+        ("tr", _TURKISH_WORDS),
     )
     for code, marker_words in candidates:
         hits = sum(word in marker_words for word in foreign_words)
@@ -156,20 +243,30 @@ def _latin_foreign_language(
     return None
 
 
-class TrilingualDetector:
+class MultilingualDetector:
+    """Detect Whisper's full language set without an English fallback.
+
+    Lingua's full 75-language model provides a text-level second opinion,
+    while Whisper supplies the audio-level hint. The previous three-language
+    detector made every unknown Latin-script sentence look English; this
+    class can now return any language understood by Lingua or Whisper.
+    """
+
     def __init__(self) -> None:
         from lingua import Language, LanguageDetectorBuilder
 
         self._mapping = {
-            Language.CHINESE: "zh",
-            Language.ENGLISH: "en",
-            Language.GERMAN: "de",
+            language: str(language.iso_code_639_1).split(".")[-1].casefold()
+            for language in Language.all()
         }
         self._detector = (
-            LanguageDetectorBuilder.from_languages(*self._mapping)
+            LanguageDetectorBuilder.from_all_languages()
             .with_minimum_relative_distance(0.05)
             .build()
         )
+        # Lingua loads model data lazily. Do that while the UI is still in its
+        # model-loading state instead of on the first live utterance.
+        self._detector.compute_language_confidence_values("hello guten morgen")
 
     def detect(
         self,
@@ -225,6 +322,7 @@ class TrilingualDetector:
             if (
                 hint == "de"
                 and hint_confidence >= 0.75
+                and english_words <= 1
                 and english_hint_words == 0
                 and german_hint_words == 0
             ):
@@ -237,27 +335,20 @@ class TrilingualDetector:
         if foreign is not None:
             return foreign
 
-        # Lingua is deliberately limited to the three meeting languages for
-        # fast code-switch decisions.  For every other Whisper language, use
-        # its segment-level prediction when the clause has no contradictory
-        # German/English evidence.  This keeps Cyrillic, Spanish, Portuguese,
-        # Japanese, etc. in their real source-language line instead of
-        # labelling them as English.
-        if (
-            hint
-            and hint not in {"zh", "en", "de"}
-            and hint_confidence >= 0.55
-            and not (de_hits or en_hits or german_words or english_words)
-        ):
-            return LanguageGuess(hint, min(0.96, hint_confidence))
-
+        # Full-language Lingua is used as a text-level second opinion after
+        # deterministic script and switch-word checks.
         values = self._detector.compute_language_confidence_values(text)
         if values:
             best = values[0]
             code = self._mapping.get(best.language)
-            # Lingua is reliable for short Latin phrases such as ``Hello``
-            # and ``Morgen``; use it before a previous-language fallback.
-            if code and best.value >= 0.60:
+            if code and best.value >= 0.50:
+                if (
+                    hint in {"zh", "en", "de"}
+                    and hint != code
+                    and hint_confidence >= 0.75
+                    and not (de_hits or en_hits or german_words or english_words)
+                ):
+                    return LanguageGuess(hint, min(0.92, hint_confidence))
                 # A segment-level Whisper hint is especially useful for a
                 # one-word German ASR result such as a name or a technical
                 # term.  Do not override a strong text decision: this keeps
@@ -266,27 +357,59 @@ class TrilingualDetector:
                 # and only repairs low-evidence conflicts.
                 if (
                     hint
+                    and hint not in {"zh", "en", "de"}
+                    and hint_confidence >= 0.85
+                    and code in {"en", "de"}
+                    and best.value < 0.70
+                ):
+                    return LanguageGuess(hint, min(0.90, hint_confidence))
+                if (
+                    hint
                     and hint != code
                     and hint_confidence >= 0.75
                     and best.value < 0.80
-                    and not (de_hits or en_hits or german_words or english_words)
+                    and hint not in {"zh", "en", "de"}
+                    and not (de_hits or en_hits)
                 ):
                     return LanguageGuess(hint, min(0.90, hint_confidence))
                 return LanguageGuess(code, float(best.value))
+
+        # Whisper is still the best signal for short or noisy clauses. The old
+        # 0.55 cutoff then fell back to English; 0.35 keeps a plausible
+        # Spanish, Arabic or other language hint visible.
+        if (
+            hint
+            and hint not in {"zh", "en", "de"}
+            and hint_confidence >= 0.35
+            and not (de_hits or en_hits or german_words or english_words)
+        ):
+            return LanguageGuess(hint, min(0.96, hint_confidence))
+
         if de_hits > en_hits:
             return LanguageGuess("de", 0.55)
         if en_hits > de_hits:
             return LanguageGuess("en", 0.55)
-        # Only genuinely ambiguous short backchannels inherit the previous
-        # language. Longer text must be classified independently.
-        if previous and letter_count <= 8:
-            return LanguageGuess(previous, 0.45)
+        if (
+            values
+            and hint in {"zh", "en", "de"}
+            and hint_confidence >= 0.75
+            and not (de_hits or en_hits or german_words or english_words)
+            and values[0].value < 0.50
+        ):
+            return LanguageGuess(hint, min(0.90, hint_confidence))
         if values:
             best = values[0]
             code = self._mapping.get(best.language)
-            if code and best.value >= 0.40:
+            # Longer clauses should not inherit a previous language just
+            # because the statistical confidence is modest.
+            if code and (best.value >= 0.35 or letter_count > 8):
                 return LanguageGuess(code, float(best.value))
-        return LanguageGuess(previous or "en", 0.35)
+        # Only genuinely ambiguous short backchannels inherit the previous
+        # language.
+        if previous and letter_count <= 8:
+            return LanguageGuess(previous, 0.45)
+        # Never claim English merely because a short utterance was ambiguous.
+        return LanguageGuess(previous or hint or "unknown", 0.25)
 
     def split_clauses(self, text: str) -> list[str]:
         clauses: list[str] = []
@@ -295,8 +418,8 @@ class TrilingualDetector:
             if not part:
                 continue
             runs = re.split(
-                r"(?<=[\u3400-\u9fff])\s*(?=[A-Za-zÄÖÜäöüß])|"
-                r"(?<=[A-Za-zÄÖÜäöüß])\s*(?=[\u3400-\u9fff])",
+                r"(?<=[\u3400-\u9fff])\s*(?=[A-Za-zÀ-ÖØ-öø-ÿĀ-ž])|"
+                r"(?<=[A-Za-zÀ-ÖØ-öø-ÿĀ-ž])\s*(?=[\u3400-\u9fff])",
                 part,
             )
             for run in runs:
@@ -342,3 +465,7 @@ class TrilingualDetector:
                 if current:
                     clauses.append(" ".join(current).strip())
         return clauses or [text.strip()]
+
+
+# Backwards-compatible import name used by older callers and saved plugins.
+TrilingualDetector = MultilingualDetector

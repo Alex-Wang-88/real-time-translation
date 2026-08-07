@@ -11,7 +11,7 @@ from typing import Callable
 import numpy as np
 
 from .audio import SAMPLE_RATE, SegmentEvent
-from .language import TrilingualDetector
+from .language import MultilingualDetector
 from .models import Utterance
 from .speaker import OnlineSpeakerClusterer
 from .text_normalize import simplify_chinese
@@ -57,6 +57,12 @@ NLLB_CODES = {
     "te": "tel_Telu", "tg": "tgk_Cyrl", "tk": "tuk_Latn",
     "tt": "tat_Cyrl", "uz": "uzn_Latn", "yi": "ydd_Hebr",
     "yue": "yue_Hant",
+    # Additional languages returned by the full Lingua detector. These are
+    # also valid NLLB-200 source tags even though Whisper does not emit every
+    # one of them in its 100-language list.
+    "eo": "epo_Latn", "ga": "gle_Latn", "lg": "lug_Latn",
+    "nb": "nob_Latn", "st": "sot_Latn", "tn": "tsn_Latn",
+    "ts": "tso_Latn", "xh": "xho_Latn", "zu": "zul_Latn",
 }
 
 
@@ -153,7 +159,7 @@ class LiveModelRuntime:
         self.compute_type = "int8"
         self.asr = None
         self.translator: LiveChineseTranslator | None = None
-        self.detector: TrilingualDetector | None = None
+        self.detector: MultilingualDetector | None = None
         self.speakers: OnlineSpeakerClusterer | None = None
         self.ready = False
         self.status = "等待加载"
@@ -171,9 +177,9 @@ class LiveModelRuntime:
             device=self.device,
             compute_type=self.compute_type,
         )
-        self.status = "正在加载语言识别"
+        self.status = "正在加载多语言识别"
         progress(self.status)
-        self.detector = TrilingualDetector()
+        self.detector = MultilingualDetector()
         self.translator = LiveChineseTranslator(
             self.translation_model_name, self.device, progress
         )
@@ -193,6 +199,8 @@ class LiveModelRuntime:
         silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
         segments, _ = self.asr.transcribe(
             silent,
+            task="transcribe",
+            language=None,
             beam_size=1,
             best_of=1,
             multilingual=True,
@@ -217,6 +225,7 @@ class LiveModelRuntime:
         prompt = hotwords or ""
         segments, info = self.asr.transcribe(
             self._float_audio(pcm),
+            task="transcribe",
             language=None,  # detect afresh for every stable audio segment
             beam_size=1 if partial else 3,
             best_of=1 if partial else 3,
@@ -240,20 +249,21 @@ class LiveModelRuntime:
         segments, whisper_language, whisper_confidence = self._recognize(
             event.pcm, recent_text, hotwords, partial=True
         )
-        text = simplify_chinese(
-            " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
-        )
-        if not text:
+        raw_text = " ".join(
+            segment.text.strip() for segment in segments if segment.text.strip()
+        ).strip()
+        if not raw_text:
             return None
         language = (
             self.detector.detect(
-                text,
+                raw_text,
                 whisper_language=whisper_language,
                 whisper_confidence=whisper_confidence,
             ).code
             if self.detector
             else None
         )
+        text = simplify_chinese(raw_text) if language == "zh" else raw_text
         return PartialResult(event.revision, event.start, event.end, text, language)
 
     def transcribe_final(
@@ -277,10 +287,11 @@ class LiveModelRuntime:
         utterances: list[Utterance] = []
         language = previous_language
         for raw in raw_segments:
-            # Whisper may emit Traditional Chinese for a Chinese turn.  Do
-            # this before clause splitting so the live UI, JSONL and exports
-            # all use the same Simplified Chinese source text.
-            text = simplify_chinese(raw.text.strip())
+            # Preserve every non-Chinese source verbatim. OpenCC is applied
+            # only after the clause has been identified as Chinese; otherwise
+            # Japanese and other scripts could be altered by a Chinese
+            # traditional-to-simplified conversion.
+            text = raw.text.strip()
             if not text:
                 continue
             clauses = self.detector.split_clauses(text)
@@ -301,7 +312,8 @@ class LiveModelRuntime:
                     whisper_language=whisper_language,
                     whisper_confidence=whisper_confidence,
                 )
-                translation_zh = self.translator.translate(clause, guess.code)
+                source_text = simplify_chinese(clause) if guess.code == "zh" else clause
+                translation_zh = self.translator.translate(source_text, guess.code)
                 utterances.append(
                     Utterance(
                         id=next_id + len(utterances),
@@ -310,7 +322,7 @@ class LiveModelRuntime:
                         speaker_id=speaker_id,
                         language=guess.code,
                         language_confidence=round(guess.confidence, 4),
-                        text=clause,
+                        text=source_text,
                         translation_zh=translation_zh,
                     )
                 )

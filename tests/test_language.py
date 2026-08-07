@@ -91,3 +91,24 @@ def test_script_and_foreign_markers_repair_an_english_whisper_hint() -> None:
     assert detector.detect("Tienes ganas.", whisper_language="en", whisper_confidence=0.9).code == "es"
     assert detector.detect("e farlo", whisper_language="en", whisper_confidence=0.9).code == "it"
     assert detector.detect("João", whisper_language="en", whisper_confidence=0.9).code == "pt"
+
+
+def test_full_detector_covers_more_than_the_original_three_languages() -> None:
+    detector = TrilingualDetector()
+    assert detector.detect("Bonjour, comment allez-vous?", whisper_language="en").code == "fr"
+    assert detector.detect("Ciao, come stai?", whisper_language="en").code == "it"
+    assert detector.detect("Hej, hur mår du?", whisper_language="en").code == "sv"
+    assert detector.detect("مرحبًا بكم", whisper_language="en").code == "ar"
+    assert detector.detect("日本語で話しています", whisper_language="en").code == "ja"
+    assert detector.detect("Γεια σου", whisper_language="en").code == "el"
+
+
+def test_ambiguous_non_english_hint_is_not_silently_relabelled_english() -> None:
+    detector = TrilingualDetector()
+    guess = detector.detect(
+        "uncommon phrase",
+        previous="en",
+        whisper_language="es",
+        whisper_confidence=0.40,
+    )
+    assert guess.code == "es"
