@@ -26,6 +26,8 @@
 
 不要自动添加 Basic 或 Bearer 前缀，程序会直接使用填写的原始值。完整配置项和启动方式见 README.md。
 
+如果确实需要在本机保留一份“含实际密钥的 Markdown”，可以把已经填写好的 .env 复制为 LOCAL_CONFIG_PRIVATE.md。该文件已加入 .gitignore，只能留在本机，不能上传到公开仓库。
+
 推荐的本地模型配置如下：
 
     MEETING_DEVICE=auto

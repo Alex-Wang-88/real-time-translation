@@ -1,4 +1,5 @@
 .env
+LOCAL_CONFIG_PRIVATE.md
 .venv/
 result/
 __pycache__/
