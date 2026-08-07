@@ -92,6 +92,8 @@ JIMO_AUTHORIZATION=完整的原始Authorization值
 
 正式使用前请轮换曾经出现在聊天、日志或截图中的密钥。仓库的 `.gitignore` 已排除 `.env`、`.venv`、`result`、缓存和编译文件。
 
+关于这些未提交文件的原因、恢复方式和安全注意事项，见 [LOCAL_CONFIG.md](LOCAL_CONFIG.md)。
+
 ## 使用流程
 
 1. 等待窗口顶部显示“后端：已就绪”，并确认 GPU 与积墨状态。
