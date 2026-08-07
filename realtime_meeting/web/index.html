@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>实时会议转译</title>
+    <meta name="description" content="本机多语言实时会议转写、中文翻译和会议纪要" />
+    <link rel="stylesheet" href="/static/styles.css?v=2" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div>
+            <p class="eyebrow">LOCAL MEETING INTELLIGENCE</p>
+            <h1>实时会议转译</h1>
+          </div>
+        </div>
+        <div class="system-pills" aria-label="系统状态">
+          <span class="pill" id="backendPill"><i></i><b>后端</b><em>检查中</em></span>
+          <span class="pill" id="gpuPill"><i></i><b>计算</b><em>—</em></span>
+          <span class="pill" id="jimoPill"><i></i><b>纪要</b><em>检查中</em></span>
+        </div>
+      </header>
+
+      <section class="control-card" aria-labelledby="controlTitle">
+        <div class="control-copy">
+          <p class="section-label">会议控制台</p>
+          <h2 id="controlTitle">让每种语言都清晰抵达</h2>
+          <p id="privacyNote">麦克风音频仅在本机处理；停止后才会发送文本生成纪要。</p>
+        </div>
+        <div class="control-center">
+          <button id="mainButton" class="main-button" type="button" disabled aria-label="开始会议">
+            <span class="button-icon" aria-hidden="true"></span>
+            <span id="mainButtonText">模型加载中</span>
+          </button>
+          <div class="live-meta">
+            <time id="timer">00:00:00</time>
+            <span class="language-badge" id="languageBadge">等待发言</span>
+          </div>
+          <div class="level-readout">
+            <span id="levelValue">0%</span>
+            <span id="micStatus">等待麦克风</span>
+          </div>
+          <div class="level-track" role="meter" aria-label="麦克风音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="levelBar"></span>
+          </div>
+          <p id="audioDebug" class="audio-debug">开始会议后会显示音频帧和后端接收状态。</p>
+        </div>
+        <div class="control-side">
+          <label for="hotwords">术语提示</label>
+          <input id="hotwords" type="text" maxlength="1000" placeholder="姓名、产品名、缩写（可选）" />
+          <p>中 / 英 / 德自动识别<br />稳定字幕约 2–4 秒</p>
+        </div>
+      </section>
+
+      <section class="status-panel" aria-labelledby="statusTitle">
+        <div class="status-head">
+          <div>
+            <p class="section-label">处理进度</p>
+            <h2 id="statusTitle">全流程状态</h2>
+          </div>
+          <p class="status-message" id="statusMessage" role="status" aria-live="polite">正在检查本机服务…</p>
+        </div>
+        <ol class="steps" id="steps">
+          <li data-step="0"><span>01</span><b>检查服务</b></li>
+          <li data-step="1"><span>02</span><b>麦克风</b></li>
+          <li data-step="2"><span>03</span><b>录音监听</b></li>
+          <li data-step="3"><span>04</span><b>语音转写</b></li>
+          <li data-step="4"><span>05</span><b>中文翻译</b></li>
+          <li data-step="5"><span>06</span><b>保存记录</b></li>
+          <li data-step="6"><span>07</span><b>AI 纪要</b></li>
+          <li data-step="7"><span>08</span><b>完成</b></li>
+        </ol>
+        <div id="notice" class="notice" hidden role="alert"></div>
+      </section>
+
+      <section class="workspace">
+        <article class="panel transcript-panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">LIVE TRANSCRIPT</p>
+              <h2>实时逐句稿</h2>
+            </div>
+            <div class="panel-actions">
+              <span id="utteranceCount">0 条稳定记录</span>
+              <button id="jumpLatest" class="text-button" type="button" hidden>回到最新</button>
+            </div>
+          </div>
+          <div class="transcript-list" id="transcriptList" tabindex="0" aria-live="polite">
+            <div class="empty-state" id="transcriptEmpty">
+              <span class="empty-wave" aria-hidden="true"></span>
+              <p>开始会议后，原文和中文翻译会逐句出现在这里。</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel minutes-panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">MEETING NOTES</p>
+              <h2>中文会议纪要</h2>
+            </div>
+            <button id="retrySummary" class="text-button" type="button" hidden>重试生成</button>
+          </div>
+          <pre id="summaryText" class="summary-text" aria-live="polite">停止录音后，完整逐句稿会分块发送给积墨 AI。纪要将在此处流式生成。</pre>
+          <div id="downloads" class="downloads" hidden>
+            <p>本次会议文件</p>
+            <div id="downloadLinks"></div>
+          </div>
+        </article>
+      </section>
+
+      <footer>
+        <span>音频本机处理</span>
+        <span id="diskStatus">磁盘检查中</span>
+        <span>匿名说话人编号</span>
+      </footer>
+    </main>
+    <script type="module" src="/static/app.js?v=3"></script>
+  </body>
+</html>
