@@ -12,6 +12,8 @@ const ui = {
   micStatus: document.querySelector("#micStatus"),
   audioDebug: document.querySelector("#audioDebug"),
   hotwords: document.querySelector("#hotwords"),
+  deviceSelect: document.querySelector("#deviceSelect"),
+  deviceHint: document.querySelector("#deviceHint"),
   statusMessage: document.querySelector("#statusMessage"),
   steps: [...document.querySelectorAll("#steps li")],
   notice: document.querySelector("#notice"),
@@ -51,6 +53,8 @@ const state = {
   lastAudioLevelAt: 0,
   lastNonZeroLevelAt: 0,
   audioWarningShown: false,
+  deviceRequest: (() => { try { return localStorage.getItem("meeting_device") || "auto"; } catch { return "auto"; } })(),
+  switchingDevice: false,
 };
 
 const languageNames = {
@@ -206,12 +210,69 @@ async function pollHealth() {
       state.restored = true;
       restoreMeeting(health.active_session);
     }
+    // Reflect an in-flight or failed device switch driven by the backend.
+    if (state.switchingDevice) {
+      if (health.switch_error && !health.switching) {
+        state.switchingDevice = false;
+        const fallback = health.device === "cuda" ? "cuda" : health.device === "cpu" ? "cpu" : "auto";
+        state.deviceRequest = fallback;
+        ui.deviceSelect.value = fallback;
+        showNotice(`切换失败：${health.switch_error}（继续使用原设备）`, "warning");
+      } else if (!health.switching && !health.switch_error) {
+        state.switchingDevice = false;
+      }
+    }
   } catch (error) {
     state.health = { status: "error" };
     setPill(ui.backendPill, "error", "无法连接");
     showNotice(`无法连接本机服务：${error.message}`);
   }
   updateMainButton();
+  updateDeviceControls();
+}
+
+function deviceLabel(value) {
+  if (value === "cuda") return "GPU（CUDA）";
+  if (value === "cpu") return "CPU";
+  return "自动（推荐）";
+}
+
+function updateDeviceControls() {
+  const health = state.health || {};
+  const recording = state.meetingState === "recording";
+  const busy = ["finalizing", "summarizing"].includes(state.meetingState) || state.stopping;
+  if (state.switchingDevice) {
+    ui.deviceSelect.disabled = true;
+    ui.deviceHint.textContent = "正在切换推理设备，请稍候（约 10–60 秒）…";
+    return;
+  }
+  if (ui.deviceSelect.value !== state.deviceRequest) ui.deviceSelect.value = state.deviceRequest;
+  ui.deviceSelect.disabled = recording || busy;
+  if (health.switch_error) {
+    ui.deviceHint.textContent = `切换失败：${health.switch_error}（继续使用原设备）`;
+  } else if (health.device) {
+    ui.deviceHint.textContent = `当前运行：${deviceLabel(health.device)}`;
+  } else {
+    ui.deviceHint.textContent = "有独显时自动启用 GPU 加速";
+  }
+}
+
+async function onDeviceChange() {
+  const requested = ui.deviceSelect.value;
+  state.deviceRequest = requested;
+  try { localStorage.setItem("meeting_device", requested); } catch { /* ignore */ }
+  state.switchingDevice = true;
+  updateDeviceControls();
+  try {
+    await requestJson("/api/device", { method: "POST", body: JSON.stringify({ device: requested }) });
+  } catch (error) {
+    state.switchingDevice = false;
+    const cur = state.health?.device === "cuda" ? "cuda" : state.health?.device === "cpu" ? "cpu" : "auto";
+    state.deviceRequest = cur;
+    ui.deviceSelect.value = cur;
+    showNotice(error.message, "warning");
+    updateDeviceControls();
+  }
 }
 
 function startTimer(offset = 0) {
@@ -572,6 +633,7 @@ ui.mainButton.addEventListener("click", () => {
   if (state.meetingState === "recording") stopMeeting();
   else startMeeting();
 });
+ui.deviceSelect.addEventListener("change", onDeviceChange);
 ui.retrySummary.addEventListener("click", retrySummary);
 ui.transcriptList.addEventListener("scroll", () => {
   const distance = ui.transcriptList.scrollHeight - ui.transcriptList.scrollTop - ui.transcriptList.clientHeight;

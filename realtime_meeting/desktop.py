@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import numpy as np
 import websockets
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSettings, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QCloseEvent, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -440,6 +440,11 @@ class DesktopWindow(QMainWindow):
         self.last_meeting_id: str | None = None
         self.health: dict[str, Any] = {}
         self.meeting_started_at = 0.0
+        # Inference-device selector state.
+        self.device_initialized = False  # sync combo with backend device once
+        self.switching_device = False  # a device switch is in flight
+        self.settings = QSettings("real-time-translation", "desktop")
+        self.device_select_combo.currentIndexChanged.connect(self._on_device_selected)
         self.last_audio_level = 0.0
         self.last_backend_packets = 0
         self.setWindowTitle("本机实时会议转译")
@@ -549,6 +554,29 @@ class DesktopWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._load_devices)
         device_row.addWidget(self.refresh_button)
         control_layout.addLayout(device_row)
+
+        # Inference device selector: lets users without a CUDA GPU fall back to
+        # CPU, or force GPU, without editing .env or restarting the backend.
+        device_select_row = QHBoxLayout()
+        device_select_row.setContentsMargins(0, 0, 0, 0)
+        device_select_row.setSpacing(8)
+        device_select_label = QLabel("推理设备")
+        device_select_label.setObjectName("fieldLabel")
+        device_select_label.setMinimumWidth(72)
+        device_select_row.addWidget(device_select_label)
+        self.device_select_combo = QComboBox()
+        self.device_select_combo.setMinimumHeight(40)
+        self.device_select_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.device_select_combo.setMinimumContentsLength(10)
+        self.device_select_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # Data role carries the value passed to the backend (auto/cpu/cuda).
+        self.device_select_combo.addItem("自动（推荐）", "auto")
+        self.device_select_combo.addItem("CPU（无显卡可用）", "cpu")
+        self.device_select_combo.addItem("GPU（需 CUDA）", "cuda")
+        device_select_row.addWidget(self.device_select_combo, 1)
+        control_layout.addLayout(device_select_row)
 
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
@@ -734,6 +762,92 @@ class DesktopWindow(QMainWindow):
             self.device_combo.addItem("无法读取音频设备", None)
             self.status_label.setText(f"无法读取麦克风设备：{exc}")
 
+    def _on_device_selected(self, _index: int) -> None:
+        """User picked a different inference device from the dropdown."""
+        # Skip programmatic selection while we sync with the backend on first
+        # poll, and ignore changes while a meeting or switch is running.
+        if not self.device_initialized or self.switching_device or self.worker is not None:
+            return
+        device = self.device_select_combo.currentData()
+        if device in (None, ""):
+            return
+        if device == str(self.health.get("device", "")).lower():
+            return
+        self._switch_device(device)
+
+    def _switch_device(self, device: str) -> None:
+        try:
+            payload = json.dumps({"device": device}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/api/device",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "ignore")
+            self.status_label.setText(f"切换设备被拒绝：{detail}")
+            self._sync_device_combo()
+            return
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            self.status_label.setText(f"无法连接后端以切换设备：{exc}")
+            self._sync_device_combo()
+            return
+        if result.get("status") != "switching":
+            self.status_label.setText("后端未确认设备切换")
+            return
+        # Persist so the choice survives a backend restart.
+        self._write_env_device(device)
+        self.settings.setValue("device", device)
+        self.switching_device = True
+        self.device_select_combo.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.status_label.setText("正在切换推理设备，模型重新加载中，请稍候（约 10–60 秒）…")
+        self.status_hint.setText("切换推理设备")
+
+    @staticmethod
+    def _write_env_device(device: str) -> None:
+        """Persist MEETING_DEVICE into .env so the next backend launch keeps it.
+
+        Defensive: never touches other lines, and bails out if the file is
+        missing instead of creating a fresh .env that would erase credentials.
+        """
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        if not env_path.is_file():
+            return
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        key = "MEETING_DEVICE"
+        new_line = f"{key}={device}"
+        replaced = False
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "" or stripped.startswith("#"):
+                continue
+            if stripped.split("=", 1)[0].strip().upper() == key:
+                lines[index] = new_line
+                replaced = True
+                break
+        if not replaced:
+            lines.append(new_line)
+        try:
+            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            return
+
+    def _sync_device_combo(self) -> None:
+        """Reflect the backend's current device in the dropdown (no re-trigger)."""
+        backend_device = str(self.health.get("device", "")).lower()
+        position = self.device_select_combo.findData(backend_device)
+        if position >= 0 and position != self.device_select_combo.currentIndex():
+            self.device_select_combo.blockSignals(True)
+            self.device_select_combo.setCurrentIndex(position)
+            self.device_select_combo.blockSignals(False)
+
     def _poll_health(self) -> None:
         try:
             with urllib.request.urlopen(f"{self.base_url}/api/health", timeout=1.0) as response:
@@ -742,11 +856,38 @@ class DesktopWindow(QMainWindow):
             self.backend_label.setText(f"后端：{'已就绪' if ready else self.health.get('status', '未知')}")
             self.gpu_label.setText(f"GPU：{str(self.health.get('device', '—')).upper()}")
             self.jimo_label.setText(f"积墨：{'已配置' if self.health.get('jimo_configured') else '未配置'}")
+            switching = bool(self.health.get("switching"))
+            switch_error = self.health.get("switch_error")
+
+            # First successful poll: align the dropdown with the backend device.
+            if not self.device_initialized:
+                self._sync_device_combo()
+                self.device_initialized = True
+
+            if switching:
+                # A switch is in flight: keep controls locked and show progress.
+                self.switching_device = True
+                self.device_select_combo.setEnabled(False)
+                self.refresh_button.setEnabled(False)
+                self.start_button.setEnabled(False)
+                self.status_hint.setText("切换推理设备")
+                self.status_label.setText("正在切换推理设备，模型重新加载中，请稍候…")
+                return
+
+            # Switch finished (successfully or not): release the lock.
+            if self.switching_device:
+                self.switching_device = False
+                self.device_select_combo.setEnabled(True)
+                self.refresh_button.setEnabled(True)
+                self._sync_device_combo()
+
             if self.worker is None:
                 self.start_button.setEnabled(ready and self.summary_worker is None)
                 if ready:
                     self.status_hint.setText("服务在线 · 可开始")
-                    if self.summary_worker is None and self.last_meeting_id is None:
+                    if switch_error:
+                        self.status_label.setText(f"切换失败：{switch_error}（仍使用原设备）")
+                    elif self.summary_worker is None and self.last_meeting_id is None:
                         self.status_label.setText("服务和模型已就绪，可以开始会议")
                 else:
                     self.status_hint.setText("模型加载中")
@@ -784,6 +925,7 @@ class DesktopWindow(QMainWindow):
         self.start_button.style().polish(self.start_button)
         self.device_combo.setEnabled(False)
         self.refresh_button.setEnabled(False)
+        self.device_select_combo.setEnabled(False)
         self.worker_thread = QThread(self)
         self.worker = MeetingWorker(self.base_url, self.device_combo.currentData())
         self.worker.moveToThread(self.worker_thread)
@@ -945,6 +1087,7 @@ class DesktopWindow(QMainWindow):
         )
         self.device_combo.setEnabled(True)
         self.refresh_button.setEnabled(True)
+        self.device_select_combo.setEnabled(True)
         self._set_input_warning("")
         self.volume_bar.setValue(0)
         self.audio_stats_label.setText("尚未采集音频")

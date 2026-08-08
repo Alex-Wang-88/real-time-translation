@@ -21,6 +21,10 @@ class MeetingCreate(BaseModel):
     hotwords: str | None = Field(default=None, max_length=1_000)
 
 
+class DeviceSwitch(BaseModel):
+    device: str  # "auto" | "cpu" | "cuda"
+
+
 def create_app(
     settings: Settings | None = None,
     runtime: LiveModelRuntime | None = None,
@@ -56,6 +60,10 @@ def create_app(
     app.state.settings = config
     app.state.runtime = model_runtime
     app.state.manager = manager
+    # Device switching (set by POST /api/device). Kept on app.state so the
+    # health endpoint can report progress without holding a session lock.
+    app.state.switching = False
+    app.state.switch_error = None
     web_dir = Path(__file__).resolve().parent / "web"
     app.mount("/static", StaticFiles(directory=web_dir), name="static")
 
@@ -65,18 +73,69 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
+        runtime = app.state.runtime
         free = shutil.disk_usage(config.results_dir).free
         active = manager.active()
+        if app.state.switching:
+            status = "loading"
+            message = "正在切换推理设备"
+        elif not runtime.ready:
+            status = "error" if app.state.load_error else "loading"
+            message = app.state.load_error or runtime.status
+        elif app.state.switch_error:
+            # The previous device keeps working; only the switch failed.
+            status = "ready"
+            message = f"切换失败：{app.state.switch_error}（继续使用原设备）"
+        else:
+            status = "ready"
+            message = runtime.status
         return {
-            "status": "ready" if model_runtime.ready else ("error" if app.state.load_error else "loading"),
-            "message": app.state.load_error or model_runtime.status,
-            "device": model_runtime.device,
+            "status": status,
+            "message": message,
+            "device": runtime.device,
+            "switching": app.state.switching,
+            "switch_error": app.state.switch_error,
             "asr_model": config.asr_model,
             "translation_model": config.translation_model,
             "jimo_configured": config.jimo_configured,
             "disk_free_bytes": free,
             "active_session": active.snapshot().to_dict() if active else None,
         }
+
+    @app.post("/api/device", status_code=status.HTTP_202_ACCEPTED)
+    async def switch_device(body: DeviceSwitch) -> dict[str, str]:
+        """Hot-swap the inference device (auto/cpu/cuda) without restarting.
+
+        Models are loaded once at startup on a fixed device, so changing it
+        requires rebuilding the runtime and reloading weights. We do that on a
+        background task and only swap the live reference once the new runtime is
+        ready, so an in-flight failure leaves the previous device intact.
+        """
+        requested = (body.device or "").strip().lower()
+        if requested not in {"auto", "cpu", "cuda"}:
+            raise HTTPException(status_code=400, detail="device 必须是 auto、cpu 或 cuda")
+        active = manager.active()
+        if active is not None and active.state in {"starting", "recording"}:
+            raise HTTPException(status_code=409, detail="会议进行中，无法切换设备；请先停止当前会议")
+        if app.state.switching:
+            raise HTTPException(status_code=409, detail="正在切换设备，请稍候")
+
+        target = LiveModelRuntime(config.asr_model, config.translation_model, requested)
+        app.state.switching = True
+        app.state.switch_error = None
+
+        async def _do_switch() -> None:
+            try:
+                await asyncio.to_thread(target.load)
+                app.state.runtime = target
+                manager.runtime = target
+                app.state.switching = False
+            except Exception as exc:  # noqa: BLE001 - surface any load failure to the UI
+                app.state.switching = False
+                app.state.switch_error = str(exc)
+
+        app.state.model_switch_task = asyncio.create_task(_do_switch(), name="switch-device")
+        return {"status": "switching", "device": requested}
 
     @app.post("/api/meetings", status_code=status.HTTP_201_CREATED)
     async def create_meeting(body: MeetingCreate) -> dict[str, Any]:
