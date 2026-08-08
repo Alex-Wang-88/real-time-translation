@@ -53,6 +53,7 @@ const state = {
   lastAudioLevelAt: 0,
   lastNonZeroLevelAt: 0,
   audioWarningShown: false,
+  apiToken: new URLSearchParams(window.location.search).get("token") || "",
   deviceRequest: (() => { try { return localStorage.getItem("meeting_device") || "auto"; } catch { return "auto"; } })(),
   switchingDevice: false,
 };
@@ -66,7 +67,8 @@ const languageNames = {
 const stageIndex = {
   checking: 0, loading: 0, microphone: 1, recording: 2, listening: 2,
   transcribing: 3, translating: 4, finalizing: 5, saving: 5,
-  summarizing: 6, summarizing_chunks: 6, summarizing_final: 6, complete: 7,
+  summarizing: 6, summarizing_chunks: 6, summarizing_final: 6,
+  summary_pending: 6, summary_error: 6, complete: 7,
 };
 
 function setPill(element, status, detail) {
@@ -187,7 +189,11 @@ function updateMainButton() {
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(state.apiToken ? { Authorization: `Bearer ${state.apiToken}` } : {}),
+      ...(options.headers || {}),
+    },
   });
   let payload = null;
   try { payload = await response.json(); } catch { payload = {}; }
@@ -290,7 +296,8 @@ function stopTimer() {
 
 async function connectWebSocket(sessionId) {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${scheme}://${location.host}/api/meetings/${sessionId}/stream`);
+  const token = state.apiToken ? `?token=${encodeURIComponent(state.apiToken)}` : "";
+  const ws = new WebSocket(`${scheme}://${location.host}/api/meetings/${sessionId}/stream${token}`);
   ws.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error("实时连接超时")), 6000);
@@ -516,9 +523,10 @@ function showPartial(event) {
 function renderDownloads(files = []) {
   ui.downloadLinks.replaceChildren();
   const preferred = ["meeting_minutes.md", "meeting_transcript.md", "translated_zh.md", "transcript.json", "audio_manifest.json"];
+  const token = state.apiToken ? `?token=${encodeURIComponent(state.apiToken)}` : "";
   preferred.filter((name) => files.includes(name)).forEach((name) => {
     const link = document.createElement("a");
-    link.href = `/api/meetings/${state.sessionId}/files/${encodeURIComponent(name)}`;
+    link.href = `/api/meetings/${state.sessionId}/files/${encodeURIComponent(name)}${token}`;
     link.textContent = name;
     link.download = name;
     ui.downloadLinks.append(link);
@@ -539,12 +547,27 @@ function applySnapshot(meeting) {
   if (["finalizing", "summarizing"].includes(meeting.state)) {
     state.stopping = true;
     setStage(meeting.state === "summarizing" ? "summarizing" : "finalizing", "正在恢复会议处理状态");
+  } else if (meeting.state === "summary_pending") {
+    state.stopping = false;
+    ui.retrySummary.hidden = false;
+    ui.retrySummary.textContent = "生成会议纪要";
+    ui.summaryText.textContent = "会议已保存。点击“生成会议纪要”后，才会请求 AI。";
+    renderDownloads(meeting.files);
+    setStage("summary_pending", "完整逐句稿已保存，可以手动生成会议纪要");
   } else if (meeting.state === "complete") {
+    ui.retrySummary.hidden = true;
     setStage("complete", "会议已完成");
     renderDownloads(meeting.files);
   } else if (meeting.state === "summary_error") {
     showNotice(meeting.error || "会议纪要生成失败，原稿已经保存");
     ui.retrySummary.hidden = false;
+    ui.retrySummary.textContent = "重试生成";
+    renderDownloads(meeting.files);
+    setStage("summary_error", "会议纪要生成失败，可以重试");
+  } else if (meeting.state === "error") {
+    showNotice(meeting.error || "会议处理未完整结束，已有记录仍可下载");
+    renderDownloads(meeting.files);
+    setStage("finalizing", "会议处理未完整结束，已有记录仍可下载");
   }
   updateMainButton();
 }
@@ -586,10 +609,23 @@ function handleServerEvent(event) {
     ui.summaryText.scrollTop = ui.summaryText.scrollHeight;
   } else if (event.type === "summary_reset") {
     ui.summaryText.textContent = "";
+  } else if (event.type === "summary_pending") {
+    state.sessionId = event.session_id || state.sessionId;
+    state.meetingState = "summary_pending";
+    state.stopping = false;
+    ui.retrySummary.hidden = false;
+    ui.retrySummary.textContent = "生成会议纪要";
+    ui.summaryText.classList.remove("streaming");
+    ui.summaryText.textContent = "会议已保存。点击“生成会议纪要”后，才会请求 AI。";
+    if (event.error) showNotice(event.error, "warning");
+    renderDownloads(event.files || []);
+    setStage("summary_pending", "完整逐句稿已保存，可以手动生成会议纪要");
+    updateMainButton();
   } else if (event.type === "summary_complete") {
     state.meetingState = "complete";
     state.stopping = false;
     stopTimer();
+    ui.retrySummary.hidden = true;
     ui.summaryText.textContent = event.content;
     ui.summaryText.classList.remove("streaming");
     renderDownloads(event.files);
@@ -603,6 +639,7 @@ function handleServerEvent(event) {
       state.meetingState = "summary_error";
       state.stopping = false;
       ui.retrySummary.hidden = !event.retryable;
+      ui.retrySummary.textContent = "重试生成";
       ui.summaryText.classList.remove("streaming");
     }
     updateMainButton();
@@ -611,6 +648,7 @@ function handleServerEvent(event) {
 
 async function retrySummary() {
   if (!state.sessionId) return;
+  const retryState = state.meetingState === "summary_error" ? "summary_error" : "summary_pending";
   clearNotice();
   ui.retrySummary.hidden = true;
   state.meetingState = "summarizing";
@@ -622,9 +660,12 @@ async function retrySummary() {
   try {
     await requestJson(`/api/meetings/${state.sessionId}/retry-summary`, { method: "POST", body: "{}" });
   } catch (error) {
+    state.meetingState = retryState;
     state.stopping = false;
     showNotice(error.message);
     ui.retrySummary.hidden = false;
+    ui.retrySummary.textContent = retryState === "summary_error" ? "重试生成" : "生成会议纪要";
+    setStage(retryState, retryState === "summary_error" ? "会议纪要生成失败，可以重试" : "会议已保存，可以手动生成会议纪要");
     updateMainButton();
   }
 }

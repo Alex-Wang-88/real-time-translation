@@ -85,9 +85,12 @@ JIMO_AUTHORIZATION=完整的原始Authorization值
 | `MEETING_TRANSLATION_MODEL` | `JustFrederik/nllb-200-distilled-1.3B-ct2-int8` | 本地中文翻译模型 |
 | `MEETING_HOST` | `127.0.0.1` | 只监听本机 |
 | `MEETING_PORT` | `8765` | 本地 API 端口 |
+| `MEETING_API_TOKEN` | 空 | 非本机监听时必填；浏览器使用 `?token=...` |
 | `MEETING_RESULTS_DIR` | `result/live` | 会议输出目录 |
 | `MEETING_MAX_UTTERANCE_SECONDS` | `5` | 连续发言的最大稳定分段长度 |
 | `MEETING_AUDIO_SEGMENT_MINUTES` | `30` | 音频轮转分片时长 |
+| `MEETING_MAX_AUDIO_PACKET_BYTES` | `262144` | WebSocket 单个 PCM 音频包上限 |
+| `MEETING_INFERENCE_QUEUE_SIZE` | `64` | 实时推理队列上限 |
 | `JIMO_MAX_REQUEST_CHARS` | `12000` | 单次积墨请求字符上限 |
 
 正式使用前请轮换曾经出现在聊天、日志或截图中的密钥。仓库的 `.gitignore` 已排除 `.env`、`.venv`、`result`、缓存和编译文件。
@@ -157,4 +160,4 @@ JIMO_AUTHORIZATION=完整的原始Authorization值
 
 - 不要把 `.env`、Authorization 值、模型缓存、录音和 `result/` 提交到 GitHub；
 - 如果密钥曾经出现在聊天、截图或日志中，请立即在服务端轮换；
-- 应用默认只监听 `127.0.0.1`，不要在未配置访问控制时暴露到公网。
+- 应用默认只监听 `127.0.0.1`；如果修改为其他监听地址，必须配置 `MEETING_API_TOKEN`，并使用带 `?token=...` 的 Web 页面地址。

@@ -1,4 +1,7 @@
+import sys
+
 import numpy as np
+import pytest
 
 from faster_whisper.tokenizer import _LANGUAGE_CODES
 
@@ -6,8 +9,20 @@ from realtime_meeting.runtime import (
     LiveChineseTranslator,
     LiveModelRuntime,
     NLLB_CODES,
+    choose_device,
     is_boundary_duplicate,
 )
+
+
+def test_explicit_cuda_does_not_silently_fallback_to_cpu(monkeypatch):
+    class FakeCTranslate2:
+        @staticmethod
+        def get_cuda_device_count():
+            return 0
+
+    monkeypatch.setitem(sys.modules, "ctranslate2", FakeCTranslate2)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        choose_device("cuda")
 
 
 def test_forced_cut_fuzzy_suffix_is_deduplicated() -> None:

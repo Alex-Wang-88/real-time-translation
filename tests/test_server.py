@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import realtime_meeting.server as server_module
 from fastapi.testclient import TestClient
 
 from realtime_meeting.audio import SAMPLE_RATE
@@ -17,6 +18,13 @@ class FakeRuntime:
     ready = True
     status = "模型已就绪"
     device = "cuda"
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        self.ready = False
 
     def transcribe_partial(self, event, recent_text="", hotwords=None):
         return PartialResult(event.revision, event.start, event.end, "临时字幕", "zh")
@@ -57,6 +65,72 @@ def test_health_does_not_expose_authorization_and_single_meeting(tmp_path: Path)
         second = client.post("/api/meetings", json={})
         assert second.status_code == 409
         client.post(f"/api/meetings/{first.json()['id']}/stop")
+
+
+def test_non_loopback_requires_configured_token_and_accepts_query_token(tmp_path: Path):
+    config = Settings(
+        host="0.0.0.0",
+        api_token="test-token",
+        results_dir=tmp_path,
+        disk_warn_bytes=0,
+        disk_stop_bytes=0,
+    )
+    app = create_app(config, FakeRuntime(), load_models=False)
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 401
+        assert client.get(
+            "/api/health", headers={"Authorization": "Bearer test-token"}
+        ).status_code == 200
+        assert client.get("/api/health?token=test-token").status_code == 200
+
+
+def test_device_switch_updates_runtime_used_by_new_meetings(tmp_path: Path, monkeypatch):
+    class SwitchRuntime:
+        instances = []
+
+        def __init__(self, _asr_model, _translation_model, requested_device):
+            self.device = requested_device
+            self.status = "等待加载"
+            self.ready = False
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def load(self):
+            self.ready = True
+            self.status = "模型已就绪"
+
+        def close(self):
+            self.closed = True
+            self.ready = False
+
+    monkeypatch.setattr(server_module, "LiveModelRuntime", SwitchRuntime)
+    previous = FakeRuntime()
+    config = Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0)
+    app = create_app(config, previous, load_models=False)
+    with TestClient(app) as client:
+        response = client.post("/api/device", json={"device": "cpu"})
+        assert response.status_code == 202
+        deadline = time.monotonic() + 2
+        while app.state.switching and time.monotonic() < deadline:
+            time.sleep(0.01)
+        health = client.get("/api/health").json()
+        assert health["device"] == "cpu"
+        assert health["status"] == "ready"
+        assert previous.closed is True
+
+        created = client.post("/api/meetings", json={})
+        assert created.status_code == 201
+        assert app.state.manager.active().runtime is app.state.runtime
+        client.post(f"/api/meetings/{created.json()['id']}/stop")
+
+
+def test_new_meeting_is_rejected_while_device_switch_is_in_flight(tmp_path: Path):
+    config = Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0)
+    app = create_app(config, FakeRuntime(), load_models=False)
+    app.state.switching = True
+    with TestClient(app) as client:
+        response = client.post("/api/meetings", json={})
+    assert response.status_code == 409
 
 
 def test_websocket_stream_emits_strict_utterance_and_saves_on_stop(tmp_path: Path):

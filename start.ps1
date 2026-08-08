@@ -53,9 +53,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $projectRoot ".env"))) {
 
 # Existing virtual environments may predate the desktop client. Install the
 # project once more when the new GUI/audio dependencies are not available.
-$dependencyCheck = & $venvPython -c "import PyQt6, sounddevice, opencc" 2>$null
+$dependencyCheck = & $venvPython -c "import PyQt6, ctranslate2, fastapi, faster_whisper, numpy, opencc, sounddevice, torch, websockets" 2>$null
 if ($LASTEXITCODE -ne 0) {
     & $venvPython -m pip install -e ".[dev]"
+}
+
+# Fail early for an explicitly requested CUDA device instead of starting a
+# backend that can only discover the problem after the model download begins.
+$deviceCheck = & $venvPython -c "from realtime_meeting.config import load_settings; from realtime_meeting.runtime import choose_device; choose_device(load_settings().device)" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Configured MEETING_DEVICE is unavailable: $($deviceCheck -join ' ')"
 }
 
 $arguments = if ($ServerOnly) {

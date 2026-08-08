@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .config import load_settings
 from .text_normalize import simplify_chinese
 from .models import language_label
 
@@ -92,10 +94,11 @@ class MeetingWorker(QObject):
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, base_url: str, device_index: int | None) -> None:
+    def __init__(self, base_url: str, device_index: int | None, api_token: str = "") -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.device_index = device_index
+        self.api_token = api_token.strip()
         self.session_id: str | None = None
         self.stop_event = threading.Event()
         self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=300)
@@ -333,13 +336,19 @@ class MeetingWorker(QObject):
 
     async def _run_async(self) -> None:
         timeout = httpx.Timeout(30.0, connect=10.0)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=timeout) as client:
+        headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
+        async with httpx.AsyncClient(
+            base_url=self.base_url, timeout=timeout, headers=headers
+        ) as client:
             response = await client.post("/api/meetings", json={})
             response.raise_for_status()
             meeting = response.json()
             self.session_id = meeting["id"]
             ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
-            async with websockets.connect(f"{ws_url}/api/meetings/{self.session_id}/stream") as socket:
+            token = f"?token={urllib.parse.quote(self.api_token)}" if self.api_token else ""
+            async with websockets.connect(
+                f"{ws_url}/api/meetings/{self.session_id}/stream{token}"
+            ) as socket:
                 self._open_audio()
                 mute_note = f"；{self.mute_note}" if self.mute_note else ""
                 self.status.emit(
@@ -383,19 +392,24 @@ class SummaryWorker(QObject):
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, base_url: str, session_id: str) -> None:
+    def __init__(self, base_url: str, session_id: str, api_token: str = "") -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.session_id = session_id
+        self.api_token = api_token.strip()
 
     async def _run_async(self) -> None:
         ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
         timeout = httpx.Timeout(30.0, connect=10.0)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=timeout) as client:
+        headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
+        token = f"?token={urllib.parse.quote(self.api_token)}" if self.api_token else ""
+        async with httpx.AsyncClient(
+            base_url=self.base_url, timeout=timeout, headers=headers
+        ) as client:
             # Connect before scheduling the server task so no streamed delta is
             # lost between the POST and the websocket subscription.
             async with websockets.connect(
-                f"{ws_url}/api/meetings/{self.session_id}/stream"
+                f"{ws_url}/api/meetings/{self.session_id}/stream{token}"
             ) as socket:
                 response = await client.post(
                     f"/api/meetings/{self.session_id}/retry-summary", json={}
@@ -429,10 +443,16 @@ class SummaryWorker(QObject):
 
 
 class DesktopWindow(QMainWindow):
-    def __init__(self, base_url: str, backend_process: subprocess.Popen[bytes] | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        backend_process: subprocess.Popen[bytes] | None = None,
+        api_token: str = "",
+    ) -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.backend_process = backend_process
+        self.api_token = api_token.strip()
         self.worker: MeetingWorker | None = None
         self.worker_thread: QThread | None = None
         self.summary_worker: SummaryWorker | None = None
@@ -781,7 +801,14 @@ class DesktopWindow(QMainWindow):
             req = urllib.request.Request(
                 f"{self.base_url}/api/device",
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    **(
+                        {"Authorization": f"Bearer {self.api_token}"}
+                        if self.api_token
+                        else {}
+                    ),
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=3.0) as response:
@@ -850,7 +877,15 @@ class DesktopWindow(QMainWindow):
 
     def _poll_health(self) -> None:
         try:
-            with urllib.request.urlopen(f"{self.base_url}/api/health", timeout=1.0) as response:
+            request = urllib.request.Request(
+                f"{self.base_url}/api/health",
+                headers=(
+                    {"Authorization": f"Bearer {self.api_token}"}
+                    if self.api_token
+                    else {}
+                ),
+            )
+            with urllib.request.urlopen(request, timeout=1.0) as response:
                 self.health = json.loads(response.read().decode("utf-8"))
             ready = self.health.get("status") == "ready"
             self.backend_label.setText(f"后端：{'已就绪' if ready else self.health.get('status', '未知')}")
@@ -927,7 +962,9 @@ class DesktopWindow(QMainWindow):
         self.refresh_button.setEnabled(False)
         self.device_select_combo.setEnabled(False)
         self.worker_thread = QThread(self)
-        self.worker = MeetingWorker(self.base_url, self.device_combo.currentData())
+        self.worker = MeetingWorker(
+            self.base_url, self.device_combo.currentData(), self.api_token
+        )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.status.connect(self.status_label.setText)
@@ -1035,7 +1072,9 @@ class DesktopWindow(QMainWindow):
         self.status_label.setText("正在请求积墨 AI 生成会议纪要…")
         self.start_button.setEnabled(False)
         self.summary_thread = QThread(self)
-        self.summary_worker = SummaryWorker(self.base_url, self.last_meeting_id)
+        self.summary_worker = SummaryWorker(
+            self.base_url, self.last_meeting_id, self.api_token
+        )
         self.summary_worker.moveToThread(self.summary_thread)
         self.summary_thread.started.connect(self.summary_worker.run)
         self.summary_worker.status.connect(self.status_label.setText)
@@ -1110,9 +1149,13 @@ class DesktopWindow(QMainWindow):
         event.accept()
 
 
-def _backend_is_reachable(base_url: str) -> bool:
+def _backend_is_reachable(base_url: str, api_token: str = "") -> bool:
     try:
-        with urllib.request.urlopen(f"{base_url}/api/health", timeout=0.5):
+        request = urllib.request.Request(
+            f"{base_url}/api/health",
+            headers={"Authorization": f"Bearer {api_token}"} if api_token else {},
+        )
+        with urllib.request.urlopen(request, timeout=0.5):
             return True
     except OSError:
         return False
@@ -1124,9 +1167,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-backend", action="store_true")
     args = parser.parse_args(argv)
+    api_token = load_settings().api_token
     base_url = f"http://{args.host}:{args.port}"
     backend_process = None
-    if not args.no_backend and not _backend_is_reachable(base_url):
+    if not args.no_backend and not _backend_is_reachable(base_url, api_token):
         project_root = Path(__file__).resolve().parent.parent
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         backend_process = subprocess.Popen(
@@ -1142,7 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
     # stylesheet so labels never become white-on-white.
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei", 10))
-    window = DesktopWindow(base_url, backend_process)
+    window = DesktopWindow(base_url, backend_process, api_token)
     window.show()
     return app.exec()
 

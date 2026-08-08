@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import re
 import sys
@@ -67,6 +68,9 @@ NLLB_CODES = {
 
 
 def choose_device(requested: str) -> tuple[str, str]:
+    requested = (requested or "auto").strip().casefold()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("MEETING_DEVICE 必须是 auto、cpu 或 cuda")
     if requested == "cpu":
         return "cpu", "int8"
     if requested in {"auto", "cuda"}:
@@ -84,6 +88,8 @@ def choose_device(requested: str) -> tuple[str, str]:
         except Exception:
             if requested == "cuda":
                 raise RuntimeError("CTranslate2 未发现可用 CUDA，请检查 CUDA 12、cuBLAS 和 cuDNN 9")
+        if requested == "cuda":
+            raise RuntimeError("CTranslate2 未发现可用 CUDA，请检查 CUDA 12、cuBLAS 和 cuDNN 9")
     return "cpu", "int8"
 
 
@@ -192,6 +198,25 @@ class LiveModelRuntime:
         self.ready = True
         self.status = "模型已就绪"
         progress(self.status)
+
+    def close(self) -> None:
+        """Release model references and any cached CUDA allocations."""
+
+        self.ready = False
+        self.asr = None
+        self.translator = None
+        self.detector = None
+        self.speakers = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            # Cleanup must never hide the original device-switch result.
+            pass
+        gc.collect()
+        self.status = "模型已释放"
 
     def _warmup(self) -> None:
         """Initialize CUDA kernels before the first participant starts speaking."""

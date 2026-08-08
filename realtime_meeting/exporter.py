@@ -46,6 +46,7 @@ def export_live_result(
     audio_segments: list[dict[str, object]],
     status: str,
     summary_error: str | None = None,
+    processing_error: str | None = None,
 ) -> list[str]:
     items = list(utterances)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +94,7 @@ def export_live_result(
         "audio_manifest": "audio_manifest.json",
         "minutes": "meeting_minutes.md" if (output_dir / "meeting_minutes.md").exists() else None,
         "summary_error": summary_error,
+        "processing_error": processing_error,
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
