@@ -5,8 +5,8 @@
 首版支持：
 
 - 中文、英文、德文实时原文转写；英文和德文翻译为简体中文。
-- 会议结束后自动生成中文 Markdown 会议纪要。
-- 纪要原子保存后，使用独立 Jimo 节点、独立 session 生成 To-do-list JSON。
+- 会议结束后自动完成 ASR 精修、说话人重排和翻译；完成后由用户点击按钮生成中文 Markdown 会议纪要。
+- 用户触发纪要后，纪要原子保存，再使用独立 Jimo 节点、独立 session 自动生成 To-do-list JSON。
 - 会议历史、下载、删除、总结重试、To-do 独立重试和进程重启恢复。
 - 本地文件存储、任务状态和企业部署所需的 Store / Queue / LLMProvider 扩展边界。
 
@@ -21,6 +21,13 @@
 也可以在项目目录中双击 `启动会记.cmd`。两个启动方式都以启动文件所在目录为项目根目录，不依赖固定盘符或用户名。
 
 首次启动脚本会创建 `.venv`、安装基础依赖和音频依赖，并从 `.env.example` 创建 `.env`。启动后打开 <http://127.0.0.1:8765>。
+
+首次部署或需要完全离线运行时，建议先显式准备并校验所有模型。模型下载和转换可能超过启动脚本的 120 秒就绪等待时间：
+
+```powershell
+& .venv\Scripts\python.exe scripts\prepare_models.py --download-translation
+& .venv\Scripts\python.exe scripts\prepare_models.py --check-only
+```
 
 也可以手动安装：
 
@@ -73,9 +80,11 @@ Jimo 请求继续使用旧版兼容格式：`messages`、`sessionId`、`source: 
 ```text
 GET    /api/v2/health
 GET    /api/v2/metrics
+POST   /api/v2/auth/session
 GET    /api/v2/meetings
 POST   /api/v2/meetings
 GET    /api/v2/meetings/{id}
+GET    /api/v2/meetings/{id}/transcript?offset=0&limit=500
 DELETE /api/v2/meetings/{id}
 POST   /api/v2/meetings/{id}/stream-ticket
 WS     /api/v2/meetings/{id}/stream
@@ -85,6 +94,8 @@ POST   /api/v2/meetings/{id}/todo
 POST   /api/v2/meetings/{id}/postprocess
 GET    /api/v2/meetings/{id}/files/{path}
 ```
+
+`POST /summary` 只有在 ASR 精修、说话人重排和翻译全部完成后才接受请求。生成纪要成功后，服务会自动使用当前纪要版本生成 To-do-list；`POST /todo` 用于单独重试行动项。
 
 ## 并发边界
 
@@ -99,10 +110,10 @@ GET    /api/v2/meetings/{id}/files/{path}
 & .venv\Scripts\python.exe -m compileall -q realtime_meeting
 ```
 
-真实 Jimo smoke test 可显式读取已经填写的 `.env.example`；脚本只输出调用状态和数量，不打印 Authorization 或模型响应正文：
+真实 Jimo smoke test 默认读取未纳入版本控制的本地 `.env`；脚本只输出调用状态和数量，不打印 Authorization 或模型响应正文：
 
 ```powershell
-& .venv\Scripts\python.exe scripts\run_jimo_smoke.py --env-file .env.example
+& .venv\Scripts\python.exe scripts\run_jimo_smoke.py --env-file .env
 ```
 
-没有配置 Jimo 时，实时转写和文件保存仍可运行，但总结任务会进入可重试失败状态。固定合成会议数据见 [tests/fixtures/sample_meeting.jsonl](tests/fixtures/sample_meeting.jsonl)。
+没有配置 Jimo 时，实时转写、自动精修、翻译和文件保存仍可运行；点击生成纪要后会显示可重试的配置错误。固定合成会议数据见 [tests/fixtures/sample_meeting.jsonl](tests/fixtures/sample_meeting.jsonl)。

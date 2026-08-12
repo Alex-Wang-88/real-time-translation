@@ -156,6 +156,10 @@ async def test_full_meeting_lifecycle(session: LiveMeetingSession) -> None:
     await drive_audio(session)
     await session.request_stop("user")
     await wait_until(session, lambda: session.recording_state == "complete")
+    await wait_until(session, lambda: session.postprocess.state == "ready_for_summary", timeout=15)
+    assert session.summary_state == "idle"
+    assert session.todo_state == "waiting_summary"
+    assert await session.request_summary() is True
     await wait_until(session, lambda: session.summary_state == "complete", timeout=15)
     await wait_until(session, lambda: session.todo_state == "complete", timeout=15)
 
@@ -214,6 +218,8 @@ async def test_recover_interrupted_meeting(tmp_path: Path) -> None:
     await drive_audio(first)
     await first.request_stop("user")
     await wait_until(first, lambda: first.recording_state == "complete")
+    await wait_until(first, lambda: first.postprocess.state == "ready_for_summary", timeout=15)
+    assert await first.request_summary() is True
     await wait_until(first, lambda: first.summary_state == "complete", timeout=15)
     await wait_until(first, lambda: first.todo_state == "complete", timeout=15)
 
@@ -270,6 +276,8 @@ async def test_unsupported_translation_leaves_translation_empty(session: LiveMee
             if item.language != "zh"
         ),
     )
+    if session.postprocess_task:
+        await session.postprocess_task
     utterances = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert utterances, "应当有转写内容"
     for item in utterances:

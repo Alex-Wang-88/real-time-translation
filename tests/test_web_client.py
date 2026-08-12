@@ -25,3 +25,10 @@ def test_web_client_supports_cookie_auth_and_full_transcript_pages() -> None:
     assert 'fetch("/api/v2/auth/session"' in source
     assert "async function loadFullTranscript(id)" in source
     assert "/transcript?offset=${offset}&limit=${limit}" in source
+
+
+def test_summary_button_waits_for_automatic_refinement() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    assert 'const preprocessingReady = ["asr_refine", "diarization", "translation"].every' in source
+    assert '"生成纪要和 To-do-list"' in source
+    assert 'value.state === "ready_for_summary"' in source

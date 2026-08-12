@@ -114,8 +114,8 @@
         <section class="result-card summary-card">
           <div class="panel-heading compact"><div><h3>会议纪要</h3></div><span id="summaryBadge" class="badge neutral">等待会议结束</span></div>
           <div id="summaryProgress" class="progress-line" hidden><span id="summaryProgressBar"></span></div>
-          <div id="summaryText" class="result-content empty-result">完成会议后，系统会自动整理可审计的中文会议纪要。</div>
-          <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>重试会议纪要</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
+          <div id="summaryText" class="result-content empty-result">停止会议后会先自动完成 ASR 精修、说话人重排和翻译。</div>
+          <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>生成纪要和 To-do-list</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
         </section>
 
         <section class="result-card todo-card">
@@ -141,6 +141,6 @@
         <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="dialogStart" class="primary-button" value="default" type="submit">开始会议 →</button></div>
       </form>
     </dialog>
-    <script type="module" src="/static/app.js?v=6"></script>
+    <script type="module" src="/static/app.js?v=7"></script>
   </body>
 </html>

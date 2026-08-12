@@ -14,10 +14,10 @@ FastAPI REST + WebSocket
     ├── Resemblyzer voice encoder（停录后匿名说话人重排）
     ├── OPUS-MT en→zh-CN、de→zh-CN（本地 CTranslate2 int8）
     ├── 本地文件和 session_state.json
-    └── Jimo SSE：summary 多轮 → minutes 原子保存 → todo 单轮
+    └── 用户触发 Jimo SSE：summary 多轮 → minutes 原子保存 → todo 单轮
 ```
 
-默认优先级：实时 ASR > 实时翻译 > 音频落盘 > 停止后精修 > 会议纪要 > To-do-list。
+默认优先级：实时 ASR > 实时翻译 > 音频落盘 > 停止后精修/说话人重排/最终翻译。前三项完成后由用户触发会议纪要，再自动生成 To-do-list。
 
 默认限制：
 

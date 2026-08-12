@@ -28,6 +28,27 @@ class SegmentEvent:
     forced: bool = False
 
 
+def decode_audio_pcm(path: Path) -> bytes:
+    """Decode a saved audio segment to 16 kHz mono PCM16 for recovery."""
+    if path.suffix.casefold() == ".wav":
+        with wave.open(str(path), "rb") as source:
+            if source.getnchannels() == 1 and source.getsampwidth() == SAMPLE_WIDTH and source.getframerate() == SAMPLE_RATE:
+                return source.readframes(source.getnframes())
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(f"恢复精修输入需要 FFmpeg: {path.name}")
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
+    if result.returncode:
+        raise RuntimeError(f"恢复精修音频失败 {path.name}: {result.stderr.decode('utf-8', errors='replace').strip()}")
+    return result.stdout
+
+
 class StreamSegmenter:
     def __init__(
         self,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from realtime_meeting.audio import FRAME_BYTES, StreamSegmenter
+import wave
+
+from realtime_meeting.audio import FRAME_BYTES, SAMPLE_RATE, StreamSegmenter, decode_audio_pcm
 
 
 def test_segmenter_handles_odd_packet_and_emits_final_segment() -> None:
@@ -53,3 +55,14 @@ def test_short_noise_burst_does_not_pass_utterance_admission() -> None:
     for _ in range(10):
         events.extend(segmenter.feed(silence))
     assert not [event for event in events if event.kind == "final"]
+
+
+def test_decode_audio_pcm_reads_native_wave(tmp_path) -> None:
+    path = tmp_path / "saved.wav"
+    pcm = np.arange(320, dtype=np.int16).tobytes()
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(SAMPLE_RATE)
+        output.writeframes(pcm)
+    assert decode_audio_pcm(path) == pcm

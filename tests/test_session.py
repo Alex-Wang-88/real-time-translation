@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import wave
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from realtime_meeting.models import TodoDocument, TodoItem, Utterance
+from realtime_meeting.audio import SAMPLE_RATE, SegmentEvent
 from realtime_meeting.session import LiveMeetingSession
 from realtime_meeting.session import SessionManager
 from realtime_meeting.storage import LocalMeetingStore
@@ -66,6 +69,21 @@ class FakeTodoGenerator:
         )
 
 
+class BlockingTodoGenerator:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(self, meeting_id, summary_revision, minutes, **kwargs):
+        type(self).started.set()
+        await type(self).release.wait()
+        return TodoDocument(
+            items=[TodoItem(task=f"旧版本 {summary_revision}")],
+            meeting_id=meeting_id,
+            summary_revision=summary_revision,
+            generated_at="now",
+        )
+
+
 @pytest.mark.asyncio
 async def test_summary_and_todo_are_independent_and_revisioned(settings) -> None:
     FakeSummarizer.calls = 0
@@ -91,6 +109,11 @@ async def test_summary_and_todo_are_independent_and_revisioned(settings) -> None
     await session.request_stop()
     assert session.stop_task is not None
     await session.stop_task
+    if session.postprocess_task:
+        await session.postprocess_task
+    assert session.postprocess.state == "ready_for_summary"
+    assert session.summary_state == "idle"
+    assert await session.request_summary()
     if session.summary_task:
         await session.summary_task
     if session.todo_task:
@@ -112,24 +135,26 @@ async def test_summary_and_todo_are_independent_and_revisioned(settings) -> None
     assert FakeTodoGenerator.calls == 2
 
 
-def test_recovery_promotes_saved_interrupted_recording_to_summary_queue(settings) -> None:
+def test_recovery_promotes_saved_interrupted_recording_to_postprocess_queue(settings) -> None:
     store = LocalMeetingStore(settings.results_dir)
     meeting_id = "recovered-meeting"
     output = store.meeting_dir(meeting_id)
     output.mkdir(parents=True, exist_ok=True)
     (output / "transcript.jsonl").write_text(
-        __import__("json").dumps(Utterance(1, 0, 1, 1, "zh", 0.9, "已保存内容", "已保存内容", "not_needed", "1:0").to_dict(), ensure_ascii=False) + "\n",
+        json.dumps(Utterance(1, 0, 1, 1, "zh", 0.9, "已保存内容", "已保存内容", "not_needed", "1:0").to_dict(), ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     (output / "session_state.json").write_text(
-        __import__("json").dumps({"id": meeting_id, "title": "恢复会议", "recording_state": "recording", "summary_state": "idle", "todo_state": "waiting_summary"}, ensure_ascii=False),
+        json.dumps({"id": meeting_id, "title": "恢复会议", "recording_state": "recording", "summary_state": "idle", "todo_state": "waiting_summary"}, ensure_ascii=False),
         encoding="utf-8",
     )
     manager = SessionManager(settings, FakeRuntime(), store)
     recovered = manager.get(meeting_id)
     assert recovered is not None
     assert recovered.recording_state == "complete"
-    assert recovered.summary_state == "queued"
+    assert recovered.summary_state == "idle"
+    assert recovered.postprocess.state == "queued"
+    assert recovered.postprocess.stages["asr_refine"]["state"] == "queued"
     assert recovered.ended_at
 
 
@@ -140,11 +165,133 @@ def test_recovery_requeues_running_postprocessing_tasks(settings) -> None:
     output.mkdir(parents=True, exist_ok=True)
     (output / "meeting_minutes.md").write_text("# 已保存纪要\n", encoding="utf-8")
     (output / "session_state.json").write_text(
-        __import__("json").dumps({"id": meeting_id, "title": "恢复任务", "recording_state": "complete", "summary_state": "running", "todo_state": "running", "summary_revision": 1}, ensure_ascii=False),
+        json.dumps({"id": meeting_id, "title": "恢复任务", "recording_state": "complete", "summary_state": "running", "todo_state": "running", "summary_revision": 1}, ensure_ascii=False),
         encoding="utf-8",
     )
     manager = SessionManager(settings, FakeRuntime(), store)
     recovered = manager.get(meeting_id)
     assert recovered is not None
-    assert recovered.summary_state == "queued"
-    assert recovered.todo_state == "queued"
+    assert recovered.summary_state == "idle"
+    assert recovered.todo_state == "waiting_summary"
+
+
+@pytest.mark.asyncio
+async def test_recovery_resumes_todo_for_completed_summary(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    meeting_id = "recovered-todo"
+    output = store.meeting_dir(meeting_id)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "meeting_minutes.md").write_text("# 已完成纪要\n", encoding="utf-8")
+    (output / "session_state.json").write_text(
+        json.dumps({
+            "id": meeting_id,
+            "recording_state": "complete",
+            "summary_state": "complete",
+            "todo_state": "running",
+            "summary_revision": 1,
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    manager = SessionManager(settings, FakeRuntime(), store)
+    recovered = manager.get(meeting_id)
+    assert recovered is not None and recovered.todo_state == "queued"
+    recovered.todo_factory = lambda _settings: FakeTodoGenerator()
+    await manager.resume_pending()
+    assert recovered.todo_task is not None
+    await recovered.todo_task
+    assert recovered.todo_state == "complete"
+
+
+def test_refinement_event_survives_restart(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    first = LiveMeetingSession(settings, FakeRuntime(), store, title="精修恢复")
+    event = SegmentEvent("final", np.full(640, 1000, dtype=np.int16).tobytes(), 1.0, 1.04, 7)
+    first._persist_refinement_event(event)
+
+    restored = LiveMeetingSession(settings, FakeRuntime(), store, meeting_id=first.id, recovered_state={"recording_state": "complete"})
+    assert restored._refinement_events[7].pcm == event.pcm
+    assert restored._refinement_events[7].start == 1.0
+
+
+def test_refinement_events_can_be_rebuilt_from_saved_audio(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    session = LiveMeetingSession(settings, FakeRuntime(), store, title="录音重建")
+    audio_dir = session.output_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / "audio-0001.wav"
+    pcm = np.full(SAMPLE_RATE, 1000, dtype=np.int16).tobytes()
+    with wave.open(str(audio_path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(SAMPLE_RATE)
+        output.writeframes(pcm)
+    session.audio_segments = [{"file": audio_path.name, "samples": SAMPLE_RATE}]
+    from realtime_meeting.exporter import append_utterance
+    append_utterance(session.transcript_path, Utterance(1, 0.1, 0.4, 1, "zh", 1.0, "恢复", segment_id="1:0", source_segment_id="1"))
+
+    assert session._rebuild_refinement_events_from_audio() == 1
+    assert len(session._refinement_events[1].pcm) == round(0.3 * SAMPLE_RATE) * 2
+
+
+@pytest.mark.asyncio
+async def test_refinement_queue_overflow_is_processed_after_stop(settings) -> None:
+    settings.refinement_queue_size = 1
+    session = LiveMeetingSession(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    pcm = np.full(640, 1000, dtype=np.int16).tobytes()
+    await session._handle_final(SegmentEvent("final", pcm, 0.0, 0.04, 1))
+    await session._handle_final(SegmentEvent("final", pcm, 0.1, 0.14, 2))
+    assert session.refinement_queue.qsize() == 1
+    assert len(session._refinement_events) == 2
+    session.recording_state = "complete"
+    session._set_postprocess_queue(True)
+    await session.run_postprocess()
+    refined_sources = {
+        item.source_segment_id for item in session.recent if item.recognition_stage == "refined"
+    }
+    assert refined_sources == {"1", "2"}
+    assert session.postprocess.state == "ready_for_summary"
+
+
+@pytest.mark.asyncio
+async def test_refinement_recovery_fails_without_persisted_or_saved_audio(settings) -> None:
+    session = LiveMeetingSession(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    from realtime_meeting.exporter import append_utterance
+    append_utterance(session.transcript_path, Utterance(1, 0.0, 0.5, 1, "zh", 1.0, "仅有文本", segment_id="1:0", source_segment_id="1"))
+    session.recording_state = "complete"
+    session._set_postprocess_queue(True)
+    await session.run_postprocess()
+    assert session.postprocess.state == "error"
+    assert session.postprocess.stages["asr_refine"]["state"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_new_summary_cancels_old_todo_task(settings) -> None:
+    BlockingTodoGenerator.started = asyncio.Event()
+    BlockingTodoGenerator.release = asyncio.Event()
+    session = LiveMeetingSession(
+        settings,
+        FakeRuntime(),
+        LocalMeetingStore(settings.results_dir),
+        title="版本竞态",
+        summarizer_factory=lambda _settings: FakeSummarizer(),
+        todo_factory=lambda _settings: BlockingTodoGenerator(),
+    )
+    session.recording_state = "complete"
+    session.postprocess.update("asr_refine", "complete")
+    session.postprocess.update("diarization", "complete")
+    session.postprocess.update("translation", "complete")
+    session.summary = "旧纪要"
+    session.summary_revision = 1
+    session.summary_state = "complete"
+    session.todo_state = "queued"
+    session.todo_task = asyncio.create_task(session.run_todo())
+    await BlockingTodoGenerator.started.wait()
+
+    assert await session.request_summary() is True
+    assert session.todo_task is None
+    assert session.summary_task is not None
+    await session.summary_task
+    if session.todo_task:
+        session.todo_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session.todo_task

@@ -86,7 +86,9 @@ def test_browser_session_cookie_authenticates_api(tmp_path) -> None:
         assert login.status_code == 204
         assert "HttpOnly" in login.headers["set-cookie"] and "SameSite=strict" in login.headers["set-cookie"]
         assert client.get("/api/v2/health").status_code == 200
-        assert client.post("/api/v2/meetings", json={"title": "浏览器鉴权"}).status_code == 201
+        created = client.post("/api/v2/meetings", json={"title": "浏览器鉴权"})
+        assert created.status_code == 201
+        assert client.post(f"/api/v2/meetings/{created.json()['id']}/stop").status_code == 202
 
 
 def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
@@ -102,3 +104,4 @@ def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
         second = client.get(f"/api/v2/meetings/{meeting.id}/transcript?offset=500&limit=500").json()
         assert first["total"] == 501 and first["has_more"] is True and len(first["items"]) == 500
         assert second["has_more"] is False and [item["text"] for item in second["items"]] == ["发言500"]
+        assert client.post(f"/api/v2/meetings/{meeting.id}/stop").status_code == 202

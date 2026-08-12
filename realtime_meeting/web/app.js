@@ -81,7 +81,7 @@ const summaryLabels = { idle: "等待会议结束", queued: "排队中", running
 const todoLabels = { waiting_summary: "等待会议纪要", queued: "排队中", running: "提取中", complete: "已完成", stale: "纪要已更新", error: "生成失败" };
 
 const postprocessStageLabels = { asr_refine: "ASR精修", diarization: "说话人重排", translation: "翻译", summary: "会议纪要", todo: "To-do-list" };
-const postprocessStateLabels = { idle: "未开始", queued: "排队中", running: "处理中", complete: "已完成", partial: "部分完成", error: "处理失败" };
+const postprocessStateLabels = { idle: "未开始", queued: "排队中", running: "处理中", ready_for_summary: "精修完成", complete: "已完成", partial: "部分完成", error: "处理失败" };
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -271,11 +271,19 @@ function renderTranscript(autoScroll = false) {
 
 function renderSummary(summary, summaryState) {
   const value = String(summary || "").trim();
+  const stages = state.meeting?.postprocess?.stages || {};
+  const preprocessingReady = ["asr_refine", "diarization", "translation"].every((key) => stages[key]?.state === "complete");
   dom.summaryBadge.textContent = summaryLabels[summaryState] || stateText(summaryState);
   dom.summaryBadge.className = `badge ${summaryState === "complete" ? "success" : summaryState === "error" ? "danger" : "neutral"}`;
   dom.summaryText.classList.toggle("empty-result", !value);
-  dom.summaryText.innerHTML = value ? markdownToHtml(value) : "完成会议后，系统会自动整理可审计的中文会议纪要。";
-  dom.retrySummary.hidden = summaryState !== "error";
+  dom.summaryText.innerHTML = value
+    ? markdownToHtml(value)
+    : preprocessingReady
+      ? "ASR 精修、说话人重排和翻译已经完成，可以生成会议纪要和 To-do-list。"
+      : "停止会议后会先自动完成 ASR 精修、说话人重排和翻译。";
+  dom.retrySummary.hidden = !(preprocessingReady && ["idle", "error", "complete"].includes(summaryState));
+  dom.retrySummary.disabled = !preprocessingReady || summaryState === "running";
+  dom.retrySummary.textContent = summaryState === "complete" ? "重新生成纪要和 To-do-list" : "生成纪要和 To-do-list";
   dom.downloadSummary.hidden = !value || !state.meeting?.files?.includes("meeting_minutes.md");
   dom.summaryProgress.hidden = !["queued", "running"].includes(summaryState);
 }
@@ -331,7 +339,7 @@ function renderPostprocess(postprocess) {
   dom.postprocessBadge.textContent = postprocessStateLabels[value.state] || stateText(value.state);
   dom.postprocessBadge.className = `badge ${value.state === "complete" ? "success" : value.state === "error" ? "danger" : "neutral"}`;
   dom.postprocessProgressBar.style.width = `${Math.max(0, Math.min(100, Number(value.overall_percent) || 0))}%`;
-  dom.postprocessMessage.textContent = value.error || (value.current_stage ? `${postprocessStageLabels[value.current_stage] || value.current_stage}处理中` : "等待处理");
+  dom.postprocessMessage.textContent = value.error || (value.state === "ready_for_summary" ? "自动精修已完成，可以生成纪要和 To-do-list" : value.current_stage ? `${postprocessStageLabels[value.current_stage] || value.current_stage}处理中` : "等待处理");
   dom.postprocessStages.replaceChildren();
   for (const [key, stage] of Object.entries(stages)) {
     const article = document.createElement("article");
@@ -363,7 +371,7 @@ function applySnapshot(snapshot, replace = false) {
   dom.recordingState.textContent = recordingLabels[state.meeting.recording_state] || stateText(state.meeting.recording_state);
   dom.recordingIndicator.classList.toggle("active", state.meeting.recording_state === "recording");
   dom.recordButton.disabled = !["recording", "starting"].includes(state.meeting.recording_state);
-  dom.recordingHint.textContent = state.meeting.error || (state.meeting.recording_state === "recording" ? "正在接收麦克风音频。结束后会自动生成纪要和 To-do-list。" : "录音已经结束，可以查看或重试后处理任务。");
+  dom.recordingHint.textContent = state.meeting.error || (state.meeting.recording_state === "recording" ? "正在接收麦克风音频。结束后会自动精修，精修完成后可生成纪要和 To-do-list。" : "录音已经结束，可以查看或重试后处理任务。");
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
   dom.languageIndicator.textContent = state.meeting.current_language ? `最近语言：${String(state.meeting.current_language).toUpperCase()}` : "等待语音";
   renderTranscript();
@@ -626,7 +634,7 @@ async function handleEvent(payload) {
   } else if (type === "recording_complete") {
     stopAudioCapture();
     applySnapshot(payload.meeting, false);
-    // ASR refinement and the remaining post-processing stages are server-side
+    // ASR refinement, diarization and translation are server-side
     // jobs. Close the audio websocket deliberately so its normal shutdown is
     // never presented as an endless reconnect loop.
     closeStream(true);
@@ -696,7 +704,7 @@ async function stopMeeting() {
 
 async function retrySummary() {
   if (!state.meeting) return;
-  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" }); state.meeting.summary_state = "running"; renderSummary(state.meeting.summary, "running"); }
+  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" }); state.meeting.summary_state = "running"; renderSummary(state.meeting.summary, "running"); setNotice("正在生成会议纪要，完成后会自动生成 To-do-list。", "info"); }
   catch (error) { setNotice(error.message, "error"); }
 }
 

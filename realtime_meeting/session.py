@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from fastapi import WebSocket
 
-from .audio import RotatingAudioWriter, SegmentEvent, StreamSegmenter
+from .audio import SAMPLE_RATE, SAMPLE_WIDTH, RotatingAudioWriter, SegmentEvent, StreamSegmenter, decode_audio_pcm
 from .config import Settings
 from .diarization import align_speakers, write_segments
 from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
@@ -97,6 +97,7 @@ class LiveMeetingSession:
         self.refinement_queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(maxsize=settings.refinement_queue_size)
         self.refinement_worker_task: asyncio.Task[None] | None = None
         self._refinement_events: dict[int, SegmentEvent] = {}
+        self.refinement_dir = self.output_dir / "refinement_events"
         self.refinement_dropped = 0
         self._segment_first_ids: dict[int, int] = {}
         self._segment_ids: dict[int, list[str]] = {}
@@ -111,6 +112,7 @@ class LiveMeetingSession:
         self.summarizer_factory = summarizer_factory or MeetingSummarizer
         self.todo_factory = todo_factory or TodoGenerator
         self._restore_files(payload)
+        self._restore_refinement_events()
         if self.postprocess.state in {"running", "queued"} and self.recording_state == "complete":
             self.postprocess.state = "queued"
 
@@ -163,6 +165,87 @@ class LiveMeetingSession:
                 self.audio_bytes_received = self.audio_samples_received * 2
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
+
+    def _persist_refinement_event(self, event: SegmentEvent) -> None:
+        self.refinement_dir.mkdir(parents=True, exist_ok=True)
+        pcm_path = self.refinement_dir / f"{event.revision}.pcm"
+        temporary = pcm_path.with_suffix(".pcm.tmp")
+        temporary.write_bytes(event.pcm)
+        temporary.replace(pcm_path)
+        atomic_write_json(self.refinement_dir / f"{event.revision}.json", {
+            "revision": event.revision,
+            "start": event.start,
+            "end": event.end,
+            "forced": event.forced,
+            "pcm": pcm_path.name,
+            "first_utterance_id": self._segment_first_ids.get(event.revision),
+        })
+
+    def _restore_refinement_events(self) -> None:
+        if not self.refinement_dir.is_dir():
+            return
+        for metadata_path in sorted(self.refinement_dir.glob("*.json")):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                pcm_path = self.refinement_dir / str(metadata["pcm"])
+                event = SegmentEvent(
+                    "final",
+                    pcm_path.read_bytes(),
+                    float(metadata["start"]),
+                    float(metadata["end"]),
+                    int(metadata["revision"]),
+                    bool(metadata.get("forced", False)),
+                )
+                if event.pcm:
+                    self._refinement_events[event.revision] = event
+                    first_id = metadata.get("first_utterance_id")
+                    if first_id is not None:
+                        self._segment_first_ids[event.revision] = int(first_id)
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+
+    def _rebuild_refinement_events_from_audio(self) -> int:
+        """Recreate missing final-segment PCM from retained audio and transcript timestamps."""
+        if self._refinement_events:
+            return len(self._refinement_events)
+        paths = [
+            self.output_dir / "audio" / str(segment.get("file"))
+            for segment in self.audio_segments
+            if isinstance(segment, dict) and segment.get("file")
+        ]
+        paths = [path for path in paths if path.is_file()]
+        if not paths:
+            return 0
+        pcm = b"".join(decode_audio_pcm(path) for path in paths)
+        items = load_utterances(self.transcript_path)
+        grouped: dict[str, list[Utterance]] = {}
+        for item in items:
+            grouped.setdefault(item.source_segment_id or item.segment_id.split(":", 1)[0], []).append(item)
+        next_revision = 1
+        for source_id, group in sorted(grouped.items(), key=lambda pair: min(item.start for item in pair[1])):
+            try:
+                revision = int(source_id)
+            except ValueError:
+                revision = next_revision
+            while revision in self._refinement_events:
+                revision += 1
+            next_revision = max(next_revision, revision + 1)
+            start = min(item.start for item in group)
+            end = max(item.end for item in group)
+            first = max(0, round(start * SAMPLE_RATE) * SAMPLE_WIDTH)
+            last = min(len(pcm), round(end * SAMPLE_RATE) * SAMPLE_WIDTH)
+            if last <= first:
+                continue
+            event = SegmentEvent("final", pcm[first:last], start, end, revision)
+            self._refinement_events[revision] = event
+            self._segment_first_ids[revision] = min(item.id for item in group)
+            self._persist_refinement_event(event)
+        return len(self._refinement_events)
+
+    def _clear_refinement_events(self) -> None:
+        self._refinement_events.clear()
+        if self.refinement_dir.is_dir():
+            shutil.rmtree(self.refinement_dir)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -389,11 +472,12 @@ class LiveMeetingSession:
                 task.add_done_callback(self.translation_tasks.discard)
         if self.settings.enable_refinement:
             try:
-                self.refinement_queue.put_nowait(event)
+                await asyncio.to_thread(self._persist_refinement_event, event)
                 self._refinement_events[event.revision] = event
+                self.refinement_queue.put_nowait(event)
             except asyncio.QueueFull:
                 self.refinement_dropped += 1
-                await self.broadcast("warning", message="精修队列已满，本片段保留实时识别结果")
+                await self.broadcast("warning", message="精修队列已满，本片段已持久化并将在停止后处理")
 
     async def _translate_item(self, item: Utterance) -> None:
         try:
@@ -516,8 +600,8 @@ class LiveMeetingSession:
                 "asr_refine": {"state": "queued" if enabled and self.settings.enable_refinement else "complete"},
                 "diarization": {"state": "queued" if enabled else "complete"},
                 "translation": {"state": "queued" if has_items else "complete"},
-                "summary": {"state": "queued" if has_items else "error"},
-                "todo": {"state": "queued" if has_items else "idle"},
+                "summary": {"state": "idle" if has_items else "error"},
+                "todo": {"state": "idle"},
             },
         })
 
@@ -632,18 +716,17 @@ class LiveMeetingSession:
             if release_realtime:
                 await asyncio.to_thread(release_realtime)
             refine_stage = self.postprocess.stages.get("asr_refine", {})
-            events_total = self.refinement_queue.qsize()
             self._refinement_errors = []
-            if (
-                self.settings.enable_refinement
-                and refine_stage.get("state") != "complete"
-                and events_total == 0
-                and self._refinement_events
-            ):
-                for event in self._refinement_events.values():
-                    with suppress(asyncio.QueueFull):
-                        self.refinement_queue.put_nowait(event)
-                events_total = self.refinement_queue.qsize()
+            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and not self._refinement_events:
+                await asyncio.to_thread(self._rebuild_refinement_events_from_audio)
+            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and self._refinement_events:
+                events = sorted(self._refinement_events.values(), key=lambda item: item.revision)
+                self.refinement_queue = asyncio.Queue(
+                    maxsize=max(self.settings.refinement_queue_size, len(events) + 1)
+                )
+                for event in events:
+                    self.refinement_queue.put_nowait(event)
+            events_total = self.refinement_queue.qsize()
             if self.settings.enable_refinement and refine_stage.get("state") != "complete" and events_total:
                 await self._postprocess_update("asr_refine", "running", current=0, total=events_total)
                 self.refinement_worker_task = asyncio.create_task(self._refinement_worker(), name=f"refinement-{self.id}")
@@ -659,8 +742,11 @@ class LiveMeetingSession:
                     await self._warm_realtime_after_postprocess()
                     return
                 await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
-            elif refine_stage.get("state") != "complete":
+                await asyncio.to_thread(self._clear_refinement_events)
+            elif refine_stage.get("state") != "complete" and not self.settings.enable_refinement:
                 await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
+            elif refine_stage.get("state") != "complete":
+                raise RuntimeError("ASR 精修输入无法从持久化片段或保留录音恢复")
             self._export_current_files()
             if self.postprocess.stages.get("diarization", {}).get("state") != "complete":
                 await self._run_diarization()
@@ -673,7 +759,7 @@ class LiveMeetingSession:
                 translation_ok = await self._run_final_translation()
             self._export_current_files()
             if not translation_ok:
-                self.summary_state = "queued"
+                self.summary_state = "idle"
                 self.todo_state = "waiting_summary"
                 self._write_state()
                 await self._warm_realtime_after_postprocess()
@@ -684,23 +770,11 @@ class LiveMeetingSession:
                 self.summary_error = "会议没有可总结的有效发言"
                 await self._postprocess_update()
                 return
-            if self.summary_state != "complete":
-                self.summary_state = "queued"
-                await self._postprocess_update("summary", "running")
-                await self.run_summary()
-            if self.todo_state != "complete" and self.todo_task:
-                await self.todo_task
-            elif self.todo_state != "complete" and self.summary_state == "complete":
-                self.todo_state = "queued"
-                await self._postprocess_update("todo", "running")
-                await self.run_todo()
-            if self.todo_state == "complete":
-                if any(stage.get("state") in {"partial", "error"} for stage in self.postprocess.stages.values()):
-                    self.postprocess.state = "partial"
-                else:
-                    self.postprocess.complete()
-            elif self.summary_state == "error" or self.todo_state == "error":
-                self.postprocess.state = "error"
+            self.summary_state = "idle"
+            self.todo_state = "waiting_summary"
+            self.postprocess.state = "ready_for_summary"
+            self.postprocess.current_stage = None
+            self.postprocess.error = None
             self._export_current_files()
             await self._postprocess_update()
             await self._warm_realtime_after_postprocess()
@@ -730,7 +804,6 @@ class LiveMeetingSession:
         if isinstance(metrics, dict):
             metrics["retry_count"] = int(metrics.get("retry_count", 0)) + 1
         self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"retry-postprocess-{self.id}")
-        self.summary_task = self.postprocess_task
         await self._postprocess_update()
         return True
 
@@ -759,7 +832,7 @@ class LiveMeetingSession:
         self.ended_at = utc_now_iso()
         self.recording_state = "complete"
         items = load_utterances(self.transcript_path)
-        self.summary_state = "queued" if items else "error"
+        self.summary_state = "idle" if items else "error"
         self.summary_error = None if items else "会议没有可总结的有效发言"
         self._set_postprocess_queue(bool(items))
         self.files = export_live_result(
@@ -782,25 +855,43 @@ class LiveMeetingSession:
         await self.broadcast("recording_complete", meeting=self.snapshot())
         if items:
             self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"postprocess-{self.id}")
-            self.summary_task = self.postprocess_task
 
     async def _finalize(self, reason: str) -> None:
         await self._finalize_fast(reason)
 
     def begin_summary(self) -> bool:
-        if self.recording_state != "complete" or self.summary_state not in {"queued", "error", "complete"}:
+        preprocessing_ready = all(
+            self.postprocess.stages.get(stage, {}).get("state") == "complete"
+            for stage in ("asr_refine", "diarization", "translation")
+        )
+        if (
+            self.recording_state != "complete"
+            or not preprocessing_ready
+            or self.summary_state not in {"idle", "error", "complete"}
+        ):
             return False
         self.summary_state = "running"
         self.summary_error = None
         self.todo_state = "stale" if self.summary_revision else "waiting_summary"
         self.todo_error = None
         self.todo = None
+        self.postprocess.state = "running"
+        self.postprocess.error = None
+        self.postprocess.update("summary", "running", current=0, total=1)
+        self.postprocess.update("todo", "idle", current=0, total=0, error=None)
+        self.postprocess.stages["summary"]["error"] = None
+        self.postprocess.stages["todo"]["error"] = None
         self._write_state()
         return True
 
     async def request_summary(self) -> bool:
         if not self.begin_summary():
             return False
+        if self.todo_task and not self.todo_task.done():
+            self.todo_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.todo_task
+            self.todo_task = None
         if self.summary_task and not self.summary_task.done():
             return True
         self.summary_task = asyncio.create_task(self.run_summary(claimed=True), name=f"summary-{self.id}")
@@ -862,6 +953,10 @@ class LiveMeetingSession:
             return False
         self.todo_state = "running"
         self.todo_error = None
+        self.postprocess.state = "running"
+        self.postprocess.error = None
+        self.postprocess.update("todo", "running", current=0, total=1)
+        self.postprocess.stages["todo"]["error"] = None
         self._write_state()
         return True
 
@@ -878,19 +973,26 @@ class LiveMeetingSession:
             return
         if not claimed:
             self.begin_todo()
-        await self.broadcast("todo_progress", phase="request", summary_revision=self.summary_revision)
+        target_revision = self.summary_revision
+        target_summary = self.summary
+        await self.broadcast("todo_progress", phase="request", summary_revision=target_revision)
         try:
             generator = self.todo_factory(self.settings)
-            self.todo = await generator.generate(self.id, self.summary_revision, self.summary, on_status=lambda phase: self.broadcast("todo_progress", phase=phase, summary_revision=self.summary_revision))
-            atomic_write_text(self.output_dir / "todo_list.json", json.dumps(self.todo.to_dict(), ensure_ascii=False, indent=2))
-            atomic_write_text(self.output_dir / "todo_list.md", render_todo_markdown(self.todo))
+            todo = await generator.generate(self.id, target_revision, target_summary, on_status=lambda phase: self.broadcast("todo_progress", phase=phase, summary_revision=target_revision))
+            if target_revision != self.summary_revision or target_summary != self.summary:
+                return
+            self.todo = todo
+            atomic_write_text(self.output_dir / "todo_list.json", json.dumps(todo.to_dict(), ensure_ascii=False, indent=2))
+            atomic_write_text(self.output_dir / "todo_list.md", render_todo_markdown(todo))
             self.todo_state = "complete"
             self.todo_error = None
             self.postprocess.update("todo", "complete", current=1, total=1)
+            self.postprocess.complete()
             items = load_utterances(self.transcript_path)
             self.files = export_live_result(self.output_dir, meeting_id=self.id, title=self.title, started_at=self.started_at, ended_at=self.ended_at or utc_now_iso(), duration_seconds=self.audio_samples_received / self.audio_sample_rate, utterances=items, audio_segments=self.audio_segments, recording_state=self.recording_state, summary_state=self.summary_state, todo_state=self.todo_state, postprocess=self.postprocess.to_dict(), model_metadata=self.model_metadata)
             self._write_state()
             await self.broadcast("todo_complete", todo=self.todo.to_dict(), files=self.files, summary_revision=self.summary_revision)
+            await self.broadcast("postprocess_update", meeting=self.snapshot())
         except Exception as exc:
             self.todo_state = "error"
             self.todo_error = str(exc)
@@ -921,15 +1023,27 @@ class SessionManager:
                 payload["error"] = "服务重启时会议尚未完成，已保留已保存内容"
             if state in {"starting", "recording", "finalizing"} and has_transcript:
                 payload["recording_state"] = "complete"
-                payload["summary_state"] = "queued"
+                payload["summary_state"] = "idle"
                 payload["todo_state"] = "waiting_summary"
                 payload["ended_at"] = payload.get("ended_at") or utc_now_iso()
                 payload["error"] = None
+                payload["postprocess"] = PostprocessTracker({
+                    "state": "queued",
+                    "current_stage": "asr_refine",
+                    "stages": {
+                        "asr_refine": {"state": "queued"},
+                        "diarization": {"state": "queued"},
+                        "translation": {"state": "queued"},
+                        "summary": {"state": "idle"},
+                        "todo": {"state": "idle"},
+                    },
+                }).to_dict()
             if payload.get("recording_state") == "complete":
                 if payload.get("summary_state") == "running":
-                    payload["summary_state"] = "queued"
-                if payload.get("todo_state") == "running":
-                    payload["todo_state"] = "queued"
+                    payload["summary_state"] = "idle"
+                    payload["todo_state"] = "waiting_summary"
+                elif payload.get("todo_state") == "running":
+                    payload["todo_state"] = "queued" if payload.get("summary_state") == "complete" else "waiting_summary"
                 postprocess = payload.get("postprocess")
                 if isinstance(postprocess, dict) and postprocess.get("state") == "running":
                     postprocess["state"] = "queued"
@@ -966,8 +1080,11 @@ class SessionManager:
         for session in self.sessions.values():
             if session.postprocess.state in {"queued", "running"} and session.recording_state == "complete":
                 session.postprocess_task = asyncio.create_task(session.run_postprocess(), name=f"recover-postprocess-{session.id}")
-                session.summary_task = session.postprocess_task
             elif session.summary_state == "queued" and session.recording_state == "complete":
-                session.summary_task = asyncio.create_task(session.run_summary(), name=f"recover-summary-{session.id}")
-            elif session.todo_state == "queued" and session.summary_state == "complete":
+                # Older versions queued summaries automatically. Migration keeps
+                # the transcript ready but requires an explicit user action.
+                session.summary_state = "idle"
+                session.todo_state = "waiting_summary"
+                session._write_state()
+            elif session.todo_state == "queued" and session.summary_state == "complete" and session.summary.strip():
                 session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")
