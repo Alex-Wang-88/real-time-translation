@@ -1,108 +1,67 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
-import re
+import shutil
 import sys
 import threading
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
 from .audio import SAMPLE_RATE, SegmentEvent
-from .language import (
-    SUPPORTED_LANGUAGE_CODES,
-    MultilingualDetector,
-    normalize_language_code,
-)
+from .diarization import DiarizationEngine
+from .language import LanguageGuess, MultilingualDetector, normalize_language_code
 from .models import Utterance
+from .scheduler import GpuResourceManager
 from .speaker import OnlineSpeakerClusterer
 from .text_normalize import simplify_chinese
 
 
-# Kept as a compatibility map for old integrations and archived exports. New
-# production translation uses pair-specific OPUS-MT models instead of NLLB.
-NLLB_CODES = {
-    "zh": "zho_Hans", "en": "eng_Latn", "de": "deu_Latn",
-    "ru": "rus_Cyrl", "es": "spa_Latn", "pt": "por_Latn",
-    "fr": "fra_Latn", "it": "ita_Latn", "ja": "jpn_Jpan",
-    "ko": "kor_Hang", "ar": "arb_Arab", "uk": "ukr_Cyrl",
-    "pl": "pol_Latn", "nl": "nld_Latn", "tr": "tur_Latn",
-    "vi": "vie_Latn", "id": "ind_Latn", "th": "tha_Thai",
-    "cs": "ces_Latn", "sv": "swe_Latn", "da": "dan_Latn",
-    "no": "nob_Latn", "fi": "fin_Latn", "el": "ell_Grek",
-    "he": "heb_Hebr", "hi": "hin_Deva", "bn": "ben_Beng",
-    "fa": "pes_Arab", "ur": "urd_Arab", "ro": "ron_Latn",
-    "hu": "hun_Latn", "bg": "bul_Cyrl", "sr": "srp_Cyrl",
-    "hr": "hrv_Latn", "sk": "slk_Latn", "sl": "slv_Latn",
-    "lt": "lit_Latn", "lv": "lvs_Latn", "et": "est_Latn",
-    "ms": "zsm_Latn", "tl": "tgl_Latn", "sw": "swh_Latn",
-    "af": "afr_Latn", "am": "amh_Ethi", "yo": "yor_Latn",
-    "as": "asm_Beng", "az": "azj_Latn", "ba": "bak_Cyrl",
-    "be": "bel_Cyrl", "bo": "bod_Tibt", "bs": "bos_Latn",
-    "ca": "cat_Latn", "cy": "cym_Latn", "eu": "eus_Latn",
-    "fo": "fao_Latn", "gl": "glg_Latn", "gu": "guj_Gujr",
-    "ha": "hau_Latn", "ht": "hat_Latn", "hy": "hye_Armn",
-    "is": "isl_Latn", "jw": "jav_Latn", "ka": "kat_Geor",
-    "kk": "kaz_Cyrl", "km": "khm_Khmr", "kn": "kan_Knda",
-    "lb": "ltz_Latn", "ln": "lin_Latn", "lo": "lao_Laoo",
-    "mg": "plt_Latn", "mi": "mri_Latn", "mk": "mkd_Cyrl",
-    "ml": "mal_Mlym", "mn": "khk_Cyrl", "mr": "mar_Deva",
-    "mt": "mlt_Latn", "my": "mya_Mymr", "ne": "npi_Deva",
-    "nn": "nno_Latn", "oc": "oci_Latn", "pa": "pan_Guru",
-    "ps": "pbt_Arab", "sa": "san_Deva", "sd": "snd_Arab",
-    "si": "sin_Sinh", "sn": "sna_Latn", "so": "som_Latn",
-    "sq": "als_Latn", "su": "sun_Latn", "ta": "tam_Taml",
-    "te": "tel_Telu", "tg": "tgk_Cyrl", "tk": "tuk_Latn",
-    "tt": "tat_Cyrl", "uz": "uzn_Latn", "yi": "ydd_Hebr",
-    "yue": "yue_Hant", "eo": "epo_Latn", "ga": "gle_Latn",
-    "lg": "lug_Latn", "nb": "nob_Latn", "st": "sot_Latn",
-    "tn": "tsn_Latn", "ts": "tso_Latn", "xh": "xho_Latn",
-    "zu": "zul_Latn",
-}
-
-
-OPUS_MT_MODEL_IDS = {
+OPUS_MT_REPOSITORIES = {
     "en": "Helsinki-NLP/opus-mt-en-zh",
-    "de": "Helsinki-NLP/opus-mt-de-zh",
-    "ja": "Helsinki-NLP/opus-mt-ja-zh",
-    "ko": "Helsinki-NLP/opus-mt-ko-zh",
-    "fr": "Helsinki-NLP/opus-mt-fr-zh",
-    "es": "Helsinki-NLP/opus-mt-es-zh",
-    "ru": "Helsinki-NLP/opus-mt-ru-zh",
+    # The official repository uses an uppercase ZH suffix.
+    "de": "Helsinki-NLP/opus-mt-de-ZH",
 }
+
+OPUS_MT_TARGET_TAGS = {
+    "en": ">>cmn_Hans<<",
+    "de": ">>zh_cn<<",
+}
+
+
+def opus_mt_repository(source: str) -> str:
+    normalized = normalize_language_code(source) or source
+    try:
+        return OPUS_MT_REPOSITORIES[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unsupported OPUS-MT source language: {source}") from exc
 
 
 def choose_device(requested: str) -> tuple[str, str]:
     requested = (requested or "auto").strip().casefold()
     if requested not in {"auto", "cpu", "cuda"}:
-        raise ValueError("MEETING_DEVICE 必须是 auto、cpu 或 cuda")
+        raise ValueError("MEETING_DEVICE must be auto, cpu or cuda")
     if requested == "cpu":
         return "cpu", "int8"
-    if requested in {"auto", "cuda"}:
-        try:
-            if sys.platform == "win32":
-                torch_lib = Path(sys.prefix) / "Lib" / "site-packages" / "torch" / "lib"
-                if torch_lib.is_dir():
-                    os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
-                    if hasattr(os, "add_dll_directory"):
-                        os.add_dll_directory(str(torch_lib))
-            import ctranslate2
+    try:
+        if sys.platform == "win32":
+            torch_lib = Path(sys.prefix) / "Lib" / "site-packages" / "torch" / "lib"
+            if torch_lib.is_dir():
+                os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
+                if hasattr(os, "add_dll_directory"):
+                    os.add_dll_directory(str(torch_lib))
+        import ctranslate2
 
-            if ctranslate2.get_cuda_device_count() > 0:
-                return "cuda", "int8_float16"
-        except Exception:
-            if requested == "cuda":
-                raise RuntimeError(
-                    "CTranslate2 未发现可用 CUDA，请检查 CUDA 12、cuBLAS 和 cuDNN 9"
-                )
-        if requested == "cuda":
-            raise RuntimeError(
-                "CTranslate2 未发现可用 CUDA，请检查 CUDA 12、cuBLAS 和 cuDNN 9"
-            )
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda", "int8_float16"
+    except Exception:
+        pass
+    if requested == "cuda":
+        raise RuntimeError("CUDA is not available")
     return "cpu", "int8"
 
 
@@ -111,240 +70,302 @@ class TranslationResult:
     text: str
     status: str
     model: str | None = None
+    error: str | None = None
 
 
-@dataclass(slots=True)
-class _LoadedTranslationPair:
-    source_sp: Any
-    target_sp: Any
-    translator: Any
-    model_id: str
+def prepare_opus_mt_model(
+    source: str,
+    root: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    """Download Marian OPUS-MT and convert it to the local CTranslate2 layout."""
+    source = normalize_language_code(source) or source
+    target = root / f"{source}-zh"
+    target.mkdir(parents=True, exist_ok=True)
+    progress = progress or (lambda _message: None)
+    from huggingface_hub import snapshot_download
+
+    repository = opus_mt_repository(source)
+    progress(f"downloading OPUS-MT {source}->zh")
+    # Use the Hub cache instead of ``local_dir``.  On Windows, ``local_dir``
+    # may attempt to create symlinks and fail with WinError 1314 when Developer
+    # Mode or the SeCreateSymbolicLinkPrivilege is unavailable.
+    raw = Path(
+        snapshot_download(
+            repository,
+            allow_patterns=[
+                "config.json",
+                "generation_config.json",
+                "metadata.json",
+                "pytorch_model.bin",
+                "model.safetensors",
+                "source.spm",
+                "target.spm",
+                "tokenizer_config.json",
+                "vocab.json",
+                "README.md",
+            ],
+        )
+    )
+    progress(f"converting OPUS-MT {source}->zh to CTranslate2")
+    from ctranslate2.converters import TransformersConverter
+    TransformersConverter(str(raw)).convert(str(target), quantization="int8", force=True)
+    for source_path in list(raw.glob("*.spm")) + list(raw.glob("*.model")):
+        shutil.copy2(source_path, target / source_path.name)
+    raw_config = next((raw / name for name in ("config.json", "model.json") if (raw / name).is_file()), None)
+    if raw_config is not None:
+        # ``config.json`` generated by CTranslate2 is required at runtime.
+        # Keep the original Transformers config under a different name so it
+        # cannot overwrite the converted model metadata.
+        shutil.copy2(raw_config, target / "source_config.json")
+    raw_readme = raw / "README.md"
+    if raw_readme.is_file():
+        shutil.copy2(raw_readme, target / "source_model_card.md")
+    (target / "meeting_model.json").write_text(
+        json.dumps({
+            "format": "ctranslate2",
+            "source": source,
+            "target": "zh",
+            "target_language_tag": OPUS_MT_TARGET_TAGS[source],
+            "repository": repository,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return target
+
+
+class RealtimeAsrEngine:
+    """Resident realtime ASR engine; deliberately has no fallback route."""
+
+    def __init__(self, model_name: str, gpu_manager: GpuResourceManager, *, autodownload: bool = True) -> None:
+        self.model_name = model_name
+        self.gpu_manager = gpu_manager
+        self.autodownload = autodownload
+        self.model: Any | None = None
+        self.device = "cpu"
+        self.compute_type = "int8"
+
+    def load(self, device: str, compute_type: str) -> Any:
+        from faster_whisper import WhisperModel
+
+        self.device = device
+        self.compute_type = compute_type
+        with self.gpu_manager.acquire_sync("asr_realtime_load"):
+            self.model = WhisperModel(
+                self.model_name,
+                device=device,
+                compute_type=compute_type,
+                local_files_only=not self.autodownload,
+            )
+        return self.model
+
+    def release(self) -> None:
+        self.model = None
+
+
+class RefinementAsrEngine:
+    """Lazy large-v3 engine loaded only after realtime capture is saved."""
+
+    def __init__(self, model_name: str, gpu_manager: GpuResourceManager, *, autodownload: bool = True) -> None:
+        self.model_name = model_name
+        self.gpu_manager = gpu_manager
+        self.autodownload = autodownload
+        self.model: Any | None = None
+        self.device = "cpu"
+        self.compute_type = "int8"
+        self._lock = threading.Lock()
+
+    def ensure_loaded(self, device: str, compute_type: str) -> Any:
+        if self.model is not None:
+            return self.model
+        from faster_whisper import WhisperModel
+
+        with self._lock:
+            if self.model is None:
+                self.device = device
+                self.compute_type = compute_type
+                with self.gpu_manager.acquire_sync("asr_refine_load"):
+                    self.model = WhisperModel(
+                        self.model_name,
+                        device=device,
+                        compute_type=compute_type,
+                        local_files_only=not self.autodownload,
+                    )
+        return self.model
+
+    def release(self) -> None:
+        with self._lock:
+            self.model = None
 
 
 class LiveChineseTranslator:
-    """Lazy, pair-specific OPUS-MT translator with safe pass-through fallback."""
+    """Local OPUS-MT en/de -> zh translator with bounded model discovery."""
 
-    def __init__(
-        self,
-        model_name: str,
-        device: str,
-        progress: Callable[[str], None],
-        *,
-        model_root: Path | None = None,
-        autodownload: bool = False,
-    ) -> None:
-        self.model_name = model_name or "opusmt-local"
-        self.device = device
-        self.progress = progress
+    def __init__(self, model_root: Path | None, device: str, progress: Callable[[str], None] | None = None, autodownload: bool = False) -> None:
         self.model_root = model_root
+        self.device = device
+        self.progress = progress or (lambda _message: None)
         self.autodownload = autodownload
-        self.models: dict[str, _LoadedTranslationPair] = {}
-        self.failed_sources: set[str] = set()
+        self.models: dict[str, tuple[Any, Any, Any, str, str]] = {}
+        self.failed: dict[str, str] = {}
         self.cache: dict[tuple[str, str], TranslationResult] = {}
-        self.cache_limit = 2_048
-        progress("正在准备本地 OPUS-MT 翻译后端")
 
-    def _local_candidates(self, source: str) -> list[Path]:
-        candidates: list[Path] = []
-        if self.model_root:
-            candidates.extend(
-                [
-                    self.model_root / f"{source}-zh",
-                    self.model_root / f"{source}_zh",
-                    self.model_root / source,
-                ]
-            )
-        configured = Path(self.model_name)
-        if configured.exists():
-            candidates.extend(
-                [configured / f"{source}-zh", configured / source, configured]
-            )
-        return candidates
+    def _find(self, source: str) -> Path | None:
+        if not self.model_root:
+            return None
+        for candidate in (self.model_root / f"{source}-zh", self.model_root / f"{source}_zh", self.model_root / source):
+            if (candidate / "model.bin").is_file() and self._spm_paths(candidate) and self._metadata_path(candidate):
+                return candidate
+        return None
 
     @staticmethod
-    def _sentencepiece_paths(model_path: Path) -> tuple[Path | None, Path | None]:
-        source = model_path / "source.spm"
-        target = model_path / "target.spm"
-        if source.is_file() or target.is_file():
-            source_path = source if source.is_file() else target
-            target_path = target if target.is_file() else source
-            return source_path, target_path
+    def _metadata_path(path: Path) -> Path | None:
+        for name in ("config.json", "model.json", "meeting_model.json", "config.yml", "config.yaml"):
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _download_if_needed(self, source: str) -> Path | None:
+        path = self._find(source)
+        if path is not None or not self.autodownload or self.model_root is None:
+            return path
+        try:
+            prepare_opus_mt_model(source, self.model_root, progress=self.progress)
+            return self._find(source)
+        except Exception as exc:  # pragma: no cover - network/model dependent
+            self.failed[source] = str(exc)
+            self.progress(f"translation model {source} download failed: {exc}")
+            return None
+
+    def assets_snapshot(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for source in ("en", "de"):
+            path = self._find(source)
+            error = self.failed.get(source)
+            result[source] = {
+                "model": opus_mt_repository(source),
+                "path": str(path or (self.model_root / f"{source}-zh" if self.model_root else "")),
+                "ready": path is not None,
+                "status": "ready" if path is not None else "unsupported" if error == "model not cached" else "failed" if error else "pending",
+                "error": error,
+            }
+        return result
+
+    def preflight(self) -> dict[str, dict[str, Any]]:
+        for source in ("en", "de"):
+            path = self._download_if_needed(source)
+            if path is None:
+                self.failed.setdefault(source, "model not cached")
+                continue
+            if self._spm_paths(path) is None:
+                self.failed[source] = "missing SentencePiece model"
+        return self.assets_snapshot()
+
+    @staticmethod
+    def _spm_paths(path: Path) -> tuple[Path, Path] | None:
+        source, target = path / "source.spm", path / "target.spm"
+        if source.is_file() and target.is_file():
+            return source, target
         for name in ("sentencepiece.bpe.model", "spm.model"):
-            candidate = model_path / name
+            candidate = path / name
             if candidate.is_file():
                 return candidate, candidate
-        matches = list(model_path.glob("*.spm")) + list(model_path.glob("*.model"))
-        if matches:
-            return matches[0], matches[0]
-        return None, None
+        matches = list(path.glob("*.spm")) + list(path.glob("*.model"))
+        return (matches[0], matches[0]) if matches else None
 
-    def _resolve_model_path(self, source: str) -> tuple[Path | None, str | None]:
-        for candidate in self._local_candidates(source):
-            if candidate.is_dir() and (candidate / "model.bin").exists():
-                return candidate, str(candidate)
-        configured = self.model_name.strip()
-        if configured not in {"", "opusmt-local"} and "/" in configured:
-            if self.autodownload:
-                try:
-                    from huggingface_hub import snapshot_download
-
-                    return (
-                        Path(snapshot_download(configured)),
-                        configured,
-                    )
-                except Exception as exc:  # noqa: BLE001 - surfaced as unsupported
-                    self.progress(f"OPUS-MT {source} 下载失败：{exc}")
-            return None, configured
-        if not self.autodownload:
-            return None, None
-        model_id = OPUS_MT_MODEL_IDS.get(source)
-        if not model_id:
-            return None, None
-        try:
-            from huggingface_hub import snapshot_download
-
-            return Path(snapshot_download(model_id)), model_id
-        except Exception as exc:  # noqa: BLE001 - surfaced as unsupported
-            self.progress(f"OPUS-MT {source} 下载失败：{exc}")
-            return None, model_id
-
-    def _load_pair(self, source: str) -> _LoadedTranslationPair | None:
-        source = source.casefold().strip()
+    def _load(self, source: str) -> tuple[Any, Any, Any, str, str] | None:
         if source in self.models:
             return self.models[source]
-        if source in self.failed_sources:
+        if source in self.failed and self._find(source) is None:
             return None
-        model_path, model_id = self._resolve_model_path(source)
-        if model_path is None:
-            self.failed_sources.add(source)
+        self.failed.pop(source, None)
+        path = self._download_if_needed(source)
+        if path is None:
+            self.failed[source] = "model not cached"
             return None
         try:
             import ctranslate2
             import sentencepiece as spm
 
-            source_path, target_path = self._sentencepiece_paths(model_path)
-            if source_path is None or target_path is None:
-                raise RuntimeError(f"OPUS-MT {source} 缺少 SentencePiece 模型")
-            source_sp = spm.SentencePieceProcessor(model_file=str(source_path))
-            target_sp = spm.SentencePieceProcessor(model_file=str(target_path))
+            paths = self._spm_paths(path)
+            if paths is None:
+                raise RuntimeError("missing SentencePiece model")
+            source_sp = spm.SentencePieceProcessor(model_file=str(paths[0]))
+            target_sp = spm.SentencePieceProcessor(model_file=str(paths[1]))
             translator = ctranslate2.Translator(
-                str(model_path),
+                str(path),
                 device=self.device,
                 compute_type="int8_float16" if self.device == "cuda" else "int8",
             )
-            loaded = _LoadedTranslationPair(
-                source_sp,
-                target_sp,
-                translator,
-                model_id or str(model_path),
-            )
-            self.models[source] = loaded
-            return loaded
-        except Exception as exc:  # noqa: BLE001 - preserve original text
-            self.progress(f"OPUS-MT {source} 不可用：{exc}")
-            self.failed_sources.add(source)
+            metadata_path = path / "meeting_model.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+            target_tag = str(metadata.get("target_language_tag") or OPUS_MT_TARGET_TAGS.get(source, ""))
+            result = (source_sp, target_sp, translator, str(path), target_tag)
+            self.models[source] = result
+            return result
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.failed[source] = str(exc)
+            self.progress(f"translation model {source} is unavailable: {exc}")
             return None
-
-    def _cache_get(self, source: str, text: str) -> TranslationResult | None:
-        cached = getattr(self, "cache", {}).get((source, text))
-        if cached is None:
-            return None
-        return TranslationResult(cached.text, cached.status, cached.model)
-
-    def _cache_put(self, source: str, text: str, result: TranslationResult) -> None:
-        if not hasattr(self, "cache"):
-            return
-        if len(self.cache) >= self.cache_limit:
-            self.cache.pop(next(iter(self.cache)))
-        self.cache[(source, text)] = result
-
-    def _translate_loaded(
-        self,
-        loaded: _LoadedTranslationPair,
-        texts: list[str],
-    ) -> list[TranslationResult]:
-        try:
-            pieces = [loaded.source_sp.encode(text, out_type=str) for text in texts]
-            generated = loaded.translator.translate_batch(
-                pieces,
-                beam_size=2,
-                max_decoding_length=384,
-                repetition_penalty=1.05,
-            )
-            results: list[TranslationResult] = []
-            for text, hypothesis in zip(texts, generated):
-                tokens = list(hypothesis.hypotheses[0])
-                while tokens and tokens[0] in {"<pad>", "</s>"}:
-                    tokens.pop(0)
-                translated = simplify_chinese(loaded.target_sp.decode(tokens).strip())
-                results.append(
-                    TranslationResult(translated or text, "ready", loaded.model_id)
-                )
-            if len(results) != len(texts):
-                raise RuntimeError("OPUS-MT 返回的结果数量与输入不一致")
-            return results
-        except Exception as exc:  # noqa: BLE001 - preserve original text
-            self.progress(f"OPUS-MT 翻译失败：{exc}")
-            return [TranslationResult(text, "failed", loaded.model_id) for text in texts]
 
     def translate_many(self, texts: list[str], source: str) -> list[TranslationResult]:
-        source = (source or "").casefold().strip()
-        normalized = [text.strip() for text in texts]
-        if source not in SUPPORTED_LANGUAGE_CODES:
-            return [TranslationResult(text, "unsupported") for text in normalized]
-        results: list[TranslationResult | None] = [None] * len(normalized)
-        pending_texts: list[str] = []
-        pending_indices: list[int] = []
-        for index, text in enumerate(normalized):
-            if not text:
+        source = normalize_language_code(source) or source
+        results: list[TranslationResult | None] = [None] * len(texts)
+        pending: list[tuple[int, str]] = []
+        for index, text in enumerate(texts):
+            value = text.strip()
+            if not value:
                 results[index] = TranslationResult("", "ready")
             elif source == "zh":
-                results[index] = TranslationResult(simplify_chinese(text), "not_needed")
+                results[index] = TranslationResult(simplify_chinese(value), "not_needed")
+            elif source not in {"en", "de"}:
+                results[index] = TranslationResult("", "unsupported", error=f"unsupported source language: {source}")
+            elif (source, value) in self.cache:
+                results[index] = self.cache[(source, value)]
             else:
-                cached = self._cache_get(source, text)
-                if cached is not None:
-                    results[index] = cached
-                else:
-                    pending_texts.append(text)
-                    pending_indices.append(index)
-        if not pending_texts:
-            return [item or TranslationResult("", "ready") for item in results]
-
-        # Preserve the old unit-test seam and old integrations that construct
-        # the object with ``sp`` and ``model`` directly.
-        if not hasattr(self, "models") and hasattr(self, "model") and hasattr(self, "sp"):
-            translated: list[TranslationResult] = []
-            for text in pending_texts:
-                pieces = self.sp.encode(text, out_type=str)
-                generated = self.model.translate_batch(
-                    [[NLLB_CODES.get(source, source), *pieces, "</s>"]],
-                    target_prefix=[[NLLB_CODES["zh"]]],
+                pending.append((index, value))
+        loaded = self._load(source) if pending else None
+        if loaded is None and pending:
+            error = self.failed.get(source, "model unavailable")
+            status = "unsupported" if error == "model not cached" else "failed"
+            for index, _value in pending:
+                results[index] = TranslationResult("", status, error=error)
+        elif loaded:
+            source_sp, target_sp, translator, model_id, target_tag = loaded
+            try:
+                # MarianTokenizer appends EOS to every source sequence.  Keep
+                # the same input contract when using SentencePiece directly;
+                # omitting it causes long/repetitive outputs, especially for
+                # the multilingual German->Chinese model.
+                pieces = [[target_tag] + source_sp.encode(value, out_type=str) + ["</s>"] for _, value in pending]
+                generated = translator.translate_batch(
+                    pieces,
                     beam_size=2,
                     max_decoding_length=384,
                     repetition_penalty=1.05,
-                )[0]
-                tokens = generated.hypotheses[0]
-                if tokens and tokens[0] == NLLB_CODES["zh"]:
-                    tokens = tokens[1:]
-                translated.append(
-                    TranslationResult(simplify_chinese(self.sp.decode(tokens).strip()), "ready")
                 )
-        else:
-            loaded = self._load_pair(source)
-            if loaded is None:
-                translated = [TranslationResult(text, "unsupported") for text in pending_texts]
-            else:
-                translated = self._translate_loaded(loaded, pending_texts)
-        for index, text, result in zip(pending_indices, pending_texts, translated):
-            results[index] = result
-            self._cache_put(source, text, result)
-        return [item or TranslationResult("", "ready") for item in results]
+                for (index, value), hypothesis in zip(pending, generated):
+                    tokens = list(hypothesis.hypotheses[0])
+                    translated = simplify_chinese(target_sp.decode(tokens).strip())
+                    if not translated:
+                        results[index] = TranslationResult("", "failed", model_id, "empty translation")
+                    else:
+                        results[index] = TranslationResult(translated, "ready", model_id)
+            except Exception as exc:  # pragma: no cover - optional dependency
+                self.progress(f"translation failed: {exc}")
+                for index, _value in pending:
+                    results[index] = TranslationResult("", "failed", model_id, str(exc))
+        final = [item or TranslationResult("", "failed", error="translator returned no result") for item in results]
+        for index, value in pending:
+            if final[index].status in {"ready", "failed"}:
+                self.cache[(source, value)] = final[index]
+        return final
 
-    def translate_with_status(self, text: str, source: str) -> TranslationResult:
-        return self.translate_many([text], source)[0]
 
-    def translate(self, text: str, source: str) -> str:
-        return self.translate_with_status(text, source).text
+# Public architecture name; the old name remains import-compatible.
+TranslationEngine = LiveChineseTranslator
 
 
 @dataclass(slots=True)
@@ -356,688 +377,468 @@ class PartialResult:
     language: str | None
     confidence: float = 0.0
     model: str | None = None
-
-
-@dataclass(slots=True)
-class _DecodedSegment:
-    start: float
-    end: float
-    text: str
+    language_source: str = "detector"
 
 
 class LiveModelRuntime:
-    """Shared ASR/translation models; mutable speaker clusters stay per meeting."""
+    """Model facade used by the session and compatible test runtimes.
+
+    The old constructor is retained for API compatibility.  ``asr_primary``
+    now names the single realtime model and ``asr_fallback`` is only an alias
+    for integrations that still inspect that field; no hidden fallback model
+    is loaded.
+    """
 
     def __init__(
         self,
-        asr_model: str,
-        translation_model: str,
+        asr_primary: str,
+        asr_fallback: str,
+        asr_refine: str,
         requested_device: str,
-        refine_asr_model: str | None = None,
-        refinement_enabled: bool = True,
-        fallback_asr_model: str | None = None,
         *,
+        asr_autodownload: bool = False,
+        refinement_enabled: bool = True,
         translation_model_root: Path | None = None,
         translation_autodownload: bool = False,
         vad_model: str = "fsmn-vad",
-        gpu_memory_budget_mb: int = 7_200,
+        gpu_memory_budget_mb: int = 7200,
+        diarization_required: bool = True,
     ) -> None:
-        self.asr_model_name = asr_model
-        self.fallback_asr_model_name = fallback_asr_model or "large-v3-turbo"
-        self.refine_asr_model_name = refine_asr_model or "large-v3"
+        self.asr_primary_name = asr_primary or asr_fallback or "large-v3-turbo"
+        self.asr_fallback_name = asr_fallback or self.asr_primary_name
+        self.asr_refine_name = asr_refine
+        self.requested_device = requested_device
+        self.asr_autodownload = asr_autodownload
         self.refinement_enabled = refinement_enabled
-        self.translation_model_name = translation_model
         self.translation_model_root = translation_model_root
         self.translation_autodownload = translation_autodownload
         self.vad_model_name = vad_model
-        self.gpu_memory_budget_mb = max(1_024, int(gpu_memory_budget_mb))
-        self.requested_device = requested_device
+        self.gpu_memory_budget_mb = gpu_memory_budget_mb
+        self.diarization_required = diarization_required
         self.device = "cpu"
         self.compute_type = "int8"
-        self.asr = None  # Whisper fallback; retained for compatibility.
-        self.fallback_asr = None
-        self.fun_asr = None
-        self.refine_asr = None
+        self.primary: Any | None = None
+        self.fallback: Any | None = None
+        self.refine: Any | None = None
         self.translator: LiveChineseTranslator | None = None
-        self.detector: MultilingualDetector | None = None
+        self.detector = MultilingualDetector()
         self.speaker_encoder = None
-        self.speakers: OnlineSpeakerClusterer | None = None
-        self.vad = None
-        self._whisper_model_class: Any = None
-        self._refine_model_lock = threading.Lock()
-        self._refine_device = "cpu"
+        self.vad: Any | None = None
+        self.diarization = DiarizationEngine(
+            "cpu",
+            required=diarization_required,
+        )
+        self.gpu_manager = GpuResourceManager()
+        self.realtime_engine = RealtimeAsrEngine(
+            self.asr_primary_name,
+            self.gpu_manager,
+            autodownload=asr_autodownload,
+        )
+        self.refinement_engine = RefinementAsrEngine(
+            self.asr_refine_name,
+            self.gpu_manager,
+            autodownload=asr_autodownload,
+        )
         self.ready = False
-        self.status = "等待加载"
+        self.capabilities_ready = False
+        self.status = "waiting for model load"
         self.metrics: dict[str, Any] = {
-            "funasr_calls": 0,
-            "whisper_calls": 0,
-            "fallback_calls": 0,
+            "asr_calls": 0,
             "translation_calls": 0,
-            "oom_count": 0,
-            "gpu_memory_peak_mb": 0,
             "model_events": [],
+            "oom_count": 0,
+            "fallback_count": 0,
+            "stage_failures": 0,
+            "retry_count": 0,
+            "queue_lengths": {},
         }
+        self._refine_lock = threading.Lock()
+        self.asr_cache_ready = True
+        self.last_asr_error: str | None = None
+        self.last_asr_error_model: str | None = None
 
-    def _model_event(self, event: str, **details: Any) -> None:
+    def _event(self, name: str, **details: Any) -> None:
         events = self.metrics.setdefault("model_events", [])
         if isinstance(events, list):
-            events.append({"event": event, **details})
+            events.append({"event": name, **details})
             del events[:-50]
 
-    def _update_gpu_memory_metrics(self) -> None:
-        if self.device != "cuda":
-            return
+    @staticmethod
+    def _whisper_repo(model_name: str) -> str | None:
+        name = str(model_name or "")
+        if name in {"large-v3", "openai/whisper-large-v3"}:
+            return "Systran/faster-whisper-large-v3"
+        if name in {"large-v3-turbo", "openai/whisper-large-v3-turbo"}:
+            return "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+        return None
+
+    def _prepare_asr_cache(self, model_name: str, progress: Callable[[str], None]) -> bool:
+        repo = self._whisper_repo(model_name)
+        if repo is None:
+            return True
         try:
-            import torch
+            from faster_whisper.utils import download_model
 
-            if not torch.cuda.is_available():
-                return
-            allocated_mb = int(torch.cuda.memory_allocated() / 1024**2)
-            peak_mb = int(torch.cuda.max_memory_allocated() / 1024**2)
-            self.metrics["gpu_memory_peak_mb"] = max(
-                int(self.metrics.get("gpu_memory_peak_mb", 0)), peak_mb
-            )
-            self.metrics["gpu_memory_allocated_mb"] = allocated_mb
+            progress(f"Checking ASR model cache: {model_name}")
+            download_model(repo, local_files_only=not self.asr_autodownload)
+            return True
+        except Exception as exc:
+            self._event("asr_preflight_error", model=model_name, error=str(exc))
+            return False
+
+    def _resolve_vad_source(self) -> str:
+        """Resolve a cached VAD model to a local snapshot path.
+
+        FunASR accepts either a model id or a local model directory. Passing
+        the local snapshot avoids a Hugging Face metadata request on every
+        server start after the deployment bundle has been prepared.
+        """
+        configured = str(self.vad_model_name or "").strip()
+        if configured in {"", "disabled"} or Path(configured).exists():
+            return configured
+        if configured != "fsmn-vad":
+            return configured
+        try:
+            from huggingface_hub import snapshot_download
+
+            return str(snapshot_download(
+                repo_id="funasr/fsmn-vad",
+                local_files_only=True,
+            ))
         except Exception:
-            return
+            if not self.asr_autodownload:
+                raise RuntimeError(
+                    "VAD model fsmn-vad is not present in the local Hugging Face cache; "
+                    "run scripts/prepare_models.py on the build host or enable download "
+                    "only during model preparation"
+                )
+            return configured
 
-    @staticmethod
-    def _is_funasr_name(name: str) -> bool:
-        normalized = (name or "").casefold()
-        return "fun-asr" in normalized or "funasr" in normalized
-
-    @staticmethod
-    def _normalize_funasr_name(name: str) -> str:
-        if name.casefold() in {"funasr-nano", "fun-asr-nano"}:
-            return "FunAudioLLM/Fun-ASR-Nano-2512"
-        return name
-
-    def load(self, progress: Callable[[str], None] = lambda _message: None) -> None:
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
-        from faster_whisper import WhisperModel
-
-        self._whisper_model_class = WhisperModel
+    def load(self, progress: Callable[[str], None] | None = None) -> None:
+        progress = progress or (lambda _message: None)
         self.device, self.compute_type = choose_device(self.requested_device)
-        self.status = "正在加载语音识别模型"
-        progress(self.status)
-
-        if self._is_funasr_name(self.asr_model_name):
+        try:
+            progress(f"Loading realtime ASR: {self.asr_primary_name}")
+            self.primary = self.realtime_engine.load(self.device, self.compute_type)
+            self.fallback = self.primary  # backwards-compatible alias only
+            self.asr_cache_ready = self._prepare_asr_cache(self.asr_refine_name, progress)
+            if self.refinement_enabled and self.asr_refine_name and self.asr_refine_name != self.asr_primary_name:
+                progress(f"Refinement model will load on demand: {self.asr_refine_name}")
+            self.translator = LiveChineseTranslator(
+                self.translation_model_root,
+                self.device,
+                progress,
+                self.translation_autodownload,
+            )
+            translation_assets = self.translator.preflight()
             try:
                 from funasr import AutoModel
 
-                funasr_kwargs = {
-                    "model": self._normalize_funasr_name(self.asr_model_name),
-                    "hub": "hf",
-                    "trust_remote_code": True,
-                    "device": f"{self.device}:0" if self.device == "cuda" else self.device,
-                }
-                try:
-                    self.fun_asr = AutoModel(**funasr_kwargs)
-                except TypeError:
-                    funasr_kwargs.pop("hub", None)
-                    funasr_kwargs.pop("trust_remote_code", None)
-                    self.fun_asr = AutoModel(**funasr_kwargs)
-                self._model_event("loaded", model=self.asr_model_name, role="primary")
-            except ImportError as exc:
-                progress(f"FunASR 未安装，使用 Whisper 回退：{exc}")
-                self.fun_asr = None
-            except Exception as exc:  # noqa: BLE001 - fallback keeps service usable
-                progress(f"FunASR 加载失败，使用 Whisper 回退：{exc}")
-                self.fun_asr = None
-        else:
-            self.asr = WhisperModel(
-                self.asr_model_name,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
-            self._model_event("loaded", model=self.asr_model_name, role="primary")
-
-        whisper_name = self.fallback_asr_model_name
-        if self.asr is None:
-            self.status = "正在加载多语言回退模型"
-            progress(self.status)
-            self.asr = WhisperModel(
-                whisper_name,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
-            self._model_event("loaded", model=whisper_name, role="fallback")
-        self.fallback_asr = self.asr
-
-        if not self.refinement_enabled or self.refine_asr_model_name == whisper_name:
-            self.refine_asr = self.asr
-            self._refine_device = self.device
-        else:
-            # large-v3 is loaded on the first stop/refinement job. This keeps
-            # the realtime path responsive and makes the low-priority model
-            # the first candidate for unloading when the GPU budget is tight.
-            self.refine_asr = None
-            self._refine_device = self.device
-            self._model_event("deferred", model=self.refine_asr_model_name, role="refine")
-
-        self.status = "正在加载多语言识别"
-        progress(self.status)
-        self.detector = MultilingualDetector()
-        if self.vad_model_name.casefold() in {"", "energy", "rms"}:
-            self.vad = None
-            progress("使用能量 VAD（按配置启用）")
-        else:
-            try:
-                from .audio import FsmnVAD
-
-                self.vad = FsmnVAD(self.vad_model_name, self.device)
-                self._model_event("loaded", model=self.vad_model_name, role="vad")
-            except Exception as exc:  # noqa: BLE001 - energy fallback remains valid
+                runtime_device = f"{self.device}:0" if self.device == "cuda" else self.device
+                self.vad = AutoModel(
+                    model=self._resolve_vad_source(),
+                    hub="hf",
+                    trust_remote_code=True,
+                    disable_update=True,
+                    device=runtime_device,
+                )
+            except Exception:
                 self.vad = None
-                progress(f"FSMN-VAD 不可用，使用能量 VAD 回退：{exc}")
-        translator_kwargs = {
-            "model_root": self.translation_model_root,
-            "autodownload": self.translation_autodownload,
-        }
-        try:
-            self.translator = LiveChineseTranslator(
-                self.translation_model_name, self.device, progress, **translator_kwargs
+            self.ready = True
+            self.diarization.device = self.device
+            diarization_ready = self.diarization.preflight()
+            self.capabilities_ready = (
+                all(item["ready"] for item in translation_assets.values())
+                and (not self.diarization_required or diarization_ready)
+                and self.vad is not None
+                and self.asr_cache_ready
             )
-        except TypeError:
-            # Keep compatibility with small embedded test doubles and external
-            # plugins implementing the original three-argument constructor.
-            self.translator = LiveChineseTranslator(
-                self.translation_model_name, self.device, progress
-            )
-
-        self.status = "正在加载说话人模型"
-        progress(self.status)
-        from resemblyzer import VoiceEncoder
-
-        self.speaker_encoder = VoiceEncoder(device=self.device)
-        self.speakers = OnlineSpeakerClusterer(self.device, encoder=self.speaker_encoder)
-        self.status = "正在预热 GPU 推理"
-        progress(self.status)
-        self._warmup()
-        self._update_gpu_memory_metrics()
-        self.ready = True
-        self.status = "模型已就绪"
-        progress(self.status)
+            issues = self._capability_issues()
+            self.status = "models ready" if not issues else "ASR ready; missing capabilities: " + "; ".join(issues)
+            self._event("ready", device=self.device, capabilities_ready=self.capabilities_ready)
+            progress(self.status)
+        except Exception as exc:
+            self.ready = False
+            self.capabilities_ready = False
+            self.status = f"model load failed: {exc}"
+            self._event("load_error", error=str(exc))
+            progress(self.status)
 
     def close(self) -> None:
-        self._model_event("unloaded", role="all")
-        self.speaker_encoder = None
+        self.realtime_engine.release()
+        self.refinement_engine.release()
+        self.primary = self.fallback = self.refine = self.translator = self.vad = None
+        self.diarization.close()
         self.ready = False
-        self.asr = None
-        self.fallback_asr = None
-        self.fun_asr = None
-        self.refine_asr = None
-        self.translator = None
-        self.detector = None
-        self.speakers = None
-        self.vad = None
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        self.capabilities_ready = False
         gc.collect()
-        self.status = "模型已释放"
+        self.status = "models released"
 
-    def _ensure_refine_model(self) -> Any:
-        if not self.refinement_enabled:
-            return self.asr
-        if self.refine_asr is not None:
-            return self.refine_asr
-        if self._whisper_model_class is None:
-            raise RuntimeError("精修模型加载器尚未就绪")
-        with self._refine_model_lock:
-            if self.refine_asr is not None:
-                return self.refine_asr
-            self.status = "正在加载高精度语音识别模型"
-            try:
-                self.refine_asr = self._whisper_model_class(
-                    self.refine_asr_model_name,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                )
-                self._refine_device = self.device
-                self._model_event(
-                    "loaded", model=self.refine_asr_model_name, role="refine"
-                )
-                self._update_gpu_memory_metrics()
-                if (
-                    self.device == "cuda"
-                    and int(self.metrics.get("gpu_memory_allocated_mb", 0))
-                    > self.gpu_memory_budget_mb
-                ):
-                    # Keep real-time ASR healthy. If the optional refine model
-                    # would exceed the configured budget, release it and retry
-                    # the low-priority job on CPU instead of risking an OOM.
-                    self.refine_asr = None
-                    import torch
+    def release_realtime_model(self) -> None:
+        """Release the resident realtime ASR before GPU-heavy postprocess."""
+        self.primary = None
+        self.fallback = None
+        self.realtime_engine.release()
+        self.ready = False
+        self.capabilities_ready = False
+        self.status = "realtime model released; waiting for warmup"
+        self._event("realtime_released", model=self.asr_primary_name)
+        gc.collect()
 
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    self._model_event(
-                        "unloaded",
-                        model=self.refine_asr_model_name,
-                        role="refine",
-                        reason="gpu_budget",
-                    )
-                    self.refine_asr = self._whisper_model_class(
-                        self.refine_asr_model_name,
-                        device="cpu",
-                        compute_type="int8",
-                    )
-                    self._refine_device = "cpu"
-                    self._model_event(
-                        "loaded",
-                        model=self.refine_asr_model_name,
-                        role="refine",
-                        device="cpu",
-                    )
-                return self.refine_asr
-            except RuntimeError as exc:
-                if "out of memory" in str(exc).casefold():
-                    self.metrics["oom_count"] = int(self.metrics.get("oom_count", 0)) + 1
-                    self._model_event(
-                        "oom", model=self.refine_asr_model_name, role="refine"
-                    )
-                    try:
-                        import torch
+    def warm_realtime(self, progress: Callable[[str], None] | None = None) -> None:
+        if self.primary is not None:
+            self.ready = True
+            self.capabilities_ready = self._capabilities_ready()
+            return
+        progress = progress or (lambda _message: None)
+        try:
+            progress(f"warming realtime ASR: {self.asr_primary_name}")
+            self.primary = self.realtime_engine.load(self.device, self.compute_type)
+            self.fallback = self.primary
+            self.ready = True
+            self.capabilities_ready = self._capabilities_ready()
+            issues = self._capability_issues()
+            self.status = "models ready" if not issues else "realtime ASR ready; missing capabilities: " + "; ".join(issues)
+            self._event("realtime_warmed", model=self.asr_primary_name)
+        except Exception as exc:
+            self.ready = False
+            self.capabilities_ready = False
+            self.status = f"realtime warmup failed: {exc}"
+            self._event("realtime_warmup_error", model=self.asr_primary_name, error=str(exc))
 
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                self.refine_asr = None
-                raise
+    def _capabilities_ready(self) -> bool:
+        translation_ready = self.translator is not None and all(
+            item["ready"] for item in self.translator.assets_snapshot().values()
+        )
+        return bool(
+            translation_ready
+            and (not self.diarization_required or self.diarization.capability_ready())
+            and (self.vad is not None or self.vad_model_name == "disabled")
+            and self.asr_cache_ready
+        )
 
-    def _warmup(self) -> None:
-        silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        if self.fun_asr is not None:
-            try:
-                self.fun_asr.generate(input=silent, language="中文", itn=True)
-            except Exception:
-                pass
-        if self.asr is not None:
-            segments, _ = self.asr.transcribe(
-                silent,
-                task="transcribe",
-                language=None,
-                beam_size=1,
-                best_of=1,
-                multilingual=True,
-                vad_filter=False,
-                condition_on_previous_text=False,
-            )
-            list(segments)
-        if self.refine_asr is not None and self.refine_asr is not self.asr:
-            refined_segments, _ = self.refine_asr.transcribe(
-                silent,
-                task="transcribe",
-                language=None,
-                beam_size=1,
-                best_of=1,
-                multilingual=True,
-                vad_filter=False,
-                condition_on_previous_text=False,
-            )
-            list(refined_segments)
-        if self.translator is not None:
-            self.translator.translate("Guten Morgen", "de")
+    def _capability_issues(self) -> list[str]:
+        issues: list[str] = []
+        if self.refinement_enabled and not self.asr_cache_ready:
+            issues.append(f"ASR refine unavailable: {self.asr_refine_name}")
+        translation = self.translator.assets_snapshot() if self.translator is not None else {}
+        for source in ("en", "de"):
+            asset = translation.get(source, {})
+            if not asset.get("ready"):
+                issues.append(f"translation {source}->zh {asset.get('status', 'missing')}")
+        if self.vad_model_name != "disabled" and self.vad is None:
+            issues.append(f"VAD unavailable: {self.vad_model_name}")
+        if self.diarization_required and not self.diarization.capability_ready():
+            issues.append(f"diarization unavailable: {self.diarization.error or self.diarization.model_name}")
+        return issues
+
+    def release_postprocess_models(self) -> None:
+        self.refinement_engine.release()
+        self.refine = None
+        self.diarization.close()
+        self._event("postprocess_released", model=self.asr_refine_name)
+        gc.collect()
 
     def new_speaker_clusterer(self) -> OnlineSpeakerClusterer:
-        if self.speaker_encoder is None:
-            return OnlineSpeakerClusterer(self.device)
         return OnlineSpeakerClusterer(self.device, encoder=self.speaker_encoder)
 
-    def new_vad(self) -> Any:
-        """Return the shared stateful VAD adapter, or ``None`` for fallback."""
+    def new_vad(self) -> Callable[[bytes], bool | None] | None:
+        if self.vad is None:
+            return None
+        cache: dict[str, Any] = {}
 
-        return self.vad
+        def decide(frame: bytes) -> bool | None:
+            audio = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                result = self.vad.generate(input=audio, cache=cache, is_final=False)
+                payload = result[0] if isinstance(result, list) and result else result
+                if isinstance(payload, dict):
+                    for key in ("is_speech", "speech", "speech_prob", "score"):
+                        if key in payload:
+                            value = payload[key]
+                            return bool(value) if key == "is_speech" else float(value) > 0.5
+            except Exception:
+                return None
+            return None
+
+        return decide
 
     @staticmethod
-    def _float_audio(pcm: bytes) -> np.ndarray:
+    def _audio(pcm: bytes) -> np.ndarray:
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _whisper_recognize(
-        self,
-        pcm: bytes,
-        recent_text: str,
-        hotwords: str | None,
-        partial: bool,
-        *,
-        refined: bool,
-        language_hint: str | None,
-    ) -> tuple[list[_DecodedSegment], str | None, float, str]:
-        model = self._ensure_refine_model() if refined else self.asr
-        if not self.ready and model is None:
-            raise RuntimeError("模型尚未就绪")
+    def _whisper(self, pcm: bytes, model: Any, *, refine: bool = False) -> tuple[str, str | None, float]:
         if model is None:
-            raise RuntimeError("Whisper 回退模型尚未就绪")
-        context = recent_text.strip()[-128:]
-        prompt_parts = [part.strip() for part in (hotwords or "", context) if part.strip()]
-        prompt = " ".join(prompt_parts)[-512:]
-        # Do not force the previous segment's language into Whisper. A short
-        # partial can be misclassified, and forcing that guess makes later
-        # Chinese audio decode as the wrong language. Whisper's own audio-level
-        # detection is more reliable for each window; ``language_hint`` is
-        # reserved for the text-level detector below.
+            return "", None, 0.0
         segments, info = model.transcribe(
-            self._float_audio(pcm),
-            task="transcribe",
-            language=None,
-            beam_size=1 if partial else 3,
-            best_of=1 if partial else 3,
-            multilingual=True,
+            self._audio(pcm),
+            beam_size=5 if refine else 1,
             vad_filter=False,
             condition_on_previous_text=False,
-            word_timestamps=not partial,
-            initial_prompt=prompt or None,
-            hotwords=hotwords,
         )
-        whisper_language = getattr(info, "language", None)
-        try:
-            whisper_confidence = float(getattr(info, "language_probability", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            whisper_confidence = 0.0
-        decoded = [
-            _DecodedSegment(float(item.start), float(item.end), item.text.strip())
-            for item in list(segments)
-            if getattr(item, "text", "").strip()
-        ]
-        self.metrics["whisper_calls"] = int(self.metrics["whisper_calls"]) + 1
-        return decoded, whisper_language, whisper_confidence, "whisper"
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        language = getattr(info, "language", None)
+        probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+        return text, language, probability
 
-    def _funasr_recognize(
-        self,
-        pcm: bytes,
-        *,
-        partial: bool,
-        language_hint: str | None,
-        hotwords: str | None,
-    ) -> tuple[list[_DecodedSegment], str | None, float, str]:
-        if self.fun_asr is None:
-            return [], None, 0.0, "funasr"
-        audio = self._float_audio(pcm)
-        kwargs: dict[str, Any] = {
-            "input": audio,
-            "itn": True,
-            "batch_size": 1,
-        }
-        if hotwords:
-            kwargs["hotword"] = hotwords
-        if not partial:
-            kwargs["is_final"] = True
+    def _recognize(self, pcm: bytes, *, refine: bool = False) -> tuple[str, LanguageGuess, float, str, str]:
+        self.last_asr_error = None
+        self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
+        model = self._ensure_refine_model() if refine else self.primary
+        model_name = self.asr_refine_name if refine else self.asr_primary_name
+        if model is None or not hasattr(model, "transcribe"):
+            return "", LanguageGuess("zh", 0.0), 0.0, "none", "detector"
         try:
-            result = self.fun_asr.generate(**kwargs)
-        except TypeError:
-            kwargs.pop("is_final", None)
-            kwargs.pop("hotword", None)
-            try:
-                result = self.fun_asr.generate(**kwargs)
-            except Exception:  # noqa: BLE001 - route an unsupported response to Whisper
-                self.metrics["fallback_calls"] = int(self.metrics["fallback_calls"]) + 1
-                return [], None, 0.0, "funasr"
-        except Exception:  # noqa: BLE001 - route model/API failures to Whisper
-            # Some Fun-ASR releases require an explicit Chinese language for
-            # the Nano checkpoint. Retry once with that documented default
-            # before routing the segment to Whisper.
-            if "language" not in kwargs:
-                kwargs["language"] = "中文"
-                try:
-                    result = self.fun_asr.generate(**kwargs)
-                except Exception:  # noqa: BLE001
-                    self.metrics["fallback_calls"] = int(self.metrics["fallback_calls"]) + 1
-                    return [], None, 0.0, "funasr"
+            if self.device == "cuda":
+                with self.gpu_manager.acquire_sync("asr_refine" if refine else "asr_realtime"):
+                    text, language, confidence = self._whisper(pcm, model, refine=refine)
             else:
-                self.metrics["fallback_calls"] = int(self.metrics["fallback_calls"]) + 1
-                return [], None, 0.0, "funasr"
-        payload = result[0] if isinstance(result, list) and result else result
-        if not isinstance(payload, dict):
-            return [], None, 0.0, "funasr"
-        language = payload.get("language") or payload.get("lang")
-        try:
-            confidence = float(
-                payload.get("confidence", payload.get("score", 0.0)) or 0.0
-            )
-        except (TypeError, ValueError):
-            confidence = 0.0
-        decoded: list[_DecodedSegment] = []
-        sentence_info = payload.get("sentence_info")
-        if isinstance(sentence_info, list):
-            for item in sentence_info:
-                if not isinstance(item, dict):
-                    continue
-                text = str(item.get("text") or item.get("sentence") or "").strip()
-                if not text:
-                    continue
-                start = float(item.get("start", 0.0) or 0.0)
-                end = float(item.get("end", start) or start)
-                if start > 100 or end > 100:
-                    start /= 1000.0
-                    end /= 1000.0
-                decoded.append(_DecodedSegment(start, end, text))
-        if not decoded:
-            text = str(payload.get("text") or payload.get("sentence") or "").strip()
-            if text:
-                decoded.append(_DecodedSegment(0.0, len(audio) / SAMPLE_RATE, text))
-        self.metrics["funasr_calls"] = int(self.metrics["funasr_calls"]) + 1
-        return decoded, str(language) if language else None, confidence, "funasr"
+                text, language, confidence = self._whisper(pcm, model, refine=refine)
+            guess = self.detector.detect(text, whisper_language=language, whisper_confidence=confidence)
+            self.metrics["asr_calls"] = int(self.metrics.get("asr_calls", 0)) + 1
+            return text, guess, confidence, model_name, "asr" if language else "detector"
+        except Exception as exc:
+            self.metrics["stage_failures"] = int(self.metrics.get("stage_failures", 0)) + 1
+            self._event("asr_error", model=model_name, refine=refine, error=str(exc))
+            self.last_asr_error = str(exc)
+            self.last_asr_error_model = model_name
+            return "", LanguageGuess("zh", 0.0), 0.0, model_name, "detector"
 
-    def _recognize(
-        self,
-        pcm: bytes,
-        recent_text: str,
-        hotwords: str | None,
-        partial: bool,
-        *,
-        refined: bool = False,
-        language_hint: str | None = None,
-    ) -> tuple[list[_DecodedSegment], str | None, float, str]:
-        if self.fun_asr is not None and not refined:
-            fun_segments, fun_language, fun_confidence, model_name = self._funasr_recognize(
-                pcm,
-                partial=partial,
-                language_hint=language_hint,
-                hotwords=hotwords,
-            )
-            text = " ".join(item.text for item in fun_segments).strip()
-            if text:
-                detected = self.detector.detect(
-                    text,
-                    whisper_language=fun_language,
-                    whisper_confidence=fun_confidence,
-                ) if self.detector else None
-                detected_code = (
-                    detected.code
-                    if detected
-                    else normalize_language_code(fun_language)
-                )
-                # Fun-ASR is the Chinese/English fast path. German goes to
-                # Whisper, which is the stronger multilingual model for that
-                # language and avoids returning a plausible-looking but wrong
-                # Fun-ASR transcript.
-                if detected_code in {"zh", "en"}:
-                    return fun_segments, detected_code, max(fun_confidence, detected.confidence if detected else 0.0), model_name
-                if detected_code == "de" or (language_hint or "").casefold() == "de":
-                    self.metrics["fallback_calls"] = int(self.metrics["fallback_calls"]) + 1
-                    return self._whisper_recognize(
-                        pcm,
-                        recent_text,
-                        hotwords,
-                        partial,
-                        refined=False,
-                        language_hint="de",
-                    )
-        return self._whisper_recognize(
-            pcm,
-            recent_text,
-            hotwords,
-            partial,
-            refined=refined,
-            language_hint=language_hint,
-        )
-
-    def transcribe_partial(
-        self,
-        event: SegmentEvent,
-        recent_text: str = "",
-        hotwords: str | None = None,
-        language_hint: str | None = None,
-    ) -> PartialResult | None:
-        segments, whisper_language, whisper_confidence, model_name = self._recognize(
-            event.pcm,
-            recent_text,
-            hotwords,
-            partial=True,
-            language_hint=language_hint,
-        )
-        raw_text = " ".join(item.text for item in segments if item.text).strip()
-        if not raw_text:
+    def _ensure_refine_model(self) -> Any | None:
+        if not self.refinement_enabled or not self.asr_refine_name:
             return None
-        language = (
-            self.detector.detect(
-                raw_text,
-                normalize_language_code(language_hint),
-                whisper_language=whisper_language,
-                whisper_confidence=whisper_confidence,
-            ).code
-            if self.detector
-            else whisper_language
-        )
-        if language not in SUPPORTED_LANGUAGE_CODES:
-            return None
-        text = simplify_chinese(raw_text) if language == "zh" else raw_text
-        return PartialResult(
-            event.revision,
-            event.start,
-            event.end,
-            text,
-            language,
-            whisper_confidence,
-            model_name,
-        )
+        if not self.asr_cache_ready:
+            raise RuntimeError(f"ASR refinement model cache is not ready: {self.asr_refine_name}")
+        if self.refine is not None:
+            return self.refine
+        with self._refine_lock:
+            if self.refine is not None:
+                return self.refine
+            try:
+                self.refine = self.refinement_engine.ensure_loaded(self.device, self.compute_type)
+                self._event("refine_loaded", model=self.asr_refine_name, device=self.device)
+            except Exception as exc:
+                self.metrics["stage_failures"] = int(self.metrics.get("stage_failures", 0)) + 1
+                self._event("refine_error", model=self.asr_refine_name, error=str(exc))
+                self.last_asr_error = str(exc)
+                self.last_asr_error_model = self.asr_refine_name
+                self.refine = None
+            return self.refine
 
-    def transcribe_draft(
-        self,
-        event: SegmentEvent,
-        recent_text: str = "",
-        hotwords: str | None = None,
-        language_hint: str | None = None,
-    ) -> PartialResult | None:
-        return self.transcribe_partial(
-            event, recent_text, hotwords, language_hint=language_hint
-        )
+    def transcribe_partial(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
+        text, guess, confidence, model, language_source = self._recognize(event.pcm)
+        return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
+
+    def transcribe_draft(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
+        return self.transcribe_partial(event, recent_text, hotwords)
 
     def transcribe_final(
         self,
         event: SegmentEvent,
         *,
         next_id: int,
-        previous_language: str | None,
+        previous_language: str | None = None,
         recent_text: str = "",
         hotwords: str | None = None,
         speaker_clusterer: OnlineSpeakerClusterer | None = None,
         refined: bool = True,
-        language_hint: str | None = None,
     ) -> list[Utterance]:
-        if self.detector is None:
-            raise RuntimeError("语言检测器尚未就绪")
-        clusterer = speaker_clusterer or self.speakers
-        if clusterer is None:
-            raise RuntimeError("说话人模型尚未就绪")
-        raw_segments, whisper_language, whisper_confidence, _model_name = self._recognize(
-            event.pcm,
-            recent_text,
-            hotwords,
-            partial=False,
-            refined=refined,
-            language_hint=language_hint or previous_language,
-        )
-        if not raw_segments:
+        text, whisper_guess, confidence, model, language_source = self._recognize(event.pcm, refine=refined)
+        if not text:
+            if refined and self.last_asr_error:
+                raise RuntimeError(
+                    f"ASR refinement failed ({self.last_asr_error_model or self.asr_refine_name}): {self.last_asr_error}"
+                )
             return []
-        content_start = min(float(raw.start) for raw in raw_segments)
-        content_end = max(float(raw.end) for raw in raw_segments)
-        speaker_id = clusterer.assign(event.pcm, max(0.0, content_end - content_start))
-        utterances: list[Utterance] = []
-        language = previous_language
-        for raw in raw_segments:
-            text = raw.text.strip()
-            if not text:
-                continue
-            clauses = self.detector.split_clauses(text)
-            weights = [max(1, len(clause)) for clause in clauses]
-            total_weight = sum(weights)
-            raw_start = event.start + float(raw.start)
-            raw_end = min(event.end, event.start + float(raw.end))
-            cursor = raw_start
-            duration = max(0.01, raw_end - raw_start)
-            for clause, weight in zip(clauses, weights):
-                end = min(raw_end, cursor + duration * weight / total_weight)
-                if not any(character.isalnum() for character in clause):
-                    cursor = end
-                    continue
-                guess = self.detector.detect(
-                    clause,
-                    language,
-                    whisper_language=whisper_language,
-                    whisper_confidence=whisper_confidence,
-                )
-                if guess.code not in SUPPORTED_LANGUAGE_CODES:
-                    cursor = end
-                    continue
-                source_text = simplify_chinese(clause) if guess.code == "zh" else clause
-                utterances.append(
-                    Utterance(
-                        id=next_id + len(utterances),
-                        start=round(cursor, 3),
-                        end=round(end, 3),
-                        speaker_id=speaker_id,
-                        language=guess.code,
-                        language_confidence=round(guess.confidence, 4),
-                        text=source_text,
-                        translation_zh="",
-                        segment_revision=event.revision,
-                        recognition_stage="refined" if refined else "fast",
-                        translation_status="pending",
-                        revision=2 if refined else 1,
-                    )
-                )
-                language = guess.code
-                cursor = end
-        return utterances
+        guess = self.detector.detect(
+            text,
+            previous=previous_language,
+            whisper_language=whisper_guess.code,
+            whisper_confidence=confidence,
+        )
+        speaker = speaker_clusterer.assign(event.pcm, event.end - event.start) if speaker_clusterer else 1
+        pieces = self.detector.split_clauses(text)
+        result: list[Utterance] = []
+        total = max(1, len(pieces))
+        cursor = event.start
+        for index, piece in enumerate(pieces):
+            duration = max(0.05, (event.end - event.start) / total)
+            end = min(event.end, cursor + duration)
+            segment_id = f"{event.revision}:{index}"
+            source_segment_id = str(event.revision)
+            value = simplify_chinese(piece) if guess.code == "zh" else piece
+            result.append(Utterance(
+                next_id + index,
+                cursor,
+                end,
+                speaker,
+                guess.code,
+                max(confidence, guess.confidence),
+                value,
+                value if guess.code == "zh" else "",
+                "not_needed" if guess.code == "zh" else "pending",
+                segment_id,
+                2 if refined else 1,
+                "refined" if refined else "fast",
+                source_segment_id,
+                model,
+                language_source,
+                "online",
+                0.0,
+                [speaker],
+            ))
+            cursor = end
+        return result
+
+    def transcribe_refined(self, event: SegmentEvent, **kwargs: Any) -> list[Utterance]:
+        kwargs["refined"] = True
+        return self.transcribe_final(event, **kwargs)
 
     def translate_text(self, text: str, source_language: str) -> TranslationResult:
         if self.translator is None:
-            return TranslationResult(text, "unsupported")
-        self.metrics["translation_calls"] = int(self.metrics["translation_calls"]) + 1
-        return self.translator.translate_with_status(text, source_language)
+            return TranslationResult("", "unsupported", error="translator is not ready")
+        self.metrics["translation_calls"] = int(self.metrics.get("translation_calls", 0)) + 1
+        if self.device == "cuda":
+            with self.gpu_manager.acquire_sync("translation"):
+                return self.translator.translate_many([text], source_language)[0]
+        return self.translator.translate_many([text], source_language)[0]
 
-    def translate_text_batch(
-        self, texts: list[str], source_language: str
-    ) -> list[TranslationResult]:
+    def translate_text_batch(self, texts: list[str], source_language: str) -> list[TranslationResult]:
         if self.translator is None:
-            return [TranslationResult(text, "unsupported") for text in texts]
-        self.metrics["translation_calls"] = int(self.metrics["translation_calls"]) + len(texts)
+            return [TranslationResult("", "unsupported", error="translator is not ready") for _ in texts]
+        self.metrics["translation_calls"] = int(self.metrics.get("translation_calls", 0)) + len(texts)
+        if self.device == "cuda":
+            with self.gpu_manager.acquire_sync("translation"):
+                return self.translator.translate_many(texts, source_language)
         return self.translator.translate_many(texts, source_language)
 
+    def diarize_audio(self, audio_paths: list[Path]) -> list[Any]:
+        if self.device == "cuda":
+            with self.gpu_manager.acquire_sync("diarization"):
+                result = self.diarization.diarize(audio_paths)
+        else:
+            result = self.diarization.diarize(audio_paths)
+        return result
 
-_NORMALIZE_RE = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
-
-
-def is_boundary_duplicate(previous: str, current: str) -> bool:
-    left = _NORMALIZE_RE.sub("", previous).casefold()
-    right = _NORMALIZE_RE.sub("", current).casefold()
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    if min(len(left), len(right)) >= 8 and (left.endswith(right) or right.startswith(left)):
-        return True
-    if min(len(left), len(right)) >= 12 and SequenceMatcher(None, left, right).ratio() >= 0.88:
-        return True
-    if 6 <= len(right) <= 20 and len(left) >= len(right):
-        suffix = left[-len(right):]
-        return SequenceMatcher(None, suffix, right).ratio() >= 0.65
-    return False
+    def capability_snapshot(self) -> dict[str, Any]:
+        translation = self.translator.assets_snapshot() if self.translator is not None else {
+            "en": {"model": "Helsinki-NLP/opus-mt-en-zh", "ready": False},
+            "de": {"model": opus_mt_repository("de"), "ready": False},
+        }
+        return {
+            "asr_realtime": {"model": self.asr_primary_name, "ready": self.primary is not None, "fallback": None},
+            "asr_refine": {"model": self.asr_refine_name, "ready": self.refine is not None, "cache_ready": self.asr_cache_ready, "load_policy": "on_demand"},
+            "translation": {"models": translation, "ready": all(item["ready"] for item in translation.values())},
+            "vad": {"model": self.vad_model_name, "ready": self.vad is not None},
+            "diarization": {
+                "model": self.diarization.model_name,
+                "backend": self.diarization.backend,
+                "ready": self.diarization.ready or self.diarization.capability_ready(),
+                "available": self.diarization.capability_ready(),
+                "status": self.diarization.status,
+                "weights_ready": self.diarization.model_size_bytes is not None,
+                "weight_bytes": self.diarization.model_size_bytes,
+                "parameters": self.diarization.model_parameters(),
+                "error": self.diarization.error,
+            },
+        }

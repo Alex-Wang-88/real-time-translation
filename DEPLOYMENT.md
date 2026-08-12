@@ -1,71 +1,76 @@
-# 企业部署与容量规划
+# v2 部署与扩展边界
 
-## 首期拓扑
+## Windows 本机首版
 
-首期以单个 Linux NVIDIA GPU 容器运行 API、实时 ASR、低优先级精修和本地翻译。所有模型任务进入同一个优先队列：实时 ASR > 翻译 > 说话人识别 > 精修 > 导出。单 RTX 5060 默认只允许一个 GPU worker 和一个活动会议。
-
-```
-企业 OIDC/SSO -> 可信反向代理 -> REST API（换取短期 ticket）
-                                      -> WebSocket 音频流
-                                      -> 单 GPU 优先队列
-                                      |-> SQLite WAL + JSONL + PCM/FLAC spool
-                                      |-> WAV/JSONL/Markdown 持久卷
-```
-
-反向代理必须移除客户端自带的 `x-meeting-user` 与 `x-meeting-service-token`，完成 SSO 后重新写入，并限制后端只接受配置在 `MEETING_TRUSTED_PROXY_CIDRS` 中的来源。生产客户端不把长期 API token 放在 WebSocket URL；服务端签发 60 秒、单次使用的 stream ticket，并要求连接后 5 秒内发送 `auth` 消息。旧的 header/query token 解析只用于滚动升级兼容。
-
-## 模型与许可证清单
-
-生产包必须保存一份机器可读模型清单（建议 `models/MODEL_MANIFEST.json`），每个模型至少记录：名称、版本或 commit SHA、来源 URL、本地路径、许可证、商业使用状态和审核人/日期。CI 或发布脚本应阻止缺少清单项的模型进入生产镜像。
-
-仓库提供 [MODEL_MANIFEST.example.json](MODEL_MANIFEST.example.json) 和校验脚本。复制并补齐真实 revision、许可证审核和商业使用结论后执行：
-
-```bash
-python scripts/check_model_manifest.py models/MODEL_MANIFEST.json --production
+```text
+Chrome / Edge
+    │  AudioWorklet PCM16 16 kHz mono + sequence
+    ▼
+FastAPI REST + WebSocket
+    ├── 有界音频队列
+    ├── VAD / 分段 / 语言识别 / 匿名说话人编号
+    ├── faster-whisper large-v3-turbo（实时）
+    ├── faster-whisper large-v3（停录后按需精修）
+    ├── Resemblyzer voice encoder（停录后匿名说话人重排）
+    ├── OPUS-MT en→zh-CN、de→zh-CN（本地 CTranslate2 int8）
+    ├── 本地文件和 session_state.json
+    └── Jimo SSE：summary 多轮 → minutes 原子保存 → todo 单轮
 ```
 
-首期默认模型：
+默认优先级：实时 ASR > 实时翻译 > 音频落盘 > 停止后精修 > 会议纪要 > To-do-list。
 
-| 角色 | 默认模型 | 运行方式 |
-| --- | --- | --- |
-| 主 ASR | `FunAudioLLM/Fun-ASR-Nano-2512` | 中英、中文方言优先；运行时失败回退 Whisper |
-| ASR 回退 | `large-v3-turbo` | 德语、长尾语种、低置信度和异常结果 |
-| 精修 ASR | `large-v3` | 停止后低优先级；首次需要时懒加载 |
-| VAD | `fsmn-vad` | FunASR FSMN-VAD；失败时能量 VAD |
-| 翻译 | 审核后的 OPUS-MT pair | CTranslate2 INT8，CPU 或低优先级 GPU |
+默认限制：
 
-生产翻译只部署已审核的常用语言对：`en→zh`、`de→zh`、`ja→zh`、`ko→zh`、`fr→zh`、`es→zh`、`ru→zh`。目标语言固定为 `zh-CN`。未部署的语言必须返回原文和 `unsupported`。当前 NLLB 生产路径已移除；任何历史 NLLB 缓存都不能直接打包为商业生产模型，需按其模型卡许可证重新审核。
+- 单主持人麦克风、单用户、单会议。
+- `MEETING_MAX_ACTIVE_MEETINGS=1`。
+- `MEETING_INFERENCE_QUEUE_SIZE=64`，不使用无限队列。
+- WebSocket 短暂断线保留有限恢复窗口，窗口后无人连接才停止会议，避免断线造成孤立录音。
+- 实时链路只使用 `large-v3-turbo`，不隐式回退到 Fun-ASR；`large-v3` 只在停止后按需加载，失败时保留已保存的 turbo 快速稿并把后处理标记为错误。
+- Jimo 请求有连接/整体超时和指数退避；失败状态可通过 REST 或页面重试。
+- To-do 只读取保存成功的当前纪要版本，不把转写切片加入 To-do 上下文。
+- 说话人重排固定使用 Resemblyzer voice encoder、16 kHz 单声道输入、能量 VAD 和余弦相似度聚类。Resemblyzer 权重随 Python 音频依赖部署；缺少包或权重时健康检查失败并禁止新建会议，不使用外部授权和运行时回退。
+- VAD 使用 FunASR `fsmn-vad`，依赖 `torchaudio` 与当前 PyTorch/CUDA wheel 版本配套；OPUS-MT 模型在构建或预部署阶段下载、转换并校验 `model.bin`、SentencePiece 和 `meeting_model.json`，运行时不访问 Hugging Face/ModelScope。
+- 服务器部署前运行 `.venv\Scripts\python.exe scripts\prepare_models.py --check-only`；该命令同时检查 VAD 本地快照、torchaudio、Resemblyzer 和两个 OPUS-MT 目录。生产环境将 `MEETING_ASR_AUTODOWNLOAD=0`、`MEETING_TRANSLATION_AUTODOWNLOAD=0`，避免服务启动时联网下载。
 
-## 容器启动
+## 企业切换接口
 
-```bash
-docker build -f Dockerfile.server -t realtime-meeting:latest .
-docker run --rm --gpus all -p 8765:8765 \
-  -v meeting-data:/data -v meeting-models:/models \
-  --env-file .env realtime-meeting:latest
+代码中的运行边界按以下接口演进，不需要改变前端契约：
+
+| 本机实现 | 企业替换 |
+|---|---|
+| `LocalMeetingStore` | PostgreSQL 元数据仓库 |
+| `result/meetings/<id>` | S3 / MinIO 对象存储 |
+| `asyncio.Queue` 和 session state | Redis、RabbitMQ 或 NATS JobQueue |
+| 单进程 `LiveModelRuntime` | ASR GPU worker pool + scheduler |
+| `JimoClient` | 公网 Jimo 或企业内网 OpenAI-compatible LLMProvider |
+| 单用户本机认证 | OIDC / LDAP / SSO IdentityProvider |
+| FastAPI 静态托管 | 统一网关、WebSocket gateway、独立前端 |
+
+目标拓扑：
+
+```text
+统一网关 / SSO
+      │
+REST API + WebSocket Gateway
+      │
+会议元数据数据库 + 对象存储
+      │
+实时 ASR GPU Worker Pool
+      │
+LLM Summary / To-do Job Queue
+      │
+Jimo 公网节点或企业内网模型网关
 ```
 
-宿主机需要 NVIDIA 驱动和 NVIDIA Container Toolkit。Docker 基础镜像和 PyTorch wheel 固定在 CUDA 12.8 系列；启动前应检查 `torch.version.cuda`、`nvidia-smi` 和 CTranslate2 CUDA 可用性。`/models` 保存 ASR/VAD/OPUS-MT 缓存，`/data` 保存录音、转写、SQLite 队列与恢复状态；两者都必须使用持久卷。
+## 容量和故障策略
 
-## 容量与扩展
+企业第一阶段按 10 路同时实时会议建立压测基线，但实际安全流数必须由目标 GPU 和真实语言混合数据测出。至少测量 1、5、10 路和 30 分钟连续录音：首个 partial、稳定句延迟、翻译延迟、实时处理比、队列深度、丢包、显存和恢复时间。
 
-“1000 人企业、峰值 50 路音频”不是单张 GPU 的承载承诺。先用目标音频和目标 GPU 测量实时、精修阶段的处理比（处理秒数 / 音频秒数），在不超过约 70% 持续 GPU 利用率和 7.2 GB 模型预算的前提下确定每副本安全流数。
+验收条件：队列不持续增长、没有 GPU OOM、进程不崩溃、重启后每场会议可恢复。超出容量时，新会议返回 HTTP 429，已有会议继续写入转写和音频。
 
-首期通过以下配置执行硬限流：
+生产部署还应补充：
 
-- `MEETING_MAX_ACTIVE_MEETINGS`（兼容 `MEETING_MAX_CONCURRENT_MEETINGS`）；
-- `MEETING_GPU_WORKERS=1`、`MEETING_GPU_MEMORY_BUDGET_MB=7200`；
-- `MEETING_INFERENCE_QUEUE_SIZE`、`MEETING_REFINEMENT_QUEUE_SIZE`；
-- `MEETING_MAX_PENDING_REFINEMENTS`、`MEETING_MAX_REFINEMENT_SPOOL_BYTES`。
-
-实时 ASR 不得等待精修；停止录音后才排空全部精修和翻译任务。达到会议、任务或磁盘配额时，新会议返回 HTTP 429，已有会议继续保存和排空。需要多 GPU 或多节点时，保留 `ASRBackend`、`TranslationBackend`、`MeetingStore` 和 `InferenceScheduler` 接口，将本地存储替换为 Postgres、S3 兼容对象存储和 Redis/消息队列适配器；SQLite 不用于多副本共享。
-
-## 运维检查
-
-- `/health/live`：进程存活探针；
-- `/health/ready`：模型、磁盘和 GPU 就绪探针；
-- `/api/health`：需鉴权，包含模型路由、许可证配置状态、GPU 预算、队列和磁盘容量；
-- `/api/metrics`：音频包、丢包/乱序、VAD、推理、翻译、精修和模型事件指标；
-- 优雅终止应给精修和翻译任务留出时间；被中断的 `running` 任务会在下次启动时恢复为 `queued`。
-
-生产部署应额外配置反向代理的 HTTPS、WebSocket 空闲超时、请求体上限、审计日志脱敏和结果目录加密/访问控制。
+- 每个 worker 的 CPU/GPU/显存/队列/音频丢包/LLM 延迟指标。
+- LLM 并发信号量、最大排队数、超时、指数退避和熔断。
+- 企业密钥管理、录音加密、访问审计、对象存储生命周期和删除审计。
+- 数据保留、跨区域传输、会议参与者告知和语言识别误差的合规评估。

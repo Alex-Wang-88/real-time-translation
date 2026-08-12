@@ -1,140 +1,150 @@
 from __future__ import annotations
 
-import json
+import asyncio
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from realtime_meeting.config import Settings
-from realtime_meeting.models import Utterance
-from realtime_meeting.session import LiveMeetingSession, SessionManager
+from realtime_meeting.models import TodoDocument, TodoItem, Utterance
+from realtime_meeting.session import LiveMeetingSession
+from realtime_meeting.session import SessionManager
+from realtime_meeting.storage import LocalMeetingStore
 
 
-class ReadyRuntime:
+class FakeRuntime:
     ready = True
-    status = "ready"
     device = "cpu"
+    status = "模型已就绪"
+    metrics = {}
+
+    def new_vad(self):
+        return None
+
+    def new_speaker_clusterer(self):
+        return None
+
+    def transcribe_partial(self, event, recent_text="", hotwords=None):
+        from realtime_meeting.runtime import PartialResult
+
+        return PartialResult(event.revision, event.start, event.end, "hello", "en", 0.9, "fake")
+
+    def transcribe_final(self, event, **kwargs):
+        stage = "refined" if kwargs.get("refined") else "fast"
+        revision = 2 if kwargs.get("refined") else 1
+        return [Utterance(kwargs["next_id"], event.start, event.end, 1, "en", 0.9, f"We will send the {stage} plan.", "", "pending", f"{event.revision}:0", revision, stage)]
+
+    def translate_text(self, text, source_language):
+        from realtime_meeting.runtime import TranslationResult
+
+        return TranslationResult("我们会发送方案。", "ready", "fake")
+
+
+class FakeSummarizer:
+    calls = 0
+    attempts: list[str | None] = []
+
+    async def summarize(self, transcript_path, meeting_id, started_at, ended_at, **kwargs):
+        type(self).calls += 1
+        type(self).attempts.append(kwargs.get("attempt_id"))
+        await kwargs["on_delta"]("# 会议纪要\n\n## 5. 行动项\n\n发送方案。")
+        return "# 会议纪要\n\n## 5. 行动项\n\n发送方案。"
+
+
+class FakeTodoGenerator:
+    calls = 0
+    minutes: list[str] = []
+
+    async def generate(self, meeting_id, summary_revision, minutes, **kwargs):
+        type(self).calls += 1
+        type(self).minutes.append(minutes)
+        return TodoDocument(
+            items=[TodoItem(task="发送方案", meeting_id=meeting_id, summary_revision=summary_revision)],
+            meeting_id=meeting_id,
+            summary_revision=summary_revision,
+            generated_at="now",
+        )
 
 
 @pytest.mark.asyncio
-async def test_feed_audio_rejects_oversized_and_odd_pcm_packets(tmp_path: Path):
-    settings = Settings(
-        results_dir=tmp_path,
-        max_audio_packet_bytes=4,
-        disk_warn_bytes=0,
-        disk_stop_bytes=0,
-    )
-    session = LiveMeetingSession(settings, ReadyRuntime())
-    await session.start()
-    try:
-        with pytest.raises(ValueError, match="4"):
-            await session.feed_audio(b"\x00" * 6)
-        with pytest.raises(ValueError, match="偶数"):
-            await session.feed_audio(b"\x00")
-        assert session.audio_packets_received == 0
-    finally:
-        await session.stop()
-
-
-@pytest.mark.asyncio
-async def test_stop_failure_is_persisted_without_losing_error(tmp_path: Path, monkeypatch):
-    settings = Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0)
-    session = LiveMeetingSession(settings, ReadyRuntime())
-    await session.start()
-
-    def fail_export(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr("realtime_meeting.session.export_live_result", fail_export)
-    await session.stop()
-
-    assert session.state == "error"
-    assert "disk full" in (session.error or "")
-    saved = json.loads((session.output_dir / "session_state.json").read_text(encoding="utf-8"))
-    assert saved["state"] == "error"
-    assert "disk full" in saved["error"]
-
-
-def test_summary_claim_is_single_use(tmp_path: Path):
+async def test_summary_and_todo_are_independent_and_revisioned(settings) -> None:
+    FakeSummarizer.calls = 0
+    FakeSummarizer.attempts = []
+    FakeTodoGenerator.calls = 0
+    FakeTodoGenerator.minutes = []
     session = LiveMeetingSession(
-        Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0),
-        ReadyRuntime(),
+        settings,
+        FakeRuntime(),
+        __import__("realtime_meeting.storage", fromlist=["LocalMeetingStore"]).LocalMeetingStore(settings.results_dir),
+        title="测试会议",
+        summarizer_factory=lambda _settings: FakeSummarizer(),
+        todo_factory=lambda _settings: FakeTodoGenerator(),
     )
-    session.state = "summary_pending"
-    assert session.begin_summary() is True
-    assert session.state == "summarizing"
-    assert session.begin_summary() is False
+    await session.start()
+    session.audio_writer = None
+    speech = np.full(320, 1200, dtype=np.int16).tobytes()
+    silence = np.zeros(320, dtype=np.int16).tobytes()
+    for _ in range(16):
+        await session.feed_audio(speech)
+    for _ in range(10):
+        await session.feed_audio(silence)
+    await session.request_stop()
+    assert session.stop_task is not None
+    await session.stop_task
+    if session.summary_task:
+        await session.summary_task
+    if session.todo_task:
+        await session.todo_task
+
+    assert session.recording_state == "complete"
+    assert session.summary_state == "complete"
+    assert session.todo_state == "complete"
+    assert session.summary_revision == 1
+    assert FakeSummarizer.calls == 1
+    assert FakeTodoGenerator.calls == 1
+    assert FakeTodoGenerator.minutes == [session.summary]
+    assert FakeSummarizer.attempts[0] and FakeSummarizer.attempts[0] != session.id
+    assert (session.output_dir / "todo_list.json").is_file()
+
+    assert await session.request_todo()
+    await session.todo_task
+    assert FakeSummarizer.calls == 1
+    assert FakeTodoGenerator.calls == 2
 
 
-def test_partial_text_only_advances_on_a_stable_prefix(tmp_path: Path):
-    session = LiveMeetingSession(
-        Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0),
-        ReadyRuntime(),
-    )
-
-    assert session._stable_partial_text(1, "hello world") == "hello world"
-    assert session._stable_partial_text(1, "hello world again") is None
-    assert session._stable_partial_text(1, "hello world again ") == "hello world again"
-    session._clear_partial_revision(1)
-    assert session._stable_partial_text(1, "你好世界") == "你好世界"
-
-
-def test_recovery_restores_terminal_state_audio_and_safe_files(tmp_path: Path):
-    output_dir = tmp_path / "20260808-120000-recovered"
-    output_dir.mkdir()
-    item = Utterance(1, 0.5, 2.0, 1, "en", 0.9, "hello", "你好")
-    (output_dir / "transcript.jsonl").write_text(
-        json.dumps(item.to_dict(), ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    (output_dir / "audio_manifest.json").write_text(
-        json.dumps(
-            {
-                "segments": [
-                    {
-                        "file": "audio/audio-0001.wav",
-                        "start_seconds": 0,
-                        "end_seconds": 4.0,
-                        "samples": 64_000,
-                        "format": "wav",
-                    },
-                    {"file": "bad.wav", "samples": "not-a-number"},
-                ]
-            }
-        ),
+def test_recovery_promotes_saved_interrupted_recording_to_summary_queue(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    meeting_id = "recovered-meeting"
+    output = store.meeting_dir(meeting_id)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "transcript.jsonl").write_text(
+        __import__("json").dumps(Utterance(1, 0, 1, 1, "zh", 0.9, "已保存内容", "已保存内容", "not_needed", "1:0").to_dict(), ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    (output_dir / "meeting_transcript.md").write_text("saved", encoding="utf-8")
-    (output_dir / "session_state.json").write_text(
-        json.dumps(
-            {
-                "id": "recovered-id",
-                "state": "summary_pending",
-                "started_at": "2026-08-08T12:00:00+00:00",
-                "ended_at": "2026-08-08T12:01:00+00:00",
-                "error": None,
-                "processing_error": "one segment failed",
-                "audio_bytes_received": 128_000,
-                "audio_packets_received": 12,
-                "audio_samples_received": 64_000,
-            }
-        ),
+    (output / "session_state.json").write_text(
+        __import__("json").dumps({"id": meeting_id, "title": "恢复会议", "recording_state": "recording", "summary_state": "idle", "todo_state": "waiting_summary"}, ensure_ascii=False),
         encoding="utf-8",
     )
-    (output_dir / "session_state.json.tmp").write_text("stale", encoding="utf-8")
+    manager = SessionManager(settings, FakeRuntime(), store)
+    recovered = manager.get(meeting_id)
+    assert recovered is not None
+    assert recovered.recording_state == "complete"
+    assert recovered.summary_state == "queued"
+    assert recovered.ended_at
 
-    settings = Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0)
-    manager = SessionManager(settings, ReadyRuntime())
-    session = manager.active()
 
-    assert session is not None
-    assert session.id == "recovered-id"
-    assert session.state == "summary_pending"
-    assert session.processing_error == "one segment failed"
-    assert session.audio_segments[0]["file"] == "audio-0001.wav"
-    assert session.audio_bytes_received == 128_000
-    assert session.audio_packets_received == 12
-    assert session.audio_samples_received == 64_000
-    assert session.elapsed_seconds == 4.0
-    assert "meeting_transcript.md" in session.files
-    assert "session_state.json" not in session.files
-    assert "session_state.json.tmp" not in session.files
+def test_recovery_requeues_running_postprocessing_tasks(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    meeting_id = "recovered-tasks"
+    output = store.meeting_dir(meeting_id)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "meeting_minutes.md").write_text("# 已保存纪要\n", encoding="utf-8")
+    (output / "session_state.json").write_text(
+        __import__("json").dumps({"id": meeting_id, "title": "恢复任务", "recording_state": "complete", "summary_state": "running", "todo_state": "running", "summary_revision": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    manager = SessionManager(settings, FakeRuntime(), store)
+    recovered = manager.get(meeting_id)
+    assert recovered is not None
+    assert recovered.summary_state == "queued"
+    assert recovered.todo_state == "queued"

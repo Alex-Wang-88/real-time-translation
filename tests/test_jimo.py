@@ -6,132 +6,109 @@ from pathlib import Path
 import httpx
 import pytest
 
-from realtime_meeting.config import Settings
-from realtime_meeting.exporter import append_utterance
-from realtime_meeting.jimo import JimoClient, MeetingSummarizer, parse_sse_lines, transcript_chunks
-from realtime_meeting.models import Utterance
+from realtime_meeting.jimo import (
+    JimoClient,
+    MeetingSummarizer,
+    TodoGenerator,
+    parse_sse_lines,
+    parse_todo_document,
+    transcript_chunks,
+)
+from realtime_meeting.models import TodoDocument, Utterance
 
 
-def settings(tmp_path: Path, **overrides) -> Settings:
-    values = {
-        "results_dir": tmp_path,
-        "jimo_api_url": "https://example.test/v2/chat/completions/share?shareId=test",
-        "jimo_authorization": "opaque-authorization-value",
-        "jimo_max_request_chars": 12_000,
-        "jimo_transcript_chars": 1_200,
-        "jimo_state_chars": 1_000,
-    }
-    values.update(overrides)
-    return Settings(**values)
-
-
-def test_sse_parser_supports_documented_field_order_and_end_event():
-    events = list(
-        parse_sse_lines(
-            [
-                'data: {"role":"assistant","content":"第一段"}',
-                "event: data",
-                "",
-                "data: {'end': {}, 'role': 'assistant'}",
-                "event: end",
-                "",
-            ]
-        )
-    )
-    assert [(event.event, event.data) for event in events] == [
-        ("data", '{"role":"assistant","content":"第一段"}'),
-        ("end", "{'end': {}, 'role': 'assistant'}"),
-    ]
+def test_sse_parser_supports_multiline_data_and_end_event() -> None:
+    events = list(parse_sse_lines([
+        ": heartbeat\n",
+        "event: data\n",
+        'data: {"content":"第一段"}\n',
+        "data: {\"content\":\"第二段\"}\n",
+        "\n",
+        "event: end\n",
+        "data: {}\n",
+        "\n",
+    ]))
+    assert events[0].event == "data"
+    assert events[0].data.count("\n") == 1
+    assert events[1].event == "end"
 
 
 @pytest.mark.asyncio
-async def test_jimo_client_uses_raw_authorization_and_parses_sse(tmp_path: Path):
-    captured = {}
+async def test_jimo_request_keeps_legacy_body_and_streams_content(settings) -> None:
+    seen: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        captured["authorization"] = request.headers["authorization"]
-        captured["body"] = json.loads(request.content)
-        body = (
-            'data: {"role":"assistant","content":"会议"}\n'
-            "event: data\n\n"
-            'data: {"role":"assistant","content":"纪要"}\n'
-            "event: data\n\n"
-            "data: {'end': {}, 'role': 'assistant'}\n"
-            "event: end\n\n"
+        seen["headers"] = dict(request.headers)
+        seen["payload"] = json.loads(request.content)
+        stream = (
+            'event: data\n'
+            'data: {"content":"中"}\n'
+            'data: {"content":"文"}\n\n'
+            'data: {"choices":[{"delta":{"content":"纪要"}}]}\n\n'
+            'data: [DONE]\n\n'
         )
-        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream.encode())
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as http_client:
-        client = JimoClient(settings(tmp_path), http_client)
-        deltas = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = JimoClient(settings, client=http_client)
+        deltas: list[str] = []
         result = await client.complete(
-            [{"role": "user", "content": "test"}], "same-session", on_delta=deltas.append
+            [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+            "meeting:m:summary:a1",
+            on_delta=deltas.append,
         )
-    assert result == "会议纪要"
-    assert deltas == ["会议", "纪要"]
-    assert captured["authorization"] == "opaque-authorization-value"
-    assert captured["body"]["sessionId"] == "same-session"
-    assert captured["body"]["source"] == "api"
+
+    payload = seen["payload"]
+    assert result == "中文纪要"
+    assert deltas == ["中文", "纪要"]
+    assert payload == {
+        "messages": [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+        "sessionId": "meeting:m:summary:a1",
+        "source": "api",
+        "extra": {},
+    }
+    assert "test-secret" in seen["headers"]["authorization"]
 
 
-def test_transcript_chunks_do_not_split_an_utterance(tmp_path: Path):
+def test_transcript_chunks_keep_utterance_boundaries(tmp_path: Path) -> None:
     path = tmp_path / "transcript.jsonl"
-    for index in range(1, 5):
-        append_utterance(
-            path,
-            Utterance(index, index, index + 1, 1, "de", 0.9, "Danke " * 20, "谢谢 " * 20),
-        )
-    chunks = list(transcript_chunks(path, 500))
-    assert len(chunks) >= 2
-    assert all("演讲人1（德文）" in chunk[3] for chunk in chunks)
-    assert all("演讲人1（中文翻译）" in chunk[3] for chunk in chunks)
+    items = [
+        Utterance(1, 0, 2, 1, "en", 0.9, "We will ship the first plan.", "我们会发布第一个计划。", "ready", "s1"),
+        Utterance(2, 2, 4, 1, "de", 0.9, "Wir prüfen die Risiken.", "我们检查风险。", "ready", "s2"),
+        Utterance(3, 4, 6, 1, "zh", 0.9, "下周确认负责人。", "下周确认负责人。", "not_needed", "s3"),
+    ]
+    path.write_text("\n".join(json.dumps(item.to_dict(), ensure_ascii=False) for item in items) + "\n", encoding="utf-8")
+    chunks = list(transcript_chunks(path, 80))
+    assert len(chunks) == 3
+    assert [chunk[0] for chunk in chunks] == [1, 2, 3]
+    assert all("[" in chunk[3] and chunk[2] >= chunk[1] for chunk in chunks)
+    assert "We will ship" in "\n".join(chunk[3] for chunk in chunks)
+
+
+class _FakeTodoClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[dict[str, str]], str]] = []
+
+    async def complete(self, messages, session_id, **_kwargs):
+        self.calls.append((messages, session_id))
+        return """```json
+        {"schema_version":"1.0","items":[{"task":"发送方案","owner":"李雷","due_date":"2026-08-20","source_time_start":12.5,"source_time_end":14,"evidence":"会议决定由李雷发送方案"}]}
+        ```"""
 
 
 @pytest.mark.asyncio
-async def test_meeting_summarizer_reuses_session_and_marks_start_end(tmp_path: Path):
-    path = tmp_path / "transcript.jsonl"
-    for index in range(1, 8):
-        append_utterance(
-            path,
-            Utterance(index, index * 2, index * 2 + 1, 1, "zh", 0.9, "项目进展正常。" * 12, "项目进展正常。" * 8),
-        )
+async def test_todo_generator_makes_one_logical_model_call(settings) -> None:
+    fake = _FakeTodoClient()
+    generator = TodoGenerator(settings, client=fake)
+    result = await generator.generate("meeting-1", 3, "# 会议纪要\n\n李雷发送方案，截止 2026-08-20。")
+    assert len(fake.calls) == 1
+    assert fake.calls[0][1] == "meeting:meeting-1:todo:3"
+    assert fake.calls[0][0][0]["role"] == "system"
+    assert result.items[0].task == "发送方案"
+    assert result.items[0].owner == "李雷"
+    assert result.items[0].source_time_start == 12.5
 
-    class FakeClient:
-        def __init__(self):
-            self.calls = []
 
-        async def complete(self, messages, session_id, *, on_delta=None, on_reset=None):
-            self.calls.append((messages, session_id))
-            final = "MEETING_END" in messages[-1]["content"]
-            output = "1. 会议主题\n项目进展" if final else "主题：项目进展；无新增风险。"
-            if final and on_delta:
-                for part in ("1. 会议主题\n", "项目进展"):
-                    result = on_delta(part)
-                    if hasattr(result, "__await__"):
-                        await result
-            return output
-
-    fake = FakeClient()
-    summarizer = MeetingSummarizer(settings(tmp_path), fake)
-    statuses = []
-    deltas = []
-    result = await summarizer.summarize(
-        path,
-        "one-session",
-        "2026-01-01T00:00:00Z",
-        "2026-01-01T01:00:00Z",
-        on_status=lambda kind, index, total: statuses.append((kind, index, total)),
-        on_delta=deltas.append,
-        on_reset=lambda: deltas.clear(),
-    )
-    assert result.startswith("1. 会议主题")
-    assert all(session_id == "one-session" for _messages, session_id in fake.calls)
-    assert "MEETING_START" in fake.calls[0][0][-1]["content"]
-    assert "MEETING_END" in fake.calls[-1][0][-1]["content"]
-    assert all(
-        sum(len(message["content"]) for message in messages) <= 12_000
-        for messages, _session in fake.calls
-    )
-    assert statuses[-1][0] == "final"
-    assert "".join(deltas) == result
+def test_todo_json_invalid_schema_is_a_failure() -> None:
+    with pytest.raises(ValueError):
+        parse_todo_document('{"items":[{"task": 3}]}', "meeting-1", 1)

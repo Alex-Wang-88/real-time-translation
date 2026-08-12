@@ -1,261 +1,187 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import shutil
 import threading
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from .audio import SegmentEvent
-
-
-class SessionRepository(Protocol):
-    def write_state(self, output_dir: Path, payload: dict[str, object]) -> None: ...
+from .models import Utterance
+from .text_normalize import simplify_chinese
 
 
-class AudioStore(Protocol):
-    def write_refinement_pcm(self, output_dir: Path, revision: int, pcm: bytes) -> Path: ...
+class MeetingStore(Protocol):
+    def meeting_dir(self, meeting_id: str) -> Path: ...
 
-    def delete(self, path: Path) -> None: ...
+    def list_states(self) -> list[dict[str, Any]]: ...
 
-
-class LocalSessionRepository:
-    def write_state(self, output_dir: Path, payload: dict[str, object]) -> None:
-        path = output_dir / "session_state.json"
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(path)
+    def delete(self, meeting_id: str) -> None: ...
 
 
-class LocalAudioStore:
-    def write_refinement_pcm(self, output_dir: Path, revision: int, pcm: bytes) -> Path:
-        directory = output_dir / "refinement_jobs"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"revision-{revision:08d}.pcm"
-        temporary = path.with_suffix(".pcm.tmp")
-        temporary.write_bytes(pcm)
-        temporary.replace(path)
-        return path
+class TranscriptStore:
+    """Append-only transcript storage with a backwards-compatible projection."""
 
-    def delete(self, path: Path) -> None:
-        path.unlink(missing_ok=True)
+    schema_version = "1.0"
+    _locks: dict[str, threading.RLock] = {}
+    _locks_guard = threading.Lock()
 
-
-@dataclass(slots=True)
-class RefinementJob:
-    session_id: str
-    revision: int
-    start: float
-    end: float
-    forced: bool
-    pcm_path: str
-    draft_text: str
-    draft_language: str | None
-    attempts: int = 0
-    status: str = "queued"
-    error: str | None = None
-
-    def event(self) -> SegmentEvent:
-        return SegmentEvent(
-            kind="final",
-            revision=self.revision,
-            start=self.start,
-            end=self.end,
-            pcm=Path(self.pcm_path).read_bytes(),
-            forced=self.forced,
-        )
-
-
-class RefinementJobStore:
-    """SQLite WAL queue metadata with atomically spooled PCM payloads."""
-
-    def __init__(self, database_path: Path, audio_store: AudioStore | None = None) -> None:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.database_path = database_path
-        self.audio_store = audio_store or LocalAudioStore()
-        self._lock = threading.RLock()
-        self._initialize()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        return connection
-
-    def _initialize(self) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS refinement_jobs (
-                    session_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    start REAL NOT NULL,
-                    end REAL NOT NULL,
-                    forced INTEGER NOT NULL,
-                    pcm_path TEXT NOT NULL,
-                    draft_text TEXT NOT NULL,
-                    draft_language TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    error TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (session_id, revision)
-                )
-                """
-            )
-            # A process can die between claim and completion. Reclaim those
-            # jobs on startup; idempotent transcript commits suppress repeats.
-            connection.execute(
-                "UPDATE refinement_jobs SET status='queued', updated_at=CURRENT_TIMESTAMP "
-                "WHERE status='running'"
-            )
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.events_path = path.with_name("transcript_events.jsonl")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        key = str(path.resolve())
+        with self._locks_guard:
+            self._lock = self._locks.setdefault(key, threading.RLock())
 
     @staticmethod
-    def _from_row(row: sqlite3.Row) -> RefinementJob:
-        return RefinementJob(
-            session_id=row["session_id"],
-            revision=int(row["revision"]),
-            start=float(row["start"]),
-            end=float(row["end"]),
-            forced=bool(row["forced"]),
-            pcm_path=row["pcm_path"],
-            draft_text=row["draft_text"],
-            draft_language=row["draft_language"],
-            attempts=int(row["attempts"]),
-            status=row["status"],
-            error=row["error"],
-        )
+    def _normalize(item: Utterance) -> Utterance:
+        if not item.segment_id:
+            item.segment_id = f"legacy:{item.id}"
+        if not item.source_segment_id or item.source_segment_id == item.segment_id:
+            item.source_segment_id = item.segment_id.split(":", 1)[0]
+        if item.language == "zh":
+            item.text = simplify_chinese(item.text)
+            item.translation_zh = item.text
+            item.translation_status = "not_needed"
+        return item
 
-    def enqueue(
-        self,
-        *,
-        session_id: str,
-        output_dir: Path,
-        event: SegmentEvent,
-        draft_text: str,
-        draft_language: str | None,
-    ) -> RefinementJob:
-        with self._lock, self._connect() as connection:
-            existing = connection.execute(
-                "SELECT * FROM refinement_jobs WHERE session_id=? AND revision=?",
-                (session_id, event.revision),
-            ).fetchone()
-            if existing is not None:
-                return self._from_row(existing)
-            pcm_path = self.audio_store.write_refinement_pcm(
-                output_dir, event.revision, event.pcm
-            )
-            connection.execute(
-                """
-                INSERT INTO refinement_jobs
-                    (session_id, revision, start, end, forced, pcm_path,
-                     draft_text, draft_language, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')
-                """,
-                (
-                    session_id,
-                    event.revision,
-                    event.start,
-                    event.end,
-                    int(event.forced),
-                    str(pcm_path),
-                    draft_text,
-                    draft_language,
-                ),
-            )
-        return RefinementJob(
-            session_id=session_id,
-            revision=event.revision,
-            start=event.start,
-            end=event.end,
-            forced=event.forced,
-            pcm_path=str(pcm_path),
-            draft_text=draft_text,
-            draft_language=draft_language,
-        )
+    @staticmethod
+    def _same_segment_key(item: Utterance) -> str:
+        return item.segment_id or item.source_segment_id or f"legacy:{item.id}"
 
-    def pending(self, session_id: str) -> list[RefinementJob]:
-        with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM refinement_jobs WHERE session_id=? "
-                "AND status IN ('queued','running') ORDER BY revision",
-                (session_id,),
-            ).fetchall()
-        return [self._from_row(row) for row in rows]
+    def append(self, item: Utterance, *, event_type: str = "upsert") -> None:
+        item = self._normalize(item)
+        payload = item.to_dict()
+        event = {
+            "schema_version": self.schema_version,
+            "event": event_type,
+            "segment_id": item.segment_id,
+            "revision": item.revision,
+            "utterance": payload,
+        }
+        with self._lock:
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                handle.flush()
+            with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                handle.flush()
 
-    def mark_running(self, job: RefinementJob) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE refinement_jobs SET status='running', attempts=attempts+1, "
-                "error=NULL, updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND revision=?",
-                (job.session_id, job.revision),
-            )
+    def delete(self, item: Utterance) -> None:
+        item.deleted = True
+        item.revision = max(2, item.revision + 1)
+        item.recognition_stage = "deleted"
+        self.append(item, event_type="delete")
 
-    def mark_done(self, job: RefinementJob) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE refinement_jobs SET status='done', error=NULL, "
-                "updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND revision=?",
-                (job.session_id, job.revision),
-            )
-        self.audio_store.delete(Path(job.pcm_path))
+    def replace_segment(self, segment_id: str, items: list[Utterance]) -> None:
+        """Emit tombstones for removed revisions, then append replacements."""
+        current = [item for item in self.load() if item.segment_id == segment_id]
+        replacement_ids = {item.id for item in items}
+        for previous in current:
+            if previous.id not in replacement_ids:
+                self.delete(previous)
+        for item in items:
+            self.append(item, event_type="replace")
 
-    def mark_failed(self, job: RefinementJob, error: str) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE refinement_jobs SET status='failed', error=?, "
-                "updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND revision=?",
-                (error[:2000], job.session_id, job.revision),
-            )
+    def load(self) -> list[Utterance]:
+        latest: dict[str, Utterance] = {}
+        if not self.path.exists():
+            return []
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as handle:
+                for raw in handle:
+                    if not raw.strip():
+                        continue
+                    try:
+                        item = Utterance.from_dict(json.loads(raw))
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        continue
+                    key = self._same_segment_key(item)
+                    previous = latest.get(key)
+                    if previous is None or (item.revision, item.recognition_stage == "refined") >= (
+                        previous.revision,
+                        previous.recognition_stage == "refined",
+                    ):
+                        latest[key] = item
+        return [item for item in latest.values() if not item.deleted]
 
-    def requeue(self, job: RefinementJob, error: str) -> None:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE refinement_jobs SET status='queued', error=?, "
-                "updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND revision=?",
-                (error[:2000], job.session_id, job.revision),
-            )
 
-    def retry_failed(self, session_id: str) -> int:
-        with self._lock, self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE refinement_jobs SET status='queued', error=NULL, "
-                "updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND status='failed'",
-                (session_id,),
-            )
-            return cursor.rowcount
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
-    def counts(self, session_id: str | None = None) -> dict[str, int]:
-        query = "SELECT status, COUNT(*) count FROM refinement_jobs"
-        parameters: tuple[object, ...] = ()
-        if session_id is not None:
-            query += " WHERE session_id=?"
-            parameters = (session_id,)
-        query += " GROUP BY status"
-        with self._lock, self._connect() as connection:
-            rows = connection.execute(query, parameters).fetchall()
-        counts = {"queued": 0, "running": 0, "failed": 0, "done": 0}
-        counts.update({row["status"]: int(row["count"]) for row in rows})
-        return counts
 
-    def pending_total(self) -> int:
-        counts = self.counts()
-        return counts["queued"] + counts["running"]
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
-    def spool_bytes(self) -> int:
-        with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                "SELECT pcm_path FROM refinement_jobs WHERE status != 'done'"
-            ).fetchall()
-        total = 0
-        for row in rows:
-            try:
-                total += Path(row["pcm_path"]).stat().st_size
-            except OSError:
-                pass
-        return total
+
+class LocalMeetingStore:
+    """Filesystem implementation used by Windows v2 and replaceable in enterprise deployments."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+
+    def meeting_dir(self, meeting_id: str) -> Path:
+        if not meeting_id or "/" in meeting_id or "\\" in meeting_id or meeting_id in {".", ".."}:
+            raise ValueError("非法会议 ID")
+        candidate = (self.root / meeting_id).resolve()
+        candidate.relative_to(self.root)
+        return candidate
+
+    def list_states(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        with self._lock:
+            for directory in self.root.iterdir():
+                if not directory.is_dir():
+                    continue
+                path = directory / "session_state.json"
+                if not path.is_file():
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    results.append(payload)
+        return sorted(results, key=lambda item: str(item.get("started_at", "")), reverse=True)
+
+    def delete(self, meeting_id: str) -> None:
+        target = self.meeting_dir(meeting_id).resolve()
+        with self._lock:
+            if not target.exists():
+                return
+            target.relative_to(self.root)
+            shutil.rmtree(target)
+
+    def purge_expired(self, retention_days: int) -> list[str]:
+        if retention_days <= 0:
+            return []
+        import time
+
+        cutoff = time.time() - retention_days * 86400
+        removed: list[str] = []
+        with self._lock:
+            for directory in self.root.iterdir():
+                if not directory.is_dir() or directory.stat().st_mtime >= cutoff:
+                    continue
+                state_path = directory / "session_state.json"
+                if state_path.is_file():
+                    try:
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        state = {}
+                    if isinstance(state, dict) and (
+                        state.get("recording_state") in {"starting", "recording", "finalizing"}
+                        or not state.get("ended_at")
+                    ):
+                        continue
+                removed.append(directory.name)
+                self.delete(directory.name)
+        return removed

@@ -11,7 +11,6 @@ from typing import Any, BinaryIO, Callable, Literal
 
 import numpy as np
 
-
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
 FRAME_MS = 20
@@ -29,91 +28,18 @@ class SegmentEvent:
     forced: bool = False
 
 
-class FsmnVAD:
-    """Small synchronous adapter for FunASR's stateful FSMN-VAD model.
-
-    The segmenter remains usable without FunASR: a missing model or an
-    unexpected model response returns ``None`` and lets the adaptive energy
-    fallback decide. This keeps local tests and CPU-only installations safe.
-    """
-
-    def __init__(self, model_name: str = "fsmn-vad", device: str = "cpu") -> None:
-        from funasr import AutoModel
-
-        runtime_device = f"{device}:0" if device == "cuda" else device
-        try:
-            self.model = AutoModel(
-                model=model_name,
-                hub="hf",
-                trust_remote_code=True,
-                device=runtime_device,
-            )
-        except TypeError:
-            self.model = AutoModel(model=model_name, device=runtime_device)
-        self.cache: dict[str, Any] = {}
-        self.frame_start_ms = 0.0
-
-    def __call__(self, frame: bytes) -> bool | None:
-        audio = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
-        try:
-            result = self.model.generate(
-                input=audio,
-                cache=self.cache,
-                is_final=False,
-            )
-        except TypeError:
-            result = self.model.generate(input=audio)
-        except Exception:
-            return None
-        payload = result[0] if isinstance(result, list) and result else result
-        frame_start_ms = self.frame_start_ms
-        self.frame_start_ms += FRAME_MS
-        if isinstance(payload, dict):
-            for key in ("is_speech", "speech", "speech_prob", "score"):
-                if key in payload:
-                    try:
-                        value = float(payload[key])
-                        return value > 0.5 if key != "is_speech" else bool(value)
-                    except (TypeError, ValueError):
-                        return None
-            info = payload.get("value")
-            if isinstance(info, (list, tuple)) and info:
-                # FSMN-VAD commonly returns accumulated speech intervals in
-                # milliseconds: ``[[start_ms, end_ms], ...]``. Decide for the
-                # current 20 ms frame while retaining the boundary format.
-                intervals = []
-                for interval in info:
-                    if isinstance(interval, (list, tuple)) and len(interval) >= 2:
-                        try:
-                            intervals.append((float(interval[0]), float(interval[1])))
-                        except (TypeError, ValueError):
-                            continue
-                if intervals:
-                    frame_end_ms = frame_start_ms + FRAME_MS
-                    decision = any(
-                        start_ms <= frame_end_ms and end_ms >= frame_start_ms
-                        for start_ms, end_ms in intervals
-                    )
-                    return decision
-                try:
-                    return float(info[-1]) > 0.5
-                except (TypeError, ValueError):
-                    return None
-        return None
-
-
 class StreamSegmenter:
-    """Adaptive energy VAD with pre-roll, stable silence commits and hard cuts."""
-
     def __init__(
         self,
         *,
-        pre_roll_ms: int = 300,
-        speech_start_ms: int = 120,
-        silence_ms: int = 500,
-        partial_interval_ms: int = 1500,
-        max_utterance_ms: int = 12_000,
-        minimum_rms: float = 60.0,
+        pre_roll_ms: int = 240,
+        speech_start_ms: int = 80,
+        silence_ms: int = 350,
+        partial_interval_ms: int = 900,
+        max_utterance_ms: int = 8000,
+        minimum_rms: float = 240.0,
+        minimum_speech_ms: int = 300,
+        minimum_speech_ratio: float = 0.12,
         vad: Callable[[bytes], bool | None] | None = None,
     ) -> None:
         self.pre_roll_frames = max(1, pre_roll_ms // FRAME_MS)
@@ -122,22 +48,16 @@ class StreamSegmenter:
         self.partial_interval_frames = max(1, partial_interval_ms // FRAME_MS)
         self.max_frames = max(1, max_utterance_ms // FRAME_MS)
         self.minimum_rms = minimum_rms
+        self.minimum_speech_frames = max(0, minimum_speech_ms // FRAME_MS)
+        self.minimum_speech_ratio = min(1.0, max(0.0, minimum_speech_ratio))
         self.vad = vad
-        # Start with a conservative floor so a quiet microphone can trigger
-        # speech detection during the first few hundred milliseconds. The
-        # floor adapts upward while idle, so ordinary background noise is not
-        # treated as speech.
         self.noise_floor = 15.0
         self._bytes = bytearray()
         self._pre_roll: deque[tuple[int, bytes]] = deque(maxlen=self.pre_roll_frames)
         self._active: list[tuple[int, bytes]] = []
-        self._speech_run = 0
-        self._silence_run = 0
-        self._total_samples = 0
-        self._frames_processed = 0
-        self._speech_frames = 0
-        self._revision = 0
-        self._last_partial_frame_count = 0
+        self._speech_run = self._silence_run = 0
+        self._total_samples = self._frames_processed = self._speech_frames = 0
+        self._revision = self._last_partial_frame_count = 0
 
     @property
     def elapsed_seconds(self) -> float:
@@ -148,34 +68,43 @@ class StreamSegmenter:
         return bool(self._active)
 
     @property
-    def frames_processed(self) -> int:
-        return self._frames_processed
-
-    @property
-    def speech_frames(self) -> int:
-        return self._speech_frames
-
-    @property
     def speech_ratio(self) -> float:
-        if not self._frames_processed:
-            return 0.0
-        return self._speech_frames / self._frames_processed
+        return self._speech_frames / self._frames_processed if self._frames_processed else 0.0
 
     def _is_speech(self, frame: bytes) -> bool:
-        if self.vad is not None:
-            try:
-                model_decision = self.vad(frame)
-            except Exception:
-                model_decision = None
-            if model_decision is not None:
-                return bool(model_decision)
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
         threshold = max(self.minimum_rms, self.noise_floor * 3.0)
-        speech = rms >= threshold
-        if not speech and not self._active:
-            self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
-        return speech
+
+        # The model VAD can interpret steady room noise as speech.  Keep an
+        # independent energy gate so low-level fans, keyboard noise and audio
+        # leakage never open an utterance merely because the model says so.
+        if rms < threshold:
+            if not self._active:
+                self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
+            return False
+        if self.vad:
+            try:
+                decision = self.vad(frame)
+            except Exception:
+                decision = None
+            if decision is not None:
+                return bool(decision)
+        return True
+
+    def _admitted(self, frames: list[tuple[int, bytes]]) -> bool:
+        if not frames:
+            return False
+        speech_frames = 0
+        for _, frame in frames:
+            samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
+            if rms >= self.minimum_rms:
+                speech_frames += 1
+        return (
+            speech_frames >= self.minimum_speech_frames
+            and speech_frames / len(frames) >= self.minimum_speech_ratio
+        )
 
     def feed(self, data: bytes) -> list[SegmentEvent]:
         if len(data) % SAMPLE_WIDTH:
@@ -189,71 +118,53 @@ class StreamSegmenter:
         return events
 
     def _feed_frame(self, frame: bytes) -> list[SegmentEvent]:
-        frame_start = self._total_samples
+        start = self._total_samples
         self._total_samples += FRAME_SAMPLES
         speech = self._is_speech(frame)
         self._frames_processed += 1
-        if speech:
-            self._speech_frames += 1
-        events: list[SegmentEvent] = []
-
+        self._speech_frames += int(speech)
         if not self._active:
-            self._pre_roll.append((frame_start, frame))
+            self._pre_roll.append((start, frame))
             self._speech_run = self._speech_run + 1 if speech else 0
             if self._speech_run >= self.speech_start_frames:
                 self._revision += 1
                 self._active = list(self._pre_roll)
                 self._last_partial_frame_count = len(self._active)
                 self._silence_run = 0
-            return events
-
-        self._active.append((frame_start, frame))
+            return []
+        self._active.append((start, frame))
         self._silence_run = 0 if speech else self._silence_run + 1
-        active_frames = len(self._active)
-        if (
-            active_frames >= max(50, self.partial_interval_frames)
-            and active_frames - self._last_partial_frame_count >= self.partial_interval_frames
-        ):
-            self._last_partial_frame_count = active_frames
+        events: list[SegmentEvent] = []
+        count = len(self._active)
+        if count >= max(50, self.partial_interval_frames) and count - self._last_partial_frame_count >= self.partial_interval_frames:
+            self._last_partial_frame_count = count
             events.append(self._make_event("partial", self._active))
-
         if self._silence_run >= self.silence_frames:
             keep_tail = min(5, self._silence_run)
-            useful = self._active[: active_frames - self._silence_run + keep_tail]
-            if useful:
+            useful = self._active[: count - self._silence_run + keep_tail]
+            if self._admitted(useful):
                 events.append(self._make_event("final", useful))
-            tail = self._active[-self.pre_roll_frames :]
-            self._reset(tail)
-        elif active_frames >= self.max_frames:
-            events.append(self._make_event("final", self._active, forced=True))
-            overlap = self._active[-self.pre_roll_frames :]
+            self._reset(self._active[-self.pre_roll_frames:])
+        elif count >= self.max_frames:
+            if self._admitted(self._active):
+                events.append(self._make_event("final", self._active, True))
+            overlap = self._active[-self.pre_roll_frames:]
             self._revision += 1
             self._active = overlap
             self._pre_roll.clear()
             self._speech_run = self.speech_start_frames
             self._silence_run = 0
-            self._last_partial_frame_count = len(self._active)
+            self._last_partial_frame_count = len(overlap)
         return events
 
-    def _make_event(
-        self, kind: Literal["partial", "final"], frames: list[tuple[int, bytes]], forced: bool = False
-    ) -> SegmentEvent:
-        start_sample = frames[0][0]
-        end_sample = frames[-1][0] + FRAME_SAMPLES
-        return SegmentEvent(
-            kind=kind,
-            pcm=b"".join(frame for _, frame in frames),
-            start=start_sample / SAMPLE_RATE,
-            end=end_sample / SAMPLE_RATE,
-            revision=self._revision,
-            forced=forced,
-        )
+    def _make_event(self, kind: Literal["partial", "final"], frames: list[tuple[int, bytes]], forced: bool = False) -> SegmentEvent:
+        start = frames[0][0]
+        end = frames[-1][0] + FRAME_SAMPLES
+        return SegmentEvent(kind, b"".join(frame for _, frame in frames), start / SAMPLE_RATE, end / SAMPLE_RATE, self._revision, forced)
 
     def _reset(self, pre_roll: list[tuple[int, bytes]] | None = None) -> None:
         self._active = []
-        self._speech_run = 0
-        self._silence_run = 0
-        self._last_partial_frame_count = 0
+        self._speech_run = self._silence_run = self._last_partial_frame_count = 0
         self._pre_roll.clear()
         if pre_roll:
             self._pre_roll.extend(pre_roll)
@@ -261,9 +172,9 @@ class StreamSegmenter:
     def flush(self) -> list[SegmentEvent]:
         if not self._active:
             return []
-        event = self._make_event("final", self._active)
+        event = self._make_event("final", self._active) if self._admitted(self._active) else None
         self._reset()
-        return [event]
+        return [event] if event else []
 
 
 @dataclass(slots=True)
@@ -276,15 +187,11 @@ class AudioSegmentInfo:
 
 
 class RotatingAudioWriter:
-    """Write an unlimited PCM stream into bounded FLAC files, with WAV fallback."""
-
     def __init__(self, output_dir: Path, segment_minutes: int = 30) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.segment_samples = max(1, segment_minutes) * 60 * SAMPLE_RATE
-        self.total_samples = 0
-        self.current_samples = 0
-        self.index = 0
+        self.total_samples = self.current_samples = self.index = 0
         self.segments: list[AudioSegmentInfo] = []
         self._process: subprocess.Popen[bytes] | None = None
         self._wave: wave.Wave_write | None = None
@@ -301,32 +208,7 @@ class RotatingAudioWriter:
         self._current_path = self.output_dir / f"audio-{self.index:04d}{suffix}"
         if self._format == "flac":
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            self._process = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "s16le",
-                    "-ar",
-                    str(SAMPLE_RATE),
-                    "-ac",
-                    "1",
-                    "-i",
-                    "pipe:0",
-                    "-c:a",
-                    "flac",
-                    "-compression_level",
-                    "5",
-                    str(self._current_path),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                creationflags=creationflags,
-            )
+            self._process = subprocess.Popen(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0", "-c:a", "flac", str(self._current_path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creationflags)
             self._sink = self._process.stdin
         else:
             self._wave = wave.open(str(self._current_path), "wb")
@@ -341,20 +223,20 @@ class RotatingAudioWriter:
         while offset < len(pcm):
             if self._current_path is None:
                 self._open()
-            room_samples = self.segment_samples - self.current_samples
-            available_samples = (len(pcm) - offset) // SAMPLE_WIDTH
-            take_samples = min(room_samples, available_samples)
-            part = pcm[offset : offset + take_samples * SAMPLE_WIDTH]
+            room = self.segment_samples - self.current_samples
+            take = min(room, (len(pcm) - offset) // SAMPLE_WIDTH)
+            part = pcm[offset: offset + take * SAMPLE_WIDTH]
             if self._format == "flac":
-                if self._sink is None:
-                    raise RuntimeError("FLAC writer is not open")
+                if not self._sink:
+                    raise RuntimeError("音频写入器未打开")
                 self._sink.write(part)
             else:
-                assert self._wave is not None
+                if not self._wave:
+                    raise RuntimeError("WAV 写入器未打开")
                 self._wave.writeframesraw(part)
             offset += len(part)
-            self.current_samples += take_samples
-            self.total_samples += take_samples
+            self.current_samples += take
+            self.total_samples += take
             if self.current_samples >= self.segment_samples:
                 self._close_current()
 
@@ -362,25 +244,16 @@ class RotatingAudioWriter:
         if self._current_path is None:
             return
         if self._format == "flac":
-            if self._sink is not None:
+            if self._sink:
                 self._sink.close()
-            assert self._process is not None
-            stderr = self._process.stderr.read().decode("utf-8", errors="replace") if self._process.stderr else ""
-            code = self._process.wait(timeout=30)
-            if code != 0:
-                raise RuntimeError(f"FFmpeg FLAC 写入失败: {stderr.strip()}")
-        elif self._wave is not None:
+            if self._process:
+                stderr = self._process.stderr.read().decode("utf-8", errors="replace") if self._process.stderr else ""
+                code = self._process.wait(timeout=30)
+                if code:
+                    raise RuntimeError(f"FFmpeg FLAC 写入失败: {stderr.strip()}")
+        elif self._wave:
             self._wave.close()
-        end_sample = self._current_start + self.current_samples
-        self.segments.append(
-            AudioSegmentInfo(
-                file=self._current_path.name,
-                start_seconds=round(self._current_start / SAMPLE_RATE, 3),
-                end_seconds=round(end_sample / SAMPLE_RATE, 3),
-                samples=self.current_samples,
-                format=self._format,
-            )
-        )
+        self.segments.append(AudioSegmentInfo(self._current_path.name, round(self._current_start / SAMPLE_RATE, 3), round((self._current_start + self.current_samples) / SAMPLE_RATE, 3), self.current_samples, self._format))
         self._process = None
         self._wave = None
         self._sink = None

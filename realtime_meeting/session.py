@@ -9,29 +9,19 @@ from collections import deque
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-import numpy as np
 from fastapi import WebSocket
 
 from .audio import RotatingAudioWriter, SegmentEvent, StreamSegmenter
 from .config import Settings
-from .exporter import append_utterance, export_live_result, load_utterances
-from .inference import InferenceCapacityError, InferenceCoordinator
-from .jimo import MeetingSummarizer
-from .models import MeetingSnapshot, SessionState, Utterance, utc_now_iso
-from .runtime import LiveModelRuntime, is_boundary_duplicate
-from .storage import (
-    LocalSessionRepository,
-    RefinementJob,
-    RefinementJobStore,
-    SessionRepository,
-)
-
-
-TERMINAL_STATES: set[SessionState] = {
-    "complete", "summary_pending", "summary_error", "refinement_error", "error"
-}
+from .diarization import align_speakers, write_segments
+from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
+from .jimo import MeetingSummarizer, TodoGenerator
+from .models import TodoDocument, TodoItem, Utterance, utc_now_iso
+from .runtime import LiveModelRuntime, PartialResult
+from .scheduler import PostprocessTracker
+from .storage import LocalMeetingStore, atomic_write_json, atomic_write_text
 
 
 class CapacityLimitError(RuntimeError):
@@ -42,1370 +32,939 @@ class LiveMeetingSession:
     def __init__(
         self,
         settings: Settings,
-        runtime: LiveModelRuntime,
+        runtime: Any,
+        store: LocalMeetingStore,
         *,
-        session_id: str | None = None,
-        output_dir: Path | None = None,
-        started_at: str | None = None,
-        recovered: bool = False,
+        meeting_id: str | None = None,
+        title: str = "",
         hotwords: str | None = None,
-        owner_id: str = "local",
-        coordinator: InferenceCoordinator | None = None,
-        job_store: RefinementJobStore | None = None,
-        repository: SessionRepository | None = None,
+        recovered_state: dict[str, Any] | None = None,
+        summarizer_factory: Callable[[Settings], MeetingSummarizer] | None = None,
+        todo_factory: Callable[[Settings], TodoGenerator] | None = None,
     ) -> None:
+        payload = recovered_state or {}
         self.settings = settings
         self.runtime = runtime
-        self.id = session_id or str(uuid.uuid4())
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.output_dir = output_dir or settings.results_dir / f"{stamp}-{self.id[:8]}"
+        self.store = store
+        self.id = meeting_id or str(uuid.uuid4())
+        self.title = title or str(payload.get("title", "未命名会议"))
+        self.output_dir = store.meeting_dir(self.id)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.started_at = started_at or utc_now_iso()
-        self.ended_at: str | None = None
-        self.started_monotonic = time.monotonic()
-        self.state: SessionState = "error" if recovered else "starting"
-        self.error: str | None = "服务重启后已恢复现有转写；可下载记录或开始新会议" if recovered else None
-        self.processing_error: str | None = None
-        self.hotwords = hotwords
-        self.owner_id = owner_id
-        self.coordinator = coordinator or InferenceCoordinator(
-            fast_workers=settings.fast_inference_workers,
-            refine_workers=settings.refine_inference_workers,
-            wait_timeout_seconds=settings.inference_wait_timeout_seconds,
-            gpu_workers=settings.gpu_workers,
-            gpu_memory_budget_mb=settings.gpu_memory_budget_mb,
-        )
-        self.job_store = job_store or RefinementJobStore(
-            settings.results_dir / "refinement_jobs.sqlite3"
-        )
-        self.repository = repository or LocalSessionRepository()
-        self.speaker_clusterer = (
-            runtime.new_speaker_clusterer()
-            if runtime.ready and hasattr(runtime, "new_speaker_clusterer")
-            else None
-        )
-        self.current_language: str | None = None
+        self.started_at = str(payload.get("started_at") or utc_now_iso())
+        self.ended_at = payload.get("ended_at")
+        self.created_monotonic = time.monotonic()
+        self.hotwords = hotwords if hotwords is not None else payload.get("hotwords")
+        self.recording_state = str(payload.get("recording_state", "starting"))
+        self.summary_state = str(payload.get("summary_state", "idle"))
+        self.todo_state = str(payload.get("todo_state", "waiting_summary"))
+        self.summary_revision = int(payload.get("summary_revision", 0) or 0)
+        self.snapshot_revision = int(payload.get("snapshot_revision", 0) or 0)
+        self.postprocess = PostprocessTracker(payload.get("postprocess") if isinstance(payload.get("postprocess"), dict) else None)
         self.summary = ""
+        self.todo: TodoDocument | None = None
+        self.error: str | None = payload.get("error")
+        self.summary_error: str | None = payload.get("summary_error")
+        self.todo_error: str | None = payload.get("todo_error")
         self.files: list[str] = []
-        self.recent: deque[Utterance] = deque(maxlen=500)
-        self.utterance_count = 0
         self.transcript_path = self.output_dir / "transcript.jsonl"
         self.audio_writer: RotatingAudioWriter | None = None
         self.segmenter: StreamSegmenter | None = None
         self.audio_segments: list[dict[str, object]] = []
-        self.audio_bytes_received = 0
-        self.audio_packets_received = 0
-        self.audio_samples_received = 0
-        self.audio_packets_dropped = 0
-        self.audio_packets_out_of_order = 0
+        self.clients: set[WebSocket] = set()
+        self.recent: deque[Utterance] = deque(maxlen=500)
+        self.utterance_count = 0
+        self.next_utterance_id = 1
+        self.current_language: str | None = None
         self.audio_sample_rate = 16_000
         self.audio_channels = 1
         self.audio_encoding = "pcm_s16le"
         self.audio_packet_ms = 40
-        self._last_audio_sequence: int | None = None
+        self.audio_bytes_received = 0
+        self.audio_packets_received = 0
+        self.audio_packets_dropped = 0
+        self.audio_packets_out_of_order = 0
+        self.audio_samples_received = 0
         self.audio_level = 0.0
-        self._last_audio_event = 0.0
-        self.clients: set[WebSocket] = set()
-        self.queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(
-            maxsize=settings.inference_queue_size
-        )
-        self.refine_queue: asyncio.Queue[RefinementJob | None] = asyncio.Queue(
-            maxsize=settings.refinement_queue_size
-        )
+        self._last_sequence: int | None = None
+        self._lock = asyncio.Lock()
+        self.queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(maxsize=settings.inference_queue_size)
         self.worker_task: asyncio.Task[None] | None = None
-        self.refine_worker_task: asyncio.Task[None] | None = None
-        self.disk_task: asyncio.Task[None] | None = None
         self.stop_task: asyncio.Task[None] | None = None
-        self.translation_queue: asyncio.Queue[tuple[str, int, str, str, float] | None] = asyncio.Queue(
-            maxsize=max(16, settings.inference_queue_size)
-        )
-        self.translation_worker_task: asyncio.Task[None] | None = None
+        self.disconnect_stop_task: asyncio.Task[None] | None = None
+        self.summary_task: asyncio.Task[None] | None = None
+        self.todo_task: asyncio.Task[None] | None = None
+        self.postprocess_task: asyncio.Task[None] | None = None
+        self.refinement_queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(maxsize=settings.refinement_queue_size)
+        self.refinement_worker_task: asyncio.Task[None] | None = None
+        self._refinement_events: dict[int, SegmentEvent] = {}
+        self.refinement_dropped = 0
+        self._segment_first_ids: dict[int, int] = {}
+        self._segment_ids: dict[int, list[str]] = {}
         self.translation_tasks: set[asyncio.Task[None]] = set()
-        self.partial_latencies_ms: deque[float] = deque(maxlen=500)
-        self.stable_latencies_ms: deque[float] = deque(maxlen=500)
-        self.translation_latencies_ms: deque[float] = deque(maxlen=500)
-        self.refinement_enqueued_at: dict[int, float] = {}
-        self._partial_raw_by_revision: dict[int, str] = {}
-        self._partial_stable_by_revision: dict[int, str] = {}
-        self.stop_lock = asyncio.Lock()
-        self.recent_text = ""
-        self.previous_language: str | None = None
-        self.last_final_revision = 0
-        self._latest_by_segment: dict[str, Utterance] = {}
-        if recovered:
-            recovered_items = load_utterances(self.transcript_path)
-            self.utterance_count = len(recovered_items)
-            self.recent.extend(recovered_items[-500:])
-            self._latest_by_segment = {
-                item.segment_id or f"legacy:{item.id}": item for item in recovered_items
-            }
-            if recovered_items:
-                self.current_language = recovered_items[-1].language
-                self.previous_language = recovered_items[-1].language
-                self.recent_text = " ".join(item.text for item in recovered_items[-20:])[-1000:]
-        if not recovered:
-            self._write_state()
+        self.model_metadata = getattr(runtime, "capability_snapshot", lambda: {})()
+        self._postprocess_error: str | None = None
+        self._refinement_errors: list[str] = []
+        self.speaker_clusterer = None
+        if getattr(runtime, "ready", False) and hasattr(runtime, "new_speaker_clusterer"):
+            with suppress(Exception):
+                self.speaker_clusterer = runtime.new_speaker_clusterer()
+        self.summarizer_factory = summarizer_factory or MeetingSummarizer
+        self.todo_factory = todo_factory or TodoGenerator
+        self._restore_files(payload)
+        if self.postprocess.state in {"running", "queued"} and self.recording_state == "complete":
+            self.postprocess.state = "queued"
+
+    def _restore_files(self, payload: dict[str, Any]) -> None:
+        self.files = [
+            path.name for path in self.output_dir.iterdir()
+            if path.is_file() and path.name not in {"session_state.json", "session_state.json.tmp"}
+        ] if self.output_dir.exists() else []
+        minutes = self.output_dir / "meeting_minutes.md"
+        if minutes.is_file():
+            self.summary = minutes.read_text(encoding="utf-8")
+        todo_path = self.output_dir / "todo_list.json"
+        if todo_path.is_file():
+            try:
+                raw = json.loads(todo_path.read_text(encoding="utf-8"))
+                todo_items: list[TodoItem] = []
+                for raw_item in raw.get("items", []) if isinstance(raw, dict) else []:
+                    if isinstance(raw_item, dict):
+                        todo_items.append(TodoItem(**{
+                            key: raw_item.get(key, default)
+                            for key, default in {
+                                "task": "", "owner": None, "due_date": None,
+                                "priority": "待确认", "status": "未开始",
+                                "source_time_start": None, "source_time_end": None,
+                                "evidence": "", "notes": "", "id": "",
+                                "meeting_id": self.id, "summary_revision": self.summary_revision,
+                                "created_at": "",
+                            }.items()
+                        }))
+                self.todo = TodoDocument(
+                    schema_version=str(raw.get("schema_version", "1.0")),
+                    items=todo_items,
+                    meeting_id=str(raw.get("meeting_id", self.id)),
+                    summary_revision=int(raw.get("summary_revision", self.summary_revision)),
+                    generated_at=str(raw.get("generated_at", "")),
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                self.todo = None
+        items = load_utterances(self.transcript_path)
+        self.recent.extend(items[-500:])
+        self.utterance_count = len(items)
+        self.next_utterance_id = max((item.id for item in items), default=0) + 1
+        self.current_language = items[-1].language if items else None
+        manifest = self.output_dir / "audio_manifest.json"
+        if manifest.is_file():
+            try:
+                value = json.loads(manifest.read_text(encoding="utf-8"))
+                self.audio_segments = list(value.get("segments", [])) if isinstance(value, dict) else []
+                self.audio_samples_received = sum(int(item.get("samples", 0) or 0) for item in self.audio_segments)
+                self.audio_bytes_received = self.audio_samples_received * 2
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
 
     @property
     def elapsed_seconds(self) -> float:
-        if self.audio_writer is not None:
-            return self.audio_writer.total_samples / 16_000
-        recent_end = self.recent[-1].end if self.recent else 0.0
-        audio_end = 0.0
-        for item in self.audio_segments:
-            try:
-                audio_end = max(audio_end, float(item.get("end_seconds", 0.0) or 0.0))
-            except (TypeError, ValueError):
-                continue
-        if recent_end or audio_end:
-            return max(recent_end, audio_end)
-        return max(0.0, time.monotonic() - self.started_monotonic) if self.state not in TERMINAL_STATES else 0.0
+        if self.ended_at and self.audio_samples_received:
+            return self.audio_samples_received / self.audio_sample_rate
+        return round(time.monotonic() - self.created_monotonic, 3)
 
-    def _write_state(self) -> None:
-        payload = {
-            "id": self.id,
-            "state": self.state,
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
-            "error": self.error,
-            "processing_error": self.processing_error,
-            "audio_bytes_received": self.audio_bytes_received,
-            "audio_packets_received": self.audio_packets_received,
-            "audio_packets_dropped": self.audio_packets_dropped,
-            "audio_packets_out_of_order": self.audio_packets_out_of_order,
-            "audio_samples_received": self.audio_samples_received,
-            "audio_sample_rate": self.audio_sample_rate,
-            "audio_channels": self.audio_channels,
-            "audio_encoding": self.audio_encoding,
-            "owner_id": self.owner_id,
-        }
-        self.repository.write_state(self.output_dir, payload)
-
-    async def start(self) -> None:
-        if not self.runtime.ready:
-            raise RuntimeError("实时模型尚未就绪")
-        if self.speaker_clusterer is None and hasattr(
-            self.runtime, "new_speaker_clusterer"
-        ):
-            self.speaker_clusterer = self.runtime.new_speaker_clusterer()
-        self.audio_writer = RotatingAudioWriter(
-            self.output_dir / "audio", self.settings.audio_segment_minutes
-        )
-        vad_factory = getattr(self.runtime, "new_vad", None)
-        vad = vad_factory() if callable(vad_factory) else None
-        self.segmenter = StreamSegmenter(
-            pre_roll_ms=self.settings.audio_pre_roll_ms,
-            speech_start_ms=self.settings.speech_start_ms,
-            silence_ms=self.settings.silence_ms,
-            partial_interval_ms=self.settings.partial_interval_ms,
-            max_utterance_ms=int(self.settings.max_utterance_seconds * 1000),
-            vad=vad,
-        )
-        self.state = "recording"
-        self._write_state()
-        self.worker_task = asyncio.create_task(self._inference_worker(), name=f"inference-{self.id}")
-        self.refine_worker_task = asyncio.create_task(
-            self._refinement_worker(), name=f"refinement-{self.id}"
-        )
-        self.translation_worker_task = asyncio.create_task(
-            self._translation_worker(), name=f"translation-{self.id}"
-        )
-        for job in self.job_store.pending(self.id):
-            self.refinement_enqueued_at[job.revision] = time.monotonic()
-            await self.refine_queue.put(job)
-        self.disk_task = asyncio.create_task(self._disk_monitor(), name=f"disk-{self.id}")
+    @property
+    def active(self) -> bool:
+        return self.recording_state in {"starting", "recording", "finalizing"}
 
     async def add_client(self, websocket: WebSocket) -> None:
+        if self.disconnect_stop_task and not self.disconnect_stop_task.done():
+            self.disconnect_stop_task.cancel()
+        self.disconnect_stop_task = None
         self.clients.add(websocket)
 
     def remove_client(self, websocket: WebSocket) -> None:
         self.clients.discard(websocket)
 
+    def schedule_disconnect_stop(self) -> None:
+        if self.clients or self.recording_state != "recording":
+            return
+        if self.disconnect_stop_task and not self.disconnect_stop_task.done():
+            return
+        self.disconnect_stop_task = asyncio.create_task(
+            self._stop_after_disconnect(), name=f"disconnect-stop-{self.id}"
+        )
+
+    async def _stop_after_disconnect(self) -> None:
+        try:
+            await asyncio.sleep(self.settings.websocket_disconnect_grace_seconds)
+            if not self.clients and self.recording_state == "recording":
+                await self.request_stop("websocket_disconnect")
+        except asyncio.CancelledError:
+            return
+
     async def broadcast(self, event_type: str, **payload: Any) -> None:
-        event = {"type": event_type, **payload}
+        message = {"type": event_type, **payload}
         stale: list[WebSocket] = []
         for client in tuple(self.clients):
             try:
-                await client.send_json(event)
+                await client.send_json(message)
             except Exception:
                 stale.append(client)
         for client in stale:
             self.clients.discard(client)
 
-    async def status(self, stage: str, message: str, **extra: Any) -> None:
-        await self.broadcast("status", stage=stage, message=message, state=self.state, **extra)
+    async def status(self, message: str, **payload: Any) -> None:
+        await self.broadcast("meeting_state", meeting=self.snapshot(), message=message, **payload)
 
-    async def _record_processing_error(
-        self, code: str, message: str, *, retryable: bool = False
-    ) -> None:
-        if self.processing_error is None:
-            self.processing_error = message
-        if self.error is None:
-            self.error = message
-        self._write_state()
-        await self.broadcast(
-            "error",
-            code=code,
-            message=message,
-            retryable=retryable,
-            state=self.state,
+    def _write_state(self) -> None:
+        self.snapshot_revision += 1
+        atomic_write_json(self.output_dir / "session_state.json", self._state_payload())
+
+    def _state_payload(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "recording_state": self.recording_state,
+            "summary_state": self.summary_state,
+            "todo_state": self.todo_state,
+            "summary_revision": self.summary_revision,
+            "snapshot_revision": self.snapshot_revision,
+            "postprocess": self.postprocess.to_dict(),
+            "hotwords": self.hotwords,
+            "error": self.error,
+            "summary_error": self.summary_error,
+            "todo_error": self.todo_error,
+            "audio_bytes_received": self.audio_bytes_received,
+            "audio_packets_received": self.audio_packets_received,
+            "audio_packets_dropped": self.audio_packets_dropped,
+            "audio_packets_out_of_order": self.audio_packets_out_of_order,
+            "audio_samples_received": self.audio_samples_received,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_seconds": round(self.elapsed_seconds, 3),
+            "recording_state": self.recording_state,
+            "summary_state": self.summary_state,
+            "todo_state": self.todo_state,
+            "snapshot_revision": self.snapshot_revision,
+            "postprocess": self.postprocess.to_dict(),
+            "summary_revision": self.summary_revision,
+            "summary": self.summary or None,
+            "todo": self.todo.to_dict() if self.todo else None,
+            "utterance_count": self.utterance_count,
+            "recent_utterances": [item.to_dict() for item in self.recent],
+            "current_language": self.current_language,
+            "files": sorted(self.files),
+            "error": self.error or self.summary_error or self.todo_error,
+            "audio_bytes_received": self.audio_bytes_received,
+            "audio_packets_received": self.audio_packets_received,
+            "audio_packets_dropped": self.audio_packets_dropped,
+            "audio_packets_out_of_order": self.audio_packets_out_of_order,
+            "audio_samples_received": self.audio_samples_received,
+            "audio_level": self.audio_level,
+            "refinement_queue_size": self.refinement_queue.qsize(),
+            "refinement_dropped": self.refinement_dropped,
+            "model_metadata": self.model_metadata,
+        }
+
+    async def start(self) -> None:
+        if self.recording_state not in {"starting", "recording"}:
+            return
+        self.audio_writer = RotatingAudioWriter(self.output_dir / "audio", self.settings.audio_segment_minutes)
+        vad = self.runtime.new_vad() if hasattr(self.runtime, "new_vad") else None
+        self.segmenter = StreamSegmenter(
+            pre_roll_ms=self.settings.audio_pre_roll_ms,
+            speech_start_ms=self.settings.speech_start_ms,
+            silence_ms=self.settings.silence_ms,
+            minimum_rms=self.settings.vad_minimum_rms,
+            minimum_speech_ms=self.settings.vad_minimum_speech_ms,
+            minimum_speech_ratio=self.settings.vad_minimum_speech_ratio,
+            partial_interval_ms=self.settings.partial_interval_ms,
+            max_utterance_ms=int(self.settings.max_utterance_seconds * 1000),
+            vad=vad,
         )
-
-    async def _enqueue_event(self, event: SegmentEvent) -> None:
-        try:
-            if event.kind == "partial":
-                if self.queue.full():
-                    return
-                self.queue.put_nowait(event)
-            else:
-                self.queue.put_nowait(event)
-        except asyncio.QueueFull:
-            message = "实时推理速度落后，当前语音片段未能全部排队；会议将保存已有记录"
-            await self._record_processing_error("inference_backlog", message)
-            await self.request_stop("inference_backlog")
+        self.recording_state = "recording"
+        self.error = None
+        self._write_state()
+        self.worker_task = asyncio.create_task(self._worker(), name=f"meeting-worker-{self.id}")
+        self.refinement_worker_task = None
+        await self.status("正在录音")
 
     def configure_audio(self, payload: dict[str, Any]) -> None:
-        sample_rate = int(payload.get("sample_rate", 16_000) or 0)
-        channels = int(payload.get("channels", 1) or 0)
-        encoding = str(payload.get("encoding", "pcm_s16le")).strip().casefold()
-        packet_ms = int(payload.get("packet_ms", 40) or 0)
-        if sample_rate != 16_000:
-            raise ValueError("浏览器音频必须是 16000 Hz")
-        if channels != 1:
-            raise ValueError("浏览器音频必须是单声道")
-        if encoding not in {"pcm_s16le", "pcm16"}:
-            raise ValueError("仅支持 PCM16 little-endian 音频")
-        if packet_ms < 10 or packet_ms > 100:
-            raise ValueError("音频包时长必须在 10–100 ms 之间")
-        self.audio_sample_rate = sample_rate
-        self.audio_channels = channels
-        self.audio_encoding = "pcm_s16le"
-        self.audio_packet_ms = packet_ms
-        self._write_state()
+        sample_rate = int(payload.get("sample_rate", 0) or 0)
+        channels = int(payload.get("channels", 0) or 0)
+        encoding = str(payload.get("encoding", ""))
+        if sample_rate != 16_000 or channels != 1 or encoding != "pcm_s16le":
+            raise ValueError("音频必须是 16000 Hz、单声道 PCM16")
+        self.audio_packet_ms = int(payload.get("packet_ms", 40) or 40)
 
-    async def feed_audio(self, pcm: bytes, *, sequence: int | None = None) -> None:
-        if self.state != "recording" or not pcm:
-            return
-        assert self.audio_writer is not None and self.segmenter is not None
-        if len(pcm) > self.settings.max_audio_packet_bytes:
-            raise ValueError(
-                f"音频包过大，单包不能超过 {self.settings.max_audio_packet_bytes} 字节"
-            )
+    async def feed_audio(self, pcm: bytes, sequence: int | None = None) -> None:
+        if self.recording_state != "recording":
+            raise ValueError("会议当前不在录音状态")
+        if not pcm or len(pcm) > self.settings.max_audio_packet_bytes:
+            raise ValueError("音频包为空或超过大小限制")
         if len(pcm) % 2:
-            raise ValueError("音频包必须是偶数长度的 PCM16 数据")
+            raise ValueError("PCM 音频包长度必须为偶数")
+        if sequence is not None and self._last_sequence is not None:
+            if sequence <= self._last_sequence:
+                self.audio_packets_out_of_order += 1
+            elif sequence > self._last_sequence + 1:
+                self.audio_packets_dropped += sequence - self._last_sequence - 1
         if sequence is not None:
-            if self._last_audio_sequence is not None:
-                expected = self._last_audio_sequence + 1
-                if sequence > expected:
-                    self.audio_packets_dropped += sequence - expected
-                elif sequence <= self._last_audio_sequence:
-                    self.audio_packets_out_of_order += 1
-                    # Do not move the watermark backwards when a delayed or
-                    # duplicate packet arrives.
-                    sequence = None
-            if sequence is not None:
-                self._last_audio_sequence = sequence
-        self.audio_bytes_received += len(pcm)
+            self._last_sequence = sequence
         self.audio_packets_received += 1
+        self.audio_bytes_received += len(pcm)
         self.audio_samples_received += len(pcm) // 2
-        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-        self.audio_level = float(np.sqrt(np.mean(samples * samples)) / 32768.0) if len(samples) else 0.0
-        self.audio_writer.write(pcm)
-        for event in self.segmenter.feed(pcm):
-            await self._enqueue_event(event)
-            if self.stop_task and not self.stop_task.done():
-                break
-        now = time.monotonic()
-        if now - self._last_audio_event >= 0.8:
-            self._last_audio_event = now
-            await self.broadcast(
-                "audio_input",
-                bytes_received=self.audio_bytes_received,
-                packets_received=self.audio_packets_received,
-                packets_dropped=self.audio_packets_dropped,
-                packets_out_of_order=self.audio_packets_out_of_order,
-                samples_received=self.audio_samples_received,
-                level=round(self.audio_level, 5),
-                vad_active=self.segmenter.active,
-                vad_speech_ratio=round(self.segmenter.speech_ratio, 4),
-            )
-
-    @staticmethod
-    def _invoke_runtime(
-        function: Any,
-        *args: Any,
-        language_hint: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        if language_hint:
-            try:
-                return function(*args, language_hint=language_hint, **kwargs)
-            except TypeError as exc:
-                if "language_hint" not in str(exc):
-                    raise
-        return function(*args, **kwargs)
-
-    @staticmethod
-    def _trim_partial_boundary(text: str) -> str:
-        """Keep a partial at a safe token boundary when the decoder revises it."""
-
-        boundaries = " \t\r\n,，。.!！？?；;、:：)]}》」』\"'"
-        for index in range(len(text) - 1, -1, -1):
-            if text[index] in boundaries:
-                return text[: index + 1].rstrip()
-        # CJK decoders do not necessarily emit spaces. Keep a common prefix
-        # there rather than dropping every partial until punctuation arrives.
-        return text
-
-    def _stable_partial_text(self, revision: int, text: str) -> str | None:
-        raw_text = text
-        text = text.strip()
-        if not text:
-            return None
-        previous_raw = self._partial_raw_by_revision.get(revision)
-        previous_stable = self._partial_stable_by_revision.get(revision, "")
-        if previous_raw is None:
-            # There is no earlier hypothesis to compare with yet. Preserve
-            # the first partial; subsequent revisions will make it stable.
-            candidate = text
-        else:
-            common_length = 0
-            for left, right in zip(previous_raw, raw_text):
-                if left != right:
-                    break
-                common_length += 1
-            common_prefix = raw_text[:common_length]
-            boundaries = " \t\r\n,，。.!！？?；;、:：)]}》」』\"'"
-            if common_length < len(raw_text) and raw_text[common_length] in boundaries:
-                candidate = common_prefix.rstrip()
-            else:
-                candidate = self._trim_partial_boundary(common_prefix)
-        self._partial_raw_by_revision[revision] = raw_text
-        if len(candidate) < len(previous_stable):
-            candidate = previous_stable
-        if not candidate or candidate == previous_stable:
-            return None
-        self._partial_stable_by_revision[revision] = candidate
-        return candidate
-
-    def _clear_partial_revision(self, revision: int) -> None:
-        self._partial_raw_by_revision.pop(revision, None)
-        self._partial_stable_by_revision.pop(revision, None)
-
-    def _remember_item(self, item: Utterance, *, replace: bool = False) -> None:
-        key = item.segment_id or f"legacy:{item.id}"
-        if not item.segment_id:
-            item.segment_id = key
-        self._latest_by_segment[key] = item
-        if replace:
-            updated = deque(
-                (item if (current.segment_id or f"legacy:{current.id}") == key else current)
-                for current in self.recent
-            )
-            self.recent = deque(updated, maxlen=500)
-        else:
-            self.recent.append(item)
-
-    async def _append_live_item(self, item: Utterance) -> None:
-        if not item.segment_id:
-            item.segment_id = f"{self.id}:{item.segment_revision}:{self.utterance_count + 1}"
-        if item.revision < 1:
-            item.revision = 1
-        item.id = self.utterance_count + 1
-        append_utterance(self.transcript_path, item)
-        self.utterance_count += 1
-        self._remember_item(item)
-        self.current_language = item.language
-        self.previous_language = item.language
-        self.recent_text = (self.recent_text + " " + item.text)[-128:]
-        await self.broadcast("utterance", utterance=item.to_dict())
-        self._schedule_translation(item)
-
-    def _schedule_translation(self, item: Utterance) -> None:
-        if item.translation_status not in {"pending", "failed"}:
-            return
-        if not callable(getattr(self.runtime, "translate_text", None)) and not callable(
-            getattr(self.runtime, "translate_text_batch", None)
-        ):
-            return
-        if self.translation_worker_task is None or self.translation_worker_task.done():
-            self.translation_worker_task = asyncio.create_task(
-                self._translation_worker(), name=f"translation-{self.id}"
-            )
-        entry = (
-            item.segment_id,
-            item.revision,
-            item.text,
-            item.language,
-            time.monotonic(),
-        )
         try:
-            self.translation_queue.put_nowait(entry)
-        except asyncio.QueueFull:
-            task = asyncio.create_task(
-                self.translation_queue.put(entry),
-                name=f"translation-enqueue-{self.id}-{item.segment_revision}",
-            )
-            self.translation_tasks.add(task)
-            task.add_done_callback(self.translation_tasks.discard)
+            import numpy as np
 
-    @staticmethod
-    def _translation_result_parts(result: Any, fallback_text: str) -> tuple[str, str]:
-        if isinstance(result, dict):
-            text = result.get("text", result.get("translation_zh", fallback_text))
-            status = result.get("status", result.get("translation_status", "ready"))
-            return str(text if text is not None else fallback_text), str(status)
-        translated = getattr(result, "text", None)
-        status = getattr(result, "status", "ready")
-        if translated is None and isinstance(result, tuple):
-            translated = result[0] if result else fallback_text
-            status = result[1] if len(result) > 1 else "ready"
-        return str(translated if translated is not None else fallback_text), str(status)
-
-    async def _apply_translation_result(
-        self,
-        segment_id: str,
-        revision: int,
-        source_text: str,
-        result: Any,
-    ) -> None:
-        current = self._latest_by_segment.get(segment_id)
-        if current is None or current.revision != revision:
-            return
-        translated, status = self._translation_result_parts(result, source_text)
-        current.translation_zh = translated
-        current.translation_status = status  # type: ignore[assignment]
-        append_utterance(self.transcript_path, current)
-        await self.broadcast(
-            "translation_update",
-            segment_id=segment_id,
-            revision=revision,
-            translation_zh=current.translation_zh,
-            translation_status=current.translation_status,
-        )
-
-    async def _translation_worker(self) -> None:
-        """Collect at most eight items for 50 ms and translate by source language."""
-
-        while True:
-            first = await self.translation_queue.get()
-            if first is None:
-                self.translation_queue.task_done()
-                return
-            batch = [first]
-            deadline = asyncio.get_running_loop().time() + 0.05
-            while len(batch) < 8:
-                timeout = deadline - asyncio.get_running_loop().time()
-                if timeout <= 0:
-                    break
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+            self.audio_level = min(1.0, float(np.sqrt(np.mean(samples * samples))) / 32768.0 * 3.0) if len(samples) else 0.0
+        except Exception:
+            self.audio_level = 0.0
+        if self.audio_writer:
+            await asyncio.to_thread(self.audio_writer.write, pcm)
+        if self.segmenter:
+            for event in self.segmenter.feed(pcm):
                 try:
-                    item = await asyncio.wait_for(self.translation_queue.get(), timeout)
-                except asyncio.TimeoutError:
-                    break
-                if item is None:
-                    # The stop path only queues the sentinel after join(), but
-                    # keep this branch safe for cancellation/retry callers.
-                    self.translation_queue.task_done()
-                    break
-                batch.append(item)
-            try:
-                grouped: dict[
-                    str, list[tuple[int, tuple[str, int, str, str, float]]]
-                ] = {}
-                for index, item in enumerate(batch):
-                    grouped.setdefault(item[3], []).append((index, item))
-                results: list[Any] = [None] * len(batch)
-                translate_batch = getattr(self.runtime, "translate_text_batch", None)
-                for language, group in grouped.items():
-                    texts = [item[2] for _, item in group]
-                    if callable(translate_batch):
-                        group_results = await self.coordinator.run(
-                            "translation", translate_batch, texts, language
-                        )
-                    else:
-                        group_results = await asyncio.gather(
-                            *(
-                                self.coordinator.run(
-                                    "translation",
-                                    self.runtime.translate_text,
-                                    item[2],
-                                    language,
-                                )
-                                for _, item in group
-                            ),
-                            return_exceptions=True,
-                        )
-                    if not isinstance(group_results, list):
-                        group_results = list(group_results)
-                    if len(group_results) != len(group):
-                        raise RuntimeError("翻译后端返回的微批结果数量不一致")
-                    for (index, _item), result in zip(group, group_results):
-                        results[index] = result
-                for item, result in zip(batch, results):
-                    if isinstance(result, BaseException):
-                        raise result
-                    await self._apply_translation_result(
-                        item[0], item[1], item[2], result
-                    )
-                    self.translation_latencies_ms.append(
-                        max(0.0, time.monotonic() - item[4]) * 1000
-                    )
-            except Exception as exc:  # noqa: BLE001 - preserve source transcript
-                for item in batch:
-                    current = self._latest_by_segment.get(item[0])
-                    if current is None or current.revision != item[1]:
-                        continue
-                    current.translation_status = "failed"
-                    current.translation_zh = item[2]
-                    append_utterance(self.transcript_path, current)
-                    await self.broadcast(
-                        "translation_update",
-                        segment_id=item[0],
-                        revision=item[1],
-                        translation_zh=item[2],
-                        translation_status="failed",
-                    )
-                await self.broadcast(
-                    "warning", code="translation_failed", message=f"中文翻译失败：{exc}"
-                )
-            finally:
-                for _ in batch:
-                    self.translation_queue.task_done()
+                    self.queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    self.error = "实时推理队列已满，已丢弃一个语音片段"
+                    await self.broadcast("warning", message=self.error)
+        if self.audio_packets_received % 10 == 0:
+            await self.broadcast("audio_input", packets_received=self.audio_packets_received, audio_level=self.audio_level)
 
-    async def _translate_item(
-        self,
-        segment_id: str,
-        revision: int,
-        text: str,
-        language: str,
-    ) -> None:
-        try:
-            result = await self.coordinator.run(
-                "translation", self.runtime.translate_text, text, language
-            )
-            current = self._latest_by_segment.get(segment_id)
-            if current is None or current.revision != revision:
-                return
-            await self._apply_translation_result(segment_id, revision, text, result)
-        except Exception as exc:  # noqa: BLE001 - source transcript remains usable
-            current = self._latest_by_segment.get(segment_id)
-            if current is not None and current.revision == revision:
-                current.translation_status = "failed"
-                append_utterance(self.transcript_path, current)
-                await self.broadcast(
-                    "translation_update",
-                    segment_id=segment_id,
-                    revision=revision,
-                    translation_zh=current.text,
-                    translation_status="failed",
-                )
-            await self.broadcast(
-                "warning", code="translation_failed", message=f"中文翻译失败：{exc}"
-            )
-
-    def _replace_refined_item(self, item: Utterance, existing: Utterance) -> None:
-        item.id = existing.id
-        item.segment_id = existing.segment_id or f"{self.id}:{existing.segment_revision}:{existing.id}"
-        item.revision = max(existing.revision + 1, item.revision)
-        if item.translation_zh:
-            item.translation_status = item.translation_status or "ready"
-        else:
-            item.translation_zh = ""
-            item.translation_status = "pending"
-        self._latest_by_segment[item.segment_id] = item
-        self.recent = deque(
-            (
-                item
-                if (current.segment_id or f"legacy:{current.id}") == item.segment_id
-                else current
-                for current in self.recent
-            ),
-            maxlen=500,
-        )
-        append_utterance(self.transcript_path, item)
-
-    async def _inference_worker(self) -> None:
+    async def _worker(self) -> None:
         while True:
             event = await self.queue.get()
             try:
                 if event is None:
                     return
                 if event.kind == "partial":
-                    await self.status("transcribing", "正在生成临时字幕")
-                    result = await self.coordinator.run(
-                        "fast",
-                        self._invoke_runtime,
-                        self.runtime.transcribe_partial,
-                        event,
-                        self.recent_text,
-                        self.hotwords,
-                        language_hint=self.previous_language,
-                    )
-                    self.partial_latencies_ms.append(
-                        max(0.0, time.monotonic() - (self.started_monotonic + event.end))
-                        * 1000
-                    )
-                    stable_text = (
-                        self._stable_partial_text(result.revision, result.text)
-                        if result
-                        else None
-                    )
-                    if (
-                        result
-                        and stable_text
-                        and result.revision > self.last_final_revision
-                        and self.state == "recording"
-                    ):
-                        await self.broadcast(
-                            "partial",
-                            revision=result.revision,
-                            start=result.start,
-                            end=result.end,
-                            text=stable_text,
-                            language=result.language,
-                        )
-                    continue
-                await self.status("transcribing", "正在转写稳定片段")
-                items = await self._handle_final_event(event)
-                self.stable_latencies_ms.append(
-                    max(0.0, time.monotonic() - (self.started_monotonic + event.end))
-                    * 1000
-                )
-                self.last_final_revision = max(self.last_final_revision, event.revision)
-                self._clear_partial_revision(event.revision)
-                await self.broadcast("partial_clear", revision=event.revision)
-                for item in items:
-                    previous = self.recent[-1] if self.recent else None
-                    if (
-                        previous
-                        and item.start <= previous.end + 0.6
-                        and is_boundary_duplicate(previous.text, item.text)
-                    ):
-                        continue
-                    await self.status("translating", "已识别语言，正在生成中文翻译")
-                    await self._append_live_item(item)
-                if self.state == "recording":
-                    await self.status("listening", "正在监听语音")
+                    await self._handle_partial(event)
+                else:
+                    await self._handle_final(event)
             except Exception as exc:
-                await self._record_processing_error(
-                    "inference_failed", f"语音片段处理失败：{exc}"
-                )
+                self.error = str(exc)
+                await self.broadcast("error", code="transcription_failed", message=self.error, retryable=True)
             finally:
                 self.queue.task_done()
 
-    async def _handle_final_event(self, event: SegmentEvent) -> list[Utterance]:
-        if not self.settings.refinement_enabled:
-            return await self.coordinator.run(
-                "fast",
-                self._invoke_runtime,
-                self.runtime.transcribe_final,
-                event,
-                next_id=self.utterance_count + 1,
-                previous_language=self.previous_language,
-                recent_text=self.recent_text,
-                hotwords=self.hotwords,
-                speaker_clusterer=self.speaker_clusterer,
-                refined=False,
-                language_hint=self.previous_language,
-            )
+    async def _handle_partial(self, event: SegmentEvent) -> None:
+        result: PartialResult = await asyncio.to_thread(self.runtime.transcribe_partial, event, "", self.hotwords)
+        if result.text:
+            await self.broadcast("draft", revision=event.revision, start=event.start, end=event.end, text=result.text, language=result.language, confidence=result.confidence)
 
-        draft = await self.coordinator.run(
-            "fast",
-            self._invoke_runtime,
-            self.runtime.transcribe_draft,
+    async def _handle_final(self, event: SegmentEvent) -> None:
+        items: list[Utterance] = await asyncio.to_thread(
+            self.runtime.transcribe_final,
             event,
-            self.recent_text,
-            self.hotwords,
-            language_hint=self.previous_language,
+            next_id=self.next_utterance_id,
+            previous_language=self.current_language,
+            recent_text=self.recent[-1].text if self.recent else "",
+            hotwords=self.hotwords,
+            speaker_clusterer=getattr(self, "speaker_clusterer", None),
+            refined=False,
         )
-        if draft:
-            await self.broadcast(
-                "draft",
-                revision=event.revision,
-                start=event.start,
-                end=event.end,
-                text=draft.text,
-                language=draft.language,
-                refinement_status="queued",
-            )
-            draft_item = Utterance(
-                id=self.utterance_count + 1,
-                start=round(draft.start, 3),
-                end=round(draft.end, 3),
-                speaker_id=0,
-                language=draft.language or self.previous_language or "unknown",
-                language_confidence=round(draft.confidence, 4),
-                text=draft.text,
-                translation_zh="",
-                segment_revision=event.revision,
-                recognition_stage="fast",
-                translation_status="pending",
-                segment_id=f"{self.id}:{event.revision}:0",
-                revision=1,
-            )
-            if callable(getattr(self.runtime, "translate_text", None)):
-                await self._append_live_item(draft_item)
-        job = self.job_store.enqueue(
-            session_id=self.id,
-            output_dir=self.output_dir,
-            event=event,
-            draft_text=draft.text if draft else "",
-            draft_language=draft.language if draft else None,
-        )
-        self.refinement_enqueued_at.setdefault(event.revision, time.monotonic())
-        if job.status != "done":
-            await self.refine_queue.put(job)
-        await self._broadcast_refinement_status()
-        return []
-
-    async def _commit_refined_items(self, items: list[Utterance]) -> None:
-        for index, item in enumerate(items):
-            existing = next(
-                (
-                    candidate
-                    for candidate in self.recent
-                    if candidate.segment_revision == item.segment_revision
-                    and candidate.recognition_stage == "fast"
-                ),
-                None,
-            )
-            previous = self.recent[-1] if self.recent else None
-            if (
-                existing is None
-                and previous
-                and item.start <= previous.end + 0.6
-                and is_boundary_duplicate(previous.text, item.text)
-            ):
-                continue
-            if existing is not None:
-                self._replace_refined_item(item, existing)
-                await self.broadcast("utterance_update", utterance=item.to_dict())
-                self._schedule_translation(item)
-            else:
-                if not item.segment_id:
-                    item.segment_id = f"{self.id}:{item.segment_revision}:{index}"
-                await self._append_live_item(item)
+        self._segment_first_ids[event.revision] = items[0].id if items else self.next_utterance_id
+        for item in items:
+            item.source_segment_id = item.source_segment_id or str(event.revision)
+            self.next_utterance_id = max(self.next_utterance_id, item.id + 1)
             self.current_language = item.language
-            self.previous_language = item.language
-            self.recent_text = (self.recent_text + " " + item.text)[-128:]
+            self.utterance_count += 1
+            self.recent.append(item)
+            append_utterance(self.transcript_path, item)
+            await self.broadcast("utterance", utterance=item.to_dict())
+            if item.language != "zh" and item.text:
+                task = asyncio.create_task(self._translate_item(item), name=f"translate-{self.id}-{item.id}")
+                self.translation_tasks.add(task)
+                task.add_done_callback(self.translation_tasks.discard)
+        if self.settings.enable_refinement:
+            try:
+                self.refinement_queue.put_nowait(event)
+                self._refinement_events[event.revision] = event
+            except asyncio.QueueFull:
+                self.refinement_dropped += 1
+                await self.broadcast("warning", message="精修队列已满，本片段保留实时识别结果")
 
-    async def _broadcast_refinement_status(self) -> None:
-        counts = self.job_store.counts(self.id)
-        ages = [
-            max(0.0, time.monotonic() - created)
-            for created in self.refinement_enqueued_at.values()
-        ]
-        await self.broadcast(
-            "refinement_status",
-            pending=counts["queued"] + counts["running"],
-            failed=counts["failed"],
-            oldest_age_seconds=round(max(ages, default=0.0), 3),
-            state=self.state,
-        )
+    async def _translate_item(self, item: Utterance) -> None:
+        try:
+            latest = next((existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id), item)
+            result = await asyncio.to_thread(self.runtime.translate_text, latest.text, latest.language)
+            latest.translation_zh = result.text if result.status in {"ready", "not_needed"} else ""
+            latest.translation_status = result.status
+            latest.translation_model = getattr(result, "model", None)
+            latest.revision = max(latest.revision, 2)
+            append_utterance(self.transcript_path, latest)
+            for index, existing in enumerate(self.recent):
+                if existing.segment_id == latest.segment_id:
+                    self.recent[index] = latest
+                    break
+            await self.broadcast("translation_update", segment_id=latest.segment_id, revision=latest.revision, translation_zh=latest.translation_zh, translation_status=latest.translation_status, translation_model=latest.translation_model)
+        except Exception as exc:
+            await self.broadcast("warning", message=f"翻译失败：{exc}")
 
     async def _refinement_worker(self) -> None:
         while True:
-            job = await self.refine_queue.get()
+            event = await self.refinement_queue.get()
             try:
-                if job is None:
+                if event is None:
                     return
-                self.job_store.mark_running(job)
-                job.attempts += 1
-                await self._broadcast_refinement_status()
-                event = job.event()
-                items = await self.coordinator.run(
-                    "refine",
-                    self._invoke_runtime,
+                first_id = self._segment_first_ids.get(event.revision, self.next_utterance_id)
+                refined_items = await asyncio.to_thread(
                     self.runtime.transcribe_final,
                     event,
-                    next_id=self.utterance_count + 1,
-                    previous_language=self.previous_language,
-                    recent_text=self.recent_text,
+                    next_id=first_id,
+                    previous_language=self.current_language,
+                    recent_text=self.recent[-1].text if self.recent else "",
                     hotwords=self.hotwords,
-                    speaker_clusterer=self.speaker_clusterer,
+                    speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
-                    language_hint=job.draft_language or self.previous_language,
                 )
-                await self._commit_refined_items(items)
-                self.job_store.mark_done(job)
-                self.refinement_enqueued_at.pop(job.revision, None)
+                await self._commit_refined_items(refined_items)
             except Exception as exc:
-                if job is not None and job.attempts < self.settings.refinement_max_attempts:
-                    self.job_store.requeue(job, str(exc))
-                    await asyncio.sleep(min(4.0, float(2 ** max(0, job.attempts - 1))))
-                    await self.refine_queue.put(job)
-                elif job is not None:
-                    self.job_store.mark_failed(job, str(exc))
-                    self.refinement_enqueued_at.pop(job.revision, None)
-                    self.processing_error = f"精修片段 {job.revision} 失败：{exc}"
-                    self._write_state()
-                    await self.broadcast(
-                        "error",
-                        code="refinement_failed",
-                        message=self.processing_error,
-                        retryable=True,
-                        state=self.state,
-                    )
+                self._refinement_errors.append(str(exc))
+                await self.broadcast("warning", message=f"停止后精修失败，已保留实时结果：{exc}")
             finally:
-                await self._broadcast_refinement_status()
-                self.refine_queue.task_done()
+                self.refinement_queue.task_done()
+
+    async def _commit_refined_items(self, items: list[Utterance]) -> None:
+        if not items:
+            return
+        source_segment_id = items[0].source_segment_id or items[0].segment_id.split(":", 1)[0]
+        previous_items = [
+            existing for existing in load_utterances(self.transcript_path)
+            if (existing.source_segment_id or existing.segment_id.split(":", 1)[0]) == source_segment_id
+        ]
+        previous_by_segment = {existing.segment_id: existing for existing in previous_items}
+        previous_items.sort(key=lambda item: (item.start, item.end, item.id))
+        replacement_ids: set[int] = set()
+        for index, item in enumerate(items):
+            item.source_segment_id = source_segment_id
+            previous = previous_by_segment.get(item.segment_id)
+            if previous is None and index < len(previous_items):
+                previous = previous_items[index]
+            if previous is None:
+                previous = next((existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id), None)
+            if previous:
+                item.id = previous.id
+                replacement_ids.add(previous.id)
+            item.revision = max(2, item.revision)
+            item.recognition_stage = "refined"
+            item.translation_zh = ""
+            item.translation_status = "not_needed" if item.language == "zh" else "pending"
+            append_utterance(self.transcript_path, item)
+            replaced = False
+            for index, existing in enumerate(self.recent):
+                if existing.segment_id == item.segment_id:
+                    self.recent[index] = item
+                    replaced = True
+                    break
+            if not replaced:
+                self.recent.append(item)
+                self.utterance_count += 1
+            await self.broadcast("utterance", utterance=item.to_dict())
+            if item.language != "zh" and item.text:
+                task = asyncio.create_task(self._translate_item(item), name=f"refine-translate-{self.id}-{item.id}")
+                self.translation_tasks.add(task)
+                task.add_done_callback(self.translation_tasks.discard)
+        for previous in previous_items:
+            if previous.id not in replacement_ids:
+                delete_utterance(self.transcript_path, previous)
+                self.recent = deque((item for item in self.recent if item.id != previous.id), maxlen=500)
+                self.utterance_count = max(0, self.utterance_count - 1)
+                await self.broadcast(
+                    "utterance_deleted",
+                    segment_id=previous.segment_id,
+                    utterance_id=previous.id,
+                    revision=max(previous.revision + 1, 2),
+                )
 
     async def request_stop(self, reason: str = "user") -> None:
-        if self.stop_task and not self.stop_task.done():
-            return
-        self.stop_task = asyncio.create_task(self.stop(reason), name=f"stop-{self.id}")
+        if self.stop_task is None:
+            self.stop_task = asyncio.create_task(self._finalize(reason), name=f"finalize-{self.id}")
+        await asyncio.sleep(0)
 
-    async def stop(self, reason: str = "user") -> None:
-        async with self.stop_lock:
-            if self.state not in {"recording", "starting", "error"}:
-                return
-            self.state = "finalizing"
-            self._write_state()
-            try:
-                await self.status("finalizing", "正在处理最后一段语音", reason=reason)
-                disk_task = self.disk_task
-                self.disk_task = None
-                if disk_task:
-                    disk_task.cancel()
-                    with suppress(asyncio.CancelledError, Exception):
-                        await disk_task
-                worker_task = self.worker_task
-                if worker_task and not worker_task.done():
-                    if self.segmenter:
-                        for event in self.segmenter.flush():
-                            await self.queue.put(event)
-                    await self.queue.join()
-                    await self.queue.put(None)
-                    await worker_task
-                elif worker_task:
-                    # A failed/cancelled worker cannot consume a stale sentinel
-                    # on a later stop retry. Preserve completed transcript data
-                    # and reset the queue bookkeeping before continuing export.
-                    self.queue = asyncio.Queue(maxsize=self.settings.inference_queue_size)
-                self.worker_task = None
-                refine_counts = self.job_store.counts(self.id)
-                if refine_counts["queued"] + refine_counts["running"]:
-                    self.state = "refining"
-                    self._write_state()
-                    await self.status(
-                        "refining",
-                        "录音已保存，正在后台生成高精度逐句稿",
-                        pending=refine_counts["queued"] + refine_counts["running"],
-                    )
-                refine_worker = self.refine_worker_task
-                if refine_worker and not refine_worker.done():
-                    await self.refine_queue.join()
-                    await self.refine_queue.put(None)
-                    await refine_worker
-                self.refine_worker_task = None
-                if self.translation_tasks:
-                    await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
-                    self.translation_tasks.clear()
-                translation_worker = self.translation_worker_task
-                if translation_worker and not translation_worker.done():
-                    await self.translation_queue.join()
-                    await self.translation_queue.put(None)
-                    await translation_worker
-                self.translation_worker_task = None
-                await self.status("saving", "正在保存录音和完整逐句稿")
-                if self.audio_writer:
-                    self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
-                    self.audio_writer = None
-                self.ended_at = utc_now_iso()
-                utterances = load_utterances(self.transcript_path)
-                self.files = export_live_result(
-                    self.output_dir,
-                    session_id=self.id,
-                    started_at=self.started_at,
-                    ended_at=self.ended_at,
-                    duration_seconds=self.elapsed_seconds,
-                    utterances=utterances,
-                    audio_segments=self.audio_segments,
-                    status="summary_pending",
-                    processing_error=self.processing_error,
-                )
-                failed_refinements = self.job_store.counts(self.id)["failed"]
-                if failed_refinements:
-                    self.state = "refinement_error"
-                    self.error = f"有 {failed_refinements} 个语音片段精修失败，可重试"
-                    self._write_state()
-                    await self.broadcast(
-                        "error",
-                        code="refinement_incomplete",
-                        message=self.error,
-                        retryable=True,
-                        state=self.state,
-                        files=self.files,
-                    )
-                    return
-                if not utterances:
-                    self.summary = "本次会议未检测到有效发言，无法生成会议纪要。"
-                    (self.output_dir / "meeting_minutes.md").write_text(
-                        self.summary + "\n", encoding="utf-8"
-                    )
-                    self.state = "complete"
-                    self.files.append("meeting_minutes.md")
-                    self._finish_export(utterances)
-                    await self.broadcast(
-                        "summary_complete", content=self.summary, files=self.files
-                    )
-                    return
-                # Stopping a meeting only finalizes and exports the recording. AI
-                # summarization is deliberately a separate user action so a user
-                # can review the transcript before sending it to the configured
-                # service.
-                self.state = "summary_pending"
-                self.summary = ""
-                self._write_state()
-                await self.status("summary_pending", "会议已保存，可手动生成会议纪要")
+    async def _postprocess_update(
+        self,
+        stage: str | None = None,
+        state: str | None = None,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        if stage and state:
+            self.postprocess.update(stage, state, current=current, total=total, error=error)
+        self._write_state()
+        await self.broadcast("postprocess_update", meeting=self.snapshot())
+
+    def _set_postprocess_queue(self, has_items: bool) -> None:
+        enabled = has_items and self.settings.enable_postprocess
+        self.postprocess = PostprocessTracker({
+            "state": "queued" if enabled else "partial",
+            "current_stage": "asr_refine" if enabled else None,
+            "stages": {
+                "asr_refine": {"state": "queued" if enabled and self.settings.enable_refinement else "complete"},
+                "diarization": {"state": "queued" if enabled else "complete"},
+                "translation": {"state": "queued" if has_items else "complete"},
+                "summary": {"state": "queued" if has_items else "error"},
+                "todo": {"state": "queued" if has_items else "idle"},
+            },
+        })
+
+    def _export_current_files(self) -> None:
+        items = load_utterances(self.transcript_path)
+        snapshot = getattr(self.runtime, "capability_snapshot", None)
+        if snapshot:
+            with suppress(Exception):
+                self.model_metadata = snapshot()
+        self.files = export_live_result(
+            self.output_dir,
+            meeting_id=self.id,
+            title=self.title,
+            started_at=self.started_at,
+            ended_at=self.ended_at or utc_now_iso(),
+            duration_seconds=self.audio_samples_received / self.audio_sample_rate,
+            utterances=items,
+            audio_segments=self.audio_segments,
+            recording_state=self.recording_state,
+            summary_state=self.summary_state,
+            todo_state=self.todo_state,
+            summary_error=self.summary_error,
+            todo_error=self.todo_error,
+            postprocess=self.postprocess.to_dict(),
+            model_metadata=self.model_metadata,
+        )
+
+    async def _warm_realtime_after_postprocess(self) -> None:
+        warm_realtime = getattr(self.runtime, "warm_realtime", None)
+        if warm_realtime:
+            with suppress(Exception):
+                await asyncio.to_thread(warm_realtime)
+
+    async def _run_final_translation(self) -> bool:
+        items = load_utterances(self.transcript_path)
+        groups: dict[str, list[Utterance]] = {}
+        for item in items:
+            if item.language != "zh" and item.text:
+                groups.setdefault(item.language, []).append(item)
+        total = sum(len(group) for group in groups.values())
+        await self._postprocess_update("translation", "running", current=0, total=total)
+        completed = 0
+        failures: list[str] = []
+        for language, group in groups.items():
+            if hasattr(self.runtime, "translate_text_batch"):
+                results = await asyncio.to_thread(self.runtime.translate_text_batch, [item.text for item in group], language)
+            else:
+                results = [await asyncio.to_thread(self.runtime.translate_text, item.text, language) for item in group]
+            for item, result in zip(group, results):
+                item.translation_zh = result.text if result.status in {"ready", "not_needed"} else ""
+                item.translation_status = result.status
+                item.translation_model = getattr(result, "model", None)
+                if result.status in {"failed", "unsupported"}:
+                    failures.append(f"{item.language}:{getattr(result, 'error', None) or result.status}")
+                item.revision = max(item.revision, 2)
+                append_utterance(self.transcript_path, item)
+                completed += 1
                 await self.broadcast(
-                    "summary_pending",
-                    session_id=self.id,
-                    files=self.files,
-                    utterance_count=len(utterances),
-                    error=self.processing_error,
+                    "translation_update",
+                    segment_id=item.segment_id,
+                    revision=item.revision,
+                    translation_zh=item.translation_zh,
+                    translation_status=item.translation_status,
+                    translation_model=item.translation_model,
                 )
-            except Exception as exc:
-                self.state = "error"
-                self.error = f"会议保存失败：{exc}"
-                try:
-                    self._write_state()
-                finally:
-                    await self.broadcast(
-                        "error",
-                        code="stop_failed",
-                        message=self.error,
-                        retryable=False,
-                        state=self.state,
-                    )
+            await self._postprocess_update("translation", "running", current=completed, total=total)
+        if failures:
+            message = "; ".join(failures[:3])
+            self.postprocess.fail("translation", message)
+            self._write_state()
+            await self._postprocess_update()
+            return False
+        await self._postprocess_update("translation", "complete", current=completed, total=total)
+        return True
+
+    async def _run_diarization(self) -> None:
+        if not hasattr(self.runtime, "diarize_audio"):
+            await self._postprocess_update("diarization", "complete", current=0, total=0)
+            return
+        paths = [
+            self.output_dir / "audio" / str(segment.get("file"))
+            for segment in self.audio_segments
+            if isinstance(segment, dict) and segment.get("file")
+        ]
+        paths = [path for path in paths if path.is_file()]
+        if not paths:
+            await self._postprocess_update("diarization", "complete", current=0, total=0)
+            return
+        await self._postprocess_update("diarization", "running", current=0, total=len(paths))
+        # ``LiveModelRuntime.diarize_audio`` owns the shared GPU lock.  Keeping
+        # the lock at the runtime boundary also makes fake/test runtimes and
+        # future schedulers safe from accidental double-acquisition.
+        segments = await asyncio.to_thread(self.runtime.diarize_audio, paths)
+        write_segments(self.output_dir / "speaker_segments.json", segments)
+        items = align_speakers(load_utterances(self.transcript_path), segments)
+        for item in items:
+            append_utterance(self.transcript_path, item)
+            for index, existing in enumerate(self.recent):
+                if existing.segment_id == item.segment_id:
+                    self.recent[index] = item
+                    break
+            await self.broadcast("utterance", utterance=item.to_dict())
+        await self._postprocess_update("diarization", "complete", current=len(paths), total=len(paths))
+
+    async def run_postprocess(self) -> None:
+        self.postprocess.start()
+        await self._postprocess_update()
+        try:
+            if self.translation_tasks:
+                await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
+            release_realtime = getattr(self.runtime, "release_realtime_model", None)
+            if release_realtime:
+                await asyncio.to_thread(release_realtime)
+            refine_stage = self.postprocess.stages.get("asr_refine", {})
+            events_total = self.refinement_queue.qsize()
+            self._refinement_errors = []
+            if (
+                self.settings.enable_refinement
+                and refine_stage.get("state") != "complete"
+                and events_total == 0
+                and self._refinement_events
+            ):
+                for event in self._refinement_events.values():
+                    with suppress(asyncio.QueueFull):
+                        self.refinement_queue.put_nowait(event)
+                events_total = self.refinement_queue.qsize()
+            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and events_total:
+                await self._postprocess_update("asr_refine", "running", current=0, total=events_total)
+                self.refinement_worker_task = asyncio.create_task(self._refinement_worker(), name=f"refinement-{self.id}")
+                await self.refinement_queue.join()
+                await self.refinement_queue.put(None)
+                await self.refinement_worker_task
+                self.refinement_worker_task = None
+                if self._refinement_errors:
+                    message = "; ".join(self._refinement_errors[:3])
+                    self.postprocess.fail("asr_refine", message)
+                    self._export_current_files()
+                    await self._postprocess_update()
+                    await self._warm_realtime_after_postprocess()
+                    return
+                await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
+            elif refine_stage.get("state") != "complete":
+                await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
+            self._export_current_files()
+            if self.postprocess.stages.get("diarization", {}).get("state") != "complete":
+                await self._run_diarization()
+            self._export_current_files()
+            release_postprocess = getattr(self.runtime, "release_postprocess_models", None)
+            if release_postprocess:
+                await asyncio.to_thread(release_postprocess)
+            translation_ok = True
+            if self.postprocess.stages.get("translation", {}).get("state") != "complete":
+                translation_ok = await self._run_final_translation()
+            self._export_current_files()
+            if not translation_ok:
+                self.summary_state = "queued"
+                self.todo_state = "waiting_summary"
+                self._write_state()
+                await self._warm_realtime_after_postprocess()
+                return
+            if not load_utterances(self.transcript_path):
+                self.postprocess.fail("summary", "meeting has no usable transcript")
+                self.summary_state = "error"
+                self.summary_error = "会议没有可总结的有效发言"
+                await self._postprocess_update()
+                return
+            if self.summary_state != "complete":
+                self.summary_state = "queued"
+                await self._postprocess_update("summary", "running")
+                await self.run_summary()
+            if self.todo_state != "complete" and self.todo_task:
+                await self.todo_task
+            elif self.todo_state != "complete" and self.summary_state == "complete":
+                self.todo_state = "queued"
+                await self._postprocess_update("todo", "running")
+                await self.run_todo()
+            if self.todo_state == "complete":
+                if any(stage.get("state") in {"partial", "error"} for stage in self.postprocess.stages.values()):
+                    self.postprocess.state = "partial"
+                else:
+                    self.postprocess.complete()
+            elif self.summary_state == "error" or self.todo_state == "error":
+                self.postprocess.state = "error"
+            self._export_current_files()
+            await self._postprocess_update()
+            await self._warm_realtime_after_postprocess()
+        except Exception as exc:
+            stage = self.postprocess.current_stage or "asr_refine"
+            self.postprocess.fail(stage, str(exc))
+            self._export_current_files()
+            self._write_state()
+            await self.broadcast("error", code="postprocess_failed", stage=stage, message=str(exc), retryable=True)
+            await self.broadcast("postprocess_update", meeting=self.snapshot())
+            await self._warm_realtime_after_postprocess()
+
+    async def request_postprocess(self) -> bool:
+        if self.recording_state != "complete":
+            return False
+        if self.postprocess_task and not self.postprocess_task.done():
+            return True
+        if self.postprocess.state not in {"error", "partial", "queued"}:
+            return False
+        self.postprocess = PostprocessTracker({
+            "state": "queued",
+            "current_stage": "diarization" if not self.refinement_queue.qsize() else "asr_refine",
+            "stages": self.postprocess.stages,
+        })
+        self.postprocess.error = None
+        metrics = getattr(self.runtime, "metrics", None)
+        if isinstance(metrics, dict):
+            metrics["retry_count"] = int(metrics.get("retry_count", 0)) + 1
+        self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"retry-postprocess-{self.id}")
+        self.summary_task = self.postprocess_task
+        await self._postprocess_update()
+        return True
+
+    async def _finalize_fast(self, reason: str) -> None:
+        if self.recording_state not in {"recording", "starting"}:
+            return
+        self.recording_state = "finalizing"
+        self._write_state()
+        await self.status("正在保存逐句稿", reason=reason)
+        if self.segmenter:
+            for event in self.segmenter.flush():
+                await self.queue.put(event)
+        await self.queue.join()
+        if self.worker_task:
+            await self.queue.put(None)
+            await self.worker_task
+        if self.audio_writer:
+            self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
+        if not self.settings.keep_audio:
+            audio_dir = (self.output_dir / "audio").resolve()
+            audio_dir.relative_to(self.output_dir.resolve())
+            if audio_dir.exists():
+                shutil.rmtree(audio_dir)
+            self.audio_segments = []
+        self.disconnect_stop_task = None
+        self.ended_at = utc_now_iso()
+        self.recording_state = "complete"
+        items = load_utterances(self.transcript_path)
+        self.summary_state = "queued" if items else "error"
+        self.summary_error = None if items else "会议没有可总结的有效发言"
+        self._set_postprocess_queue(bool(items))
+        self.files = export_live_result(
+            self.output_dir,
+            meeting_id=self.id,
+            title=self.title,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
+            duration_seconds=self.audio_samples_received / self.audio_sample_rate,
+            utterances=items,
+            audio_segments=self.audio_segments,
+            recording_state=self.recording_state,
+            summary_state=self.summary_state,
+            todo_state="waiting_summary",
+            postprocess=self.postprocess.to_dict(),
+            model_metadata=self.model_metadata,
+        )
+        self._write_state()
+        await self.status("录音已保存，正在后台处理")
+        await self.broadcast("recording_complete", meeting=self.snapshot())
+        if items:
+            self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"postprocess-{self.id}")
+            self.summary_task = self.postprocess_task
+
+    async def _finalize(self, reason: str) -> None:
+        await self._finalize_fast(reason)
 
     def begin_summary(self) -> bool:
-        """Atomically claim a pending summary before spawning its task."""
-
-        if self.state not in {"summary_pending", "summary_error"}:
+        if self.recording_state != "complete" or self.summary_state not in {"queued", "error", "complete"}:
             return False
-        self.state = "summarizing"
-        self.summary = ""
-        self.error = None
+        self.summary_state = "running"
+        self.summary_error = None
+        self.todo_state = "stale" if self.summary_revision else "waiting_summary"
+        self.todo_error = None
+        self.todo = None
         self._write_state()
         return True
 
-    async def retry_refinement(self) -> None:
-        if self.state != "refinement_error":
-            raise RuntimeError("当前会议没有可重试的精修任务")
-        if self.speaker_clusterer is None and hasattr(
-            self.runtime, "new_speaker_clusterer"
-        ):
-            self.speaker_clusterer = self.runtime.new_speaker_clusterer()
-        retried = self.job_store.retry_failed(self.id)
-        if not retried and not self.job_store.pending(self.id):
-            raise RuntimeError("没有失败的精修任务")
-        self.state = "refining"
-        self.error = None
-        self._write_state()
-        self.refine_worker_task = asyncio.create_task(
-            self._refinement_worker(), name=f"refinement-retry-{self.id}"
-        )
-        for job in self.job_store.pending(self.id):
-            await self.refine_queue.put(job)
-        await self._broadcast_refinement_status()
-        await self.refine_queue.join()
-        await self.refine_queue.put(None)
-        await self.refine_worker_task
-        self.refine_worker_task = None
-        if self.job_store.counts(self.id)["failed"]:
-            self.state = "refinement_error"
-            self.error = "部分语音片段精修仍然失败"
-            self._write_state()
-            await self._broadcast_refinement_status()
+    async def request_summary(self) -> bool:
+        if not self.begin_summary():
+            return False
+        if self.summary_task and not self.summary_task.done():
+            return True
+        self.summary_task = asyncio.create_task(self.run_summary(claimed=True), name=f"summary-{self.id}")
+        return True
+
+    async def run_summary(self, claimed: bool = False) -> None:
+        if not claimed and self.summary_state != "queued":
             return
-        utterances = load_utterances(self.transcript_path)
-        self.files = export_live_result(
-            self.output_dir,
-            session_id=self.id,
-            started_at=self.started_at,
-            ended_at=self.ended_at or utc_now_iso(),
-            duration_seconds=self.elapsed_seconds,
-            utterances=utterances,
-            audio_segments=self.audio_segments,
-            status="summary_pending",
-            processing_error=None,
-        )
-        self.state = "summary_pending"
-        self.processing_error = None
-        self._write_state()
-        await self.broadcast(
-            "summary_pending",
-            session_id=self.id,
-            files=self.files,
-            utterance_count=len(utterances),
-            error=None,
-        )
-
-    async def _run_summary(self, utterances: list[Utterance] | None = None) -> None:
-        await self.status("summarizing", "正在准备积墨 AI 分块")
+        if not claimed:
+            self.begin_summary()
+        await self.status("正在生成会议纪要")
+        self.summary = ""
         try:
-            summarizer = MeetingSummarizer(self.settings)
+            summarizer = self.summarizer_factory(self.settings)
 
-            async def summary_status(kind: str, index: int, total: int) -> None:
-                if kind == "chunk":
-                    await self.status(
-                        "summarizing_chunks",
-                        f"积墨 AI 正在分析第 {index}/{total} 块",
-                        current=index,
-                        total=total,
-                    )
-                else:
-                    await self.status("summarizing_final", "正在生成最终会议纪要")
+            async def on_status(kind: str, index: int, total: int) -> None:
+                await self.broadcast("summary_progress", phase=kind, current=index, total=total)
 
-            async def summary_delta(content: str) -> None:
+            async def on_delta(content: str) -> None:
                 self.summary += content
                 await self.broadcast("summary_delta", content=content)
 
-            async def summary_reset() -> None:
+            async def on_reset() -> None:
                 self.summary = ""
                 await self.broadcast("summary_reset")
 
-            self.summary = await summarizer.summarize(
+            result = await summarizer.summarize(
                 self.transcript_path,
                 self.id,
                 self.started_at,
                 self.ended_at or utc_now_iso(),
-                on_status=summary_status,
-                on_delta=summary_delta,
-                on_reset=summary_reset,
+                on_status=on_status,
+                on_delta=on_delta,
+                on_reset=on_reset,
+                attempt_id=f"{self.id}:{self.summary_revision + 1}:{uuid.uuid4().hex}",
             )
-            (self.output_dir / "meeting_minutes.md").write_text(
-                self.summary.rstrip() + "\n", encoding="utf-8"
-            )
-            self.state = "complete"
-            if "meeting_minutes.md" not in self.files:
-                self.files.append("meeting_minutes.md")
-            final_items = utterances or load_utterances(self.transcript_path)
-            self._finish_export(final_items)
-            await self.status("complete", "会议纪要已生成")
-            await self.broadcast("summary_complete", content=self.summary, files=self.files)
+            self.summary = result.strip()
+            self.summary_revision += 1
+            atomic_write_text(self.output_dir / "meeting_minutes.md", self.summary + "\n")
+            self.summary_state = "complete"
+            self.todo_state = "queued"
+            self.summary_error = None
+            self.postprocess.update("summary", "complete", current=1, total=1)
+            items = load_utterances(self.transcript_path)
+            self.files = export_live_result(self.output_dir, meeting_id=self.id, title=self.title, started_at=self.started_at, ended_at=self.ended_at or utc_now_iso(), duration_seconds=self.audio_samples_received / self.audio_sample_rate, utterances=items, audio_segments=self.audio_segments, recording_state=self.recording_state, summary_state=self.summary_state, todo_state=self.todo_state, postprocess=self.postprocess.to_dict(), model_metadata=self.model_metadata)
+            self._write_state()
+            await self.broadcast("summary_complete", content=self.summary, summary_revision=self.summary_revision, files=self.files)
+            self.todo_task = asyncio.create_task(self.run_todo(), name=f"todo-{self.id}-{self.summary_revision}")
         except Exception as exc:
-            self.state = "summary_error"
-            self.error = str(exc)
-            items = utterances or load_utterances(self.transcript_path)
-            self._finish_export(items, summary_error=self.error)
-            await self.broadcast(
-                "error",
-                code="summary_failed",
-                message=self.error,
-                retryable=True,
-            )
+            self.summary_state = "error"
+            self.summary_error = str(exc)
+            self.postprocess.fail("summary", self.summary_error)
+            self._write_state()
+            await self.broadcast("error", code="summary_failed", message=self.summary_error, retryable=True)
+            await self.broadcast("postprocess_update", meeting=self.snapshot())
 
-    def _finish_export(self, utterances: list[Utterance], summary_error: str | None = None) -> None:
-        self.files = export_live_result(
-            self.output_dir,
-            session_id=self.id,
-            started_at=self.started_at,
-            ended_at=self.ended_at or utc_now_iso(),
-            duration_seconds=self.elapsed_seconds,
-            utterances=utterances,
-            audio_segments=self.audio_segments,
-            status=self.state,
-            summary_error=summary_error,
-            processing_error=self.processing_error,
-        )
-        if (self.output_dir / "meeting_minutes.md").exists():
-            self.files.append("meeting_minutes.md")
+    def begin_todo(self) -> bool:
+        if self.recording_state != "complete" or self.summary_state != "complete" or not self.summary.strip() or self.todo_state not in {"queued", "error", "stale", "complete"}:
+            return False
+        self.todo_state = "running"
+        self.todo_error = None
         self._write_state()
+        return True
 
-    async def retry_summary(self, *, claimed: bool = False) -> None:
-        if not claimed and not self.begin_summary():
-            raise ValueError("当前会议不需要生成纪要")
-        await self._run_summary()
+    async def request_todo(self) -> bool:
+        if not self.begin_todo():
+            return False
+        if self.todo_task and not self.todo_task.done():
+            return True
+        self.todo_task = asyncio.create_task(self.run_todo(claimed=True), name=f"todo-{self.id}-{self.summary_revision}")
+        return True
 
-    async def _disk_monitor(self) -> None:
-        try:
-            while self.state == "recording":
-                free = shutil.disk_usage(self.output_dir).free
-                if self.settings.disk_warn_bytes and free < self.settings.disk_warn_bytes:
-                    await self.broadcast(
-                        "warning",
-                        code="disk_low",
-                        message="可用磁盘空间不足 2GB，请尽快停止会议",
-                        free_bytes=free,
-                    )
-                if self.settings.disk_stop_bytes and free < self.settings.disk_stop_bytes:
-                    await self.broadcast(
-                        "error",
-                        code="disk_critical",
-                        message="磁盘空间不足，系统将自动停止并保存会议",
-                        retryable=False,
-                    )
-                    await self.request_stop("disk_low")
-                    return
-                await asyncio.sleep(60)
-        except asyncio.CancelledError:
+    async def run_todo(self, claimed: bool = False) -> None:
+        if not claimed and self.todo_state != "queued":
             return
-
-    @staticmethod
-    def _percentile(values: deque[float], percentile: float) -> float:
-        if not values:
-            return 0.0
-        ordered = sorted(values)
-        index = min(
-            len(ordered) - 1,
-            max(0, int(round((percentile / 100.0) * (len(ordered) - 1)))),
-        )
-        return round(ordered[index], 3)
-
-    def metrics_snapshot(self) -> dict[str, Any]:
-        refinement_counts = self.job_store.counts(self.id)
-        return {
-            "audio_packets_received": self.audio_packets_received,
-            "audio_packets_dropped": self.audio_packets_dropped,
-            "audio_packets_out_of_order": self.audio_packets_out_of_order,
-            "audio_duration_seconds": round(self.audio_samples_received / 16_000, 3),
-            "vad_speech_ratio": round(
-                self.segmenter.speech_ratio if self.segmenter else 0.0, 4
-            ),
-            "partial_latency_p50_ms": self._percentile(self.partial_latencies_ms, 50),
-            "partial_latency_p95_ms": self._percentile(self.partial_latencies_ms, 95),
-            "stable_latency_p50_ms": self._percentile(self.stable_latencies_ms, 50),
-            "stable_latency_p95_ms": self._percentile(self.stable_latencies_ms, 95),
-            "translation_latency_p50_ms": self._percentile(
-                self.translation_latencies_ms, 50
-            ),
-            "translation_latency_p95_ms": self._percentile(
-                self.translation_latencies_ms, 95
-            ),
-            "realtime_queue_depth": self.queue.qsize(),
-            "refinement_queue_depth": refinement_counts["queued"]
-            + refinement_counts["running"],
-            "refinement_queue_oldest_age_seconds": round(
-                max(
-                    (
-                        max(0.0, time.monotonic() - created)
-                        for created in self.refinement_enqueued_at.values()
-                    ),
-                    default=0.0,
-                ),
-                3,
-            ),
-            "translation_queue_depth": self.translation_queue.qsize(),
-        }
-
-    def snapshot(self) -> MeetingSnapshot:
-        refinement_counts = self.job_store.counts(self.id)
-        return MeetingSnapshot(
-            id=self.id,
-            state=self.state,
-            started_at=self.started_at,
-            elapsed_seconds=round(self.elapsed_seconds, 3),
-            current_language=self.current_language,
-            utterance_count=self.utterance_count,
-            recent_utterances=[item.to_dict() for item in self.recent],
-            summary=self.summary,
-            error=self.error or self.processing_error,
-            files=self.files,
-            audio_bytes_received=self.audio_bytes_received,
-            audio_packets_received=self.audio_packets_received,
-            audio_packets_dropped=self.audio_packets_dropped,
-            audio_packets_out_of_order=self.audio_packets_out_of_order,
-            audio_samples_received=self.audio_samples_received,
-            audio_level=round(self.audio_level, 5),
-            pending_refinements=refinement_counts["queued"] + refinement_counts["running"],
-            failed_refinements=refinement_counts["failed"],
-            owner_id=self.owner_id,
-            metrics=self.metrics_snapshot(),
-        )
+        if not claimed:
+            self.begin_todo()
+        await self.broadcast("todo_progress", phase="request", summary_revision=self.summary_revision)
+        try:
+            generator = self.todo_factory(self.settings)
+            self.todo = await generator.generate(self.id, self.summary_revision, self.summary, on_status=lambda phase: self.broadcast("todo_progress", phase=phase, summary_revision=self.summary_revision))
+            atomic_write_text(self.output_dir / "todo_list.json", json.dumps(self.todo.to_dict(), ensure_ascii=False, indent=2))
+            atomic_write_text(self.output_dir / "todo_list.md", render_todo_markdown(self.todo))
+            self.todo_state = "complete"
+            self.todo_error = None
+            self.postprocess.update("todo", "complete", current=1, total=1)
+            items = load_utterances(self.transcript_path)
+            self.files = export_live_result(self.output_dir, meeting_id=self.id, title=self.title, started_at=self.started_at, ended_at=self.ended_at or utc_now_iso(), duration_seconds=self.audio_samples_received / self.audio_sample_rate, utterances=items, audio_segments=self.audio_segments, recording_state=self.recording_state, summary_state=self.summary_state, todo_state=self.todo_state, postprocess=self.postprocess.to_dict(), model_metadata=self.model_metadata)
+            self._write_state()
+            await self.broadcast("todo_complete", todo=self.todo.to_dict(), files=self.files, summary_revision=self.summary_revision)
+        except Exception as exc:
+            self.todo_state = "error"
+            self.todo_error = str(exc)
+            self.postprocess.fail("todo", self.todo_error)
+            self._write_state()
+            await self.broadcast("error", code="todo_failed", message=self.todo_error, retryable=True)
+            await self.broadcast("postprocess_update", meeting=self.snapshot())
 
 
 class SessionManager:
-    def __init__(self, settings: Settings, runtime: LiveModelRuntime) -> None:
+    def __init__(self, settings: Settings, runtime: Any, store: LocalMeetingStore | None = None) -> None:
         self.settings = settings
         self.runtime = runtime
-        self.coordinator = InferenceCoordinator(
-            fast_workers=settings.fast_inference_workers,
-            refine_workers=settings.refine_inference_workers,
-            wait_timeout_seconds=settings.inference_wait_timeout_seconds,
-            gpu_workers=settings.gpu_workers,
-            gpu_memory_budget_mb=settings.gpu_memory_budget_mb,
-        )
-        self.job_store = RefinementJobStore(settings.results_dir / "refinement_jobs.sqlite3")
-        self.repository = LocalSessionRepository()
+        self.store = store or LocalMeetingStore(settings.results_dir)
         self.sessions: dict[str, LiveMeetingSession] = {}
-        self.recovery_tasks: set[asyncio.Task[None]] = set()
-        self.active_id: str | None = None
-        self.lock = asyncio.Lock()
-        self._recover_existing()
+        self._load_recovered()
 
-    def _recover_existing(self) -> None:
-        root = self.settings.results_dir
-        if not root.exists():
-            return
-        state_files = sorted(
-            root.glob("*/session_state.json"), key=lambda path: path.stat().st_mtime
-        )[-10:]
-        safe_files = {
-            "meeting_transcript.md",
-            "translated_zh.md",
-            "transcript.json",
-            "transcript.jsonl",
-            "audio_manifest.json",
-            "manifest.json",
-            "meeting_minutes.md",
-        }
-        for state_file in state_files:
-            try:
-                payload = json.loads(state_file.read_text(encoding="utf-8"))
-                session = LiveMeetingSession(
-                    self.settings,
-                    self.runtime,
-                    session_id=payload["id"],
-                    output_dir=state_file.parent,
-                    started_at=payload.get("started_at"),
-                    recovered=True,
-                    owner_id=str(payload.get("owner_id") or "local"),
-                    coordinator=self.coordinator,
-                    job_store=self.job_store,
-                    repository=self.repository,
-                )
-                session.ended_at = payload.get("ended_at")
-                session.processing_error = payload.get("processing_error")
-                for attribute in (
-                    "audio_bytes_received",
-                    "audio_packets_received",
-                    "audio_packets_dropped",
-                    "audio_packets_out_of_order",
-                    "audio_samples_received",
-                ):
-                    try:
-                        setattr(session, attribute, max(0, int(payload.get(attribute, 0) or 0)))
-                    except (TypeError, ValueError):
-                        pass
-                recovered_state = payload.get("state")
-                if recovered_state in {"complete", "summary_pending", "summary_error"}:
-                    session.state = recovered_state
-                    session.error = payload.get("error")
-                elif recovered_state in {
-                    "recording", "starting", "finalizing", "refining", "summarizing"
-                }:
-                    session.state = "error"
-                    session.error = payload.get("error") or session.error
-                    if self.job_store.pending(session.id):
-                        session.state = "refinement_error"
-                        session.error = "服务重启后仍有精修任务待恢复"
-                else:
-                    session.error = payload.get("error") or session.error
-                minutes = session.output_dir / "meeting_minutes.md"
-                if minutes.exists():
-                    session.summary = minutes.read_text(encoding="utf-8")
-                audio_manifest = session.output_dir / "audio_manifest.json"
-                if audio_manifest.exists():
-                    try:
-                        manifest_payload = json.loads(audio_manifest.read_text(encoding="utf-8"))
-                        segments = (
-                            manifest_payload.get("segments", [])
-                            if isinstance(manifest_payload, dict)
-                            else []
-                        )
-                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                        segments = []
-                    if isinstance(segments, list):
-                        recovered_segments: list[dict[str, object]] = []
-                        for segment in segments:
-                            if not isinstance(segment, dict) or not segment.get("file"):
-                                continue
-                            try:
-                                normalized = dict(segment)
-                                normalized["file"] = Path(str(normalized["file"])).name
-                                normalized["start_seconds"] = max(
-                                    0.0, float(normalized.get("start_seconds", 0.0) or 0.0)
-                                )
-                                normalized["end_seconds"] = max(
-                                    0.0, float(normalized.get("end_seconds", 0.0) or 0.0)
-                                )
-                                normalized["samples"] = max(0, int(normalized.get("samples", 0) or 0))
-                            except (TypeError, ValueError):
-                                continue
-                            recovered_segments.append(normalized)
-                        session.audio_segments = recovered_segments
-                        if not session.audio_samples_received:
-                            session.audio_samples_received = sum(
-                                int(segment.get("samples", 0) or 0)
-                                for segment in recovered_segments
-                            )
-                        if not session.audio_bytes_received:
-                            session.audio_bytes_received = session.audio_samples_received * 2
-                session.files = [
-                    path.name
-                    for path in session.output_dir.iterdir()
-                    if path.is_file()
-                    and (
-                        path.name in safe_files
-                        or (path.name.startswith("original_") and path.suffix == ".md")
-                    )
-                ]
-                self.sessions[session.id] = session
-                self.active_id = session.id
-            except Exception:
+    def _load_recovered(self) -> None:
+        for payload in self.store.list_states():
+            meeting_id = str(payload.get("id", ""))
+            if not meeting_id:
                 continue
+            state = str(payload.get("recording_state", "complete"))
+            transcript_path = self.store.meeting_dir(meeting_id) / "transcript.jsonl"
+            has_transcript = bool(load_utterances(transcript_path))
+            if state in {"starting", "recording", "finalizing"} and not has_transcript:
+                payload["recording_state"] = "error"
+                payload["error"] = "服务重启时会议尚未完成，已保留已保存内容"
+            if state in {"starting", "recording", "finalizing"} and has_transcript:
+                payload["recording_state"] = "complete"
+                payload["summary_state"] = "queued"
+                payload["todo_state"] = "waiting_summary"
+                payload["ended_at"] = payload.get("ended_at") or utc_now_iso()
+                payload["error"] = None
+            if payload.get("recording_state") == "complete":
+                if payload.get("summary_state") == "running":
+                    payload["summary_state"] = "queued"
+                if payload.get("todo_state") == "running":
+                    payload["todo_state"] = "queued"
+                postprocess = payload.get("postprocess")
+                if isinstance(postprocess, dict) and postprocess.get("state") == "running":
+                    postprocess["state"] = "queued"
+            self.sessions[meeting_id] = LiveMeetingSession(self.settings, self.runtime, self.store, meeting_id=meeting_id, recovered_state=payload)
 
     def active_count(self) -> int:
-        return sum(
-            1
-            for session in self.sessions.values()
-            if session.state not in TERMINAL_STATES
-            or (session.worker_task and not session.worker_task.done())
-            or (session.stop_task and not session.stop_task.done())
-        )
+        return sum(session.active for session in self.sessions.values())
 
-    def resume_recoverable(self) -> int:
-        """Resume durable jobs after model loading without blocking readiness."""
+    def get(self, meeting_id: str) -> LiveMeetingSession | None:
+        return self.sessions.get(meeting_id)
 
-        resumed = 0
+    def list(self) -> list[dict[str, Any]]:
+        return [session.snapshot() for session in sorted(self.sessions.values(), key=lambda item: item.started_at, reverse=True)]
+
+    async def create(self, title: str = "", hotwords: str | None = None) -> LiveMeetingSession:
+        if self.active_count() >= self.settings.max_active_meetings:
+            raise CapacityLimitError("当前已达到实时会议并发上限")
+        session = LiveMeetingSession(self.settings, self.runtime, self.store, title=title or "未命名会议", hotwords=hotwords)
+        self.sessions[session.id] = session
+        await session.start()
+        return session
+
+    async def delete(self, meeting_id: str) -> bool:
+        session = self.sessions.get(meeting_id)
+        if session and session.active:
+            raise ValueError("会议进行中，不能删除")
+        if meeting_id not in self.sessions and not self.store.meeting_dir(meeting_id).exists():
+            return False
+        self.sessions.pop(meeting_id, None)
+        self.store.delete(meeting_id)
+        return True
+
+    async def resume_pending(self) -> None:
         for session in self.sessions.values():
-            if session.state != "refinement_error" or not self.job_store.pending(session.id):
-                continue
-            task = asyncio.create_task(
-                session.retry_refinement(), name=f"recover-refinement-{session.id}"
-            )
-            self.recovery_tasks.add(task)
-            task.add_done_callback(self.recovery_tasks.discard)
-            resumed += 1
-        return resumed
-
-    def capacity_snapshot(self) -> dict[str, object]:
-        return {
-            "active_meetings": self.active_count(),
-            "max_concurrent_meetings": self.settings.max_concurrent_meetings,
-            "refinement_jobs": self.job_store.counts(),
-            "refinement_spool_bytes": self.job_store.spool_bytes(),
-            "inference": self.coordinator.snapshot(),
-        }
-
-    async def create(
-        self, hotwords: str | None = None, *, owner_id: str = "local"
-    ) -> LiveMeetingSession:
-        async with self.lock:
-            if self.active_count() >= self.settings.max_concurrent_meetings:
-                raise CapacityLimitError("当前会议并发已达到容量上限")
-            if self.job_store.pending_total() >= self.settings.max_pending_refinements:
-                raise CapacityLimitError("精修任务队列已达到容量上限")
-            if self.job_store.spool_bytes() >= self.settings.max_refinement_spool_bytes:
-                raise CapacityLimitError("精修任务磁盘配额已达到上限")
-            session = LiveMeetingSession(
-                self.settings,
-                self.runtime,
-                hotwords=hotwords,
-                owner_id=owner_id,
-                coordinator=self.coordinator,
-                job_store=self.job_store,
-                repository=self.repository,
-            )
-            await session.start()
-            self.sessions[session.id] = session
-            self.active_id = session.id
-            return session
-
-    def get(self, session_id: str) -> LiveMeetingSession | None:
-        return self.sessions.get(session_id)
-
-    def active(self) -> LiveMeetingSession | None:
-        return self.sessions.get(self.active_id) if self.active_id else None
+            if session.postprocess.state in {"queued", "running"} and session.recording_state == "complete":
+                session.postprocess_task = asyncio.create_task(session.run_postprocess(), name=f"recover-postprocess-{session.id}")
+                session.summary_task = session.postprocess_task
+            elif session.summary_state == "queued" and session.recording_state == "complete":
+                session.summary_task = asyncio.create_task(session.run_summary(), name=f"recover-summary-{session.id}")
+            elif session.todo_state == "queued" and session.summary_state == "complete":
+                session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")

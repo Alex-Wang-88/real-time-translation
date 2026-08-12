@@ -1,11 +1,11 @@
 .env
-LOCAL_CONFIG_PRIVATE.md
-.venv/
-.venv_*/
-.workbuddy/
-*.lnk
 result/
+models/
+.venv/
 __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+

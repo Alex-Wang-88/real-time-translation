@@ -1,0 +1,6 @@
+.meeting-entry { width: 100%; margin-bottom: 8px; padding: 12px; border: 0; border-radius: 10px; color: #b8ccc4; background: transparent; text-align: left; }
+.meeting-entry:hover { background: #1a302a; }
+.meeting-entry.active { color: #e8faf2; background: #1f4036; }
+.meeting-entry-title { display: block; overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.meeting-entry-meta, .meeting-entry-state { display: block; margin-top: 5px; color: #6b8a80; font-size: 9px; }
+.meeting-entry-state.live { color: #ed9b76; }

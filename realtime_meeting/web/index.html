@@ -4,138 +4,143 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
-    <title>实时会议转译</title>
-    <meta name="description" content="本机多语言实时会议转写、中文翻译和会议纪要" />
-    <link rel="stylesheet" href="/static/styles.css?v=5" />
+    <meta name="description" content="实时中文、英文、德文会议记录、翻译、会议纪要和行动项" />
+    <title>会记 v2 · 实时会议记录</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css?v=7" />
+    <link rel="stylesheet" href="/static/styles-fixes.css?v=2" />
   </head>
   <body>
-    <main class="shell">
-      <header class="topbar">
+    <div class="app-shell">
+      <aside class="sidebar">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
           <div>
-            <p class="eyebrow">LOCAL MEETING INTELLIGENCE</p>
-            <h1>实时会议转译</h1>
+            <h1>会记</h1>
           </div>
         </div>
-        <div class="system-pills" aria-label="系统状态" hidden>
-          <span class="pill" id="backendPill"><i></i><b>后端</b><em>检查中</em></span>
-          <span class="pill" id="gpuPill"><i></i><b>计算</b><em>—</em></span>
-          <span class="pill" id="jimoPill"><i></i><b>纪要</b><em>检查中</em></span>
-        </div>
-      </header>
 
-      <section class="control-card" aria-labelledby="controlTitle">
-        <div class="control-copy">
-          <p class="section-label">会议控制台</p>
-          <h2 id="controlTitle">让每种语言都清晰抵达</h2>
-          <p id="privacyNote">支持中文（含方言）、英文和德语；麦克风音频仅在本机处理。</p>
+        <button id="newMeeting" class="primary-button full" type="button" disabled>＋ 新建会议</button>
+
+        <div class="sidebar-section">
+          <div class="section-heading">
+            <span>会议历史</span>
+            <button id="refreshMeetings" class="icon-button" type="button" title="刷新会议历史" aria-label="刷新会议历史">↻</button>
+          </div>
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="meetingSearch" type="search" placeholder="搜索会议" autocomplete="off" />
+          </label>
+          <div id="meetingList" class="meeting-list" aria-live="polite">
+            <div class="sidebar-empty">还没有会议记录</div>
+          </div>
         </div>
-        <div class="control-center">
-          <button id="mainButton" class="main-button" type="button" disabled aria-label="开始会议">
-            <span class="button-icon" aria-hidden="true"></span>
-            <span id="mainButtonText">模型加载中</span>
-          </button>
-          <div class="live-meta">
-            <time id="timer">00:00:00</time>
-            <span class="language-badge" id="languageBadge">等待发言</span>
-          </div>
-          <div class="level-readout">
-            <span id="levelValue">0%</span>
-            <span id="micStatus">等待麦克风</span>
-          </div>
-          <div class="level-track" role="meter" aria-label="麦克风音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-            <span id="levelBar"></span>
-          </div>
-          <p id="audioDebug" class="audio-debug" hidden>开始会议后会显示音频帧和后端接收状态。</p>
-          <p id="inputWarning" class="input-warning" hidden role="alert"></p>
+
+        <div class="sidebar-footer">
+          <div class="system-status"><span id="statusDot" class="status-dot"></span><span id="systemStatus">正在连接本机服务</span></div>
         </div>
-        <div class="control-side">
-          <label for="inputDeviceSelect">输入设备</label>
-          <div class="input-device-controls">
-            <select id="inputDeviceSelect" class="input-device-select" aria-describedby="inputDeviceHint">
-              <option value="">系统默认（浏览器当前输入设备）</option>
-            </select>
-            <button id="refreshInputDevices" class="refresh-button" type="button" title="重新读取浏览器可用的麦克风">刷新</button>
+      </aside>
+
+      <main class="main-column">
+        <header class="topbar">
+          <div>
+            <h2 id="pageTitle" aria-live="polite"></h2>
+            <p id="pageSubtitle" class="muted"></p>
           </div>
-          <p id="inputDeviceHint" hidden>浏览器授权麦克风后会显示设备名称。</p>
-          <label for="hotwords" hidden>术语提示</label>
-          <input id="hotwords" type="text" maxlength="1000" placeholder="姓名、产品名、缩写（可选）" hidden />
-          <label for="deviceSelect" hidden>推理设备</label>
-          <select id="deviceSelect" class="device-select" hidden>
-            <option value="auto">自动（推荐）</option>
-            <option value="cpu">CPU（无显卡可用）</option>
-            <option value="cuda">GPU（需 CUDA）</option>
-          </select>
-          <p id="deviceHint" hidden>有独显时自动启用 GPU 加速</p>
-        </div>
-        <div class="notice-slot">
+          <div class="topbar-actions">
+            <span id="connectionBadge" class="badge neutral">服务检查中</span>
+            <button id="deleteMeeting" class="ghost-button danger" type="button" hidden>删除会议</button>
+          </div>
+        </header>
+
+        <section id="welcomePanel" class="welcome-panel">
+          <div class="welcome-copy">
+            <p>支持中文、英文、德文原文转写；英文和德文会自动翻译为简体中文。</p>
+          </div>
+          <div class="welcome-form">
+            <label for="meetingTitle">会议名称</label>
+            <input id="meetingTitle" type="text" maxlength="200" placeholder="例如：产品周会 / Q3 规划" />
+            <label for="hotwords">专业词、姓名或产品名 <span>可选</span></label>
+            <input id="hotwords" type="text" maxlength="2000" placeholder="用逗号分隔，帮助识别专有名词" />
+            <button id="startMeeting" class="primary-button" type="button" disabled>开始会议 <span>→</span></button>
+          </div>
+        </section>
+
+        <section id="meetingPanel" class="meeting-panel" hidden>
+          <div class="recording-card">
+            <div class="recording-info">
+              <div class="recording-row"><span id="recordingIndicator" class="recording-indicator"></span><strong id="recordingState">准备中</strong><time id="timer">00:00:00</time></div>
+              <p id="recordingHint" class="muted">请允许浏览器访问麦克风。</p>
+            </div>
+            <div class="recording-center">
+              <button id="recordButton" class="record-button" type="button" aria-label="停止会议"><span></span></button>
+              <div class="level-meter"><span id="levelBar"></span></div>
+              <span id="levelText">麦克风等待中</span>
+            </div>
+            <div class="recording-controls">
+              <label for="inputDevice">输入设备</label>
+              <div class="device-row"><select id="inputDevice"><option value="">系统默认设备</option></select><button id="refreshDevices" class="icon-button" type="button" title="刷新设备" aria-label="刷新设备">↻</button></div>
+              <span id="languageIndicator" class="language-indicator">等待语音</span>
+            </div>
+          </div>
+
+          <section id="postprocessPanel" class="postprocess-panel panel-card" hidden>
+            <div class="panel-heading compact">
+              <div><h3>后台处理</h3><p id="postprocessMessage" class="muted">等待处理</p></div>
+              <span id="postprocessBadge" class="badge neutral">未开始</span>
+            </div>
+            <div class="postprocess-progress"><span id="postprocessProgressBar"></span></div>
+            <div id="postprocessStages" class="postprocess-stages"></div>
+            <div class="result-actions"><button id="retryPostprocess" class="text-button" type="button" hidden>重试后台处理</button></div>
+          </section>
+
           <div id="notice" class="notice" hidden role="alert"></div>
-        </div>
-      </section>
 
-      <section class="status-panel" aria-labelledby="statusTitle" hidden>
-        <div class="status-head">
-          <div>
-            <p class="section-label">处理进度</p>
-            <h2 id="statusTitle">全流程状态</h2>
-          </div>
-          <p class="status-message" id="statusMessage" role="status" aria-live="polite">正在检查本机服务…</p>
-        </div>
-        <ol class="steps" id="steps">
-          <li data-step="0"><span>01</span><b>检查服务</b></li>
-          <li data-step="1"><span>02</span><b>麦克风</b></li>
-          <li data-step="2"><span>03</span><b>录音监听</b></li>
-          <li data-step="3"><span>04</span><b>语音转写</b></li>
-          <li data-step="4"><span>05</span><b>中文翻译</b></li>
-          <li data-step="5"><span>06</span><b>保存记录</b></li>
-          <li data-step="6"><span>07</span><b>AI 纪要</b></li>
-          <li data-step="7"><span>08</span><b>完成</b></li>
-        </ol>
-      </section>
+          <section class="transcript-panel panel-card">
+            <div class="panel-heading">
+              <div><h3>实时逐句稿</h3></div>
+              <div class="panel-heading-meta"><span id="utteranceCount">0 条记录</span><button id="jumpLatest" class="text-button" type="button" hidden>回到最新</button></div>
+            </div>
+            <div id="transcriptList" class="transcript-list" tabindex="0" aria-live="polite">
+              <div id="transcriptEmpty" class="content-empty"><span class="wave-mark"></span><p>开始说话后，原文和中文翻译会在这里逐句出现。</p></div>
+            </div>
+          </section>
+        </section>
+      </main>
 
-      <section class="workspace">
-        <article class="panel transcript-panel">
-          <div class="panel-head">
-            <div>
-              <p class="section-label">LIVE TRANSCRIPT</p>
-              <h2>实时逐句稿</h2>
-            </div>
-            <div class="panel-actions">
-              <span id="utteranceCount">0 条稳定记录</span>
-              <button id="jumpLatest" class="text-button" type="button" hidden>回到最新</button>
-            </div>
-          </div>
-          <div class="transcript-list" id="transcriptList" tabindex="0" aria-live="polite">
-            <div class="empty-state" id="transcriptEmpty">
-              <span class="empty-wave" aria-hidden="true"></span>
-              <p>开始会议后，原文和中文翻译会逐句出现在这里。</p>
-            </div>
-          </div>
-        </article>
+      <aside class="results-column">
+        <section class="result-card summary-card">
+          <div class="panel-heading compact"><div><h3>会议纪要</h3></div><span id="summaryBadge" class="badge neutral">等待会议结束</span></div>
+          <div id="summaryProgress" class="progress-line" hidden><span id="summaryProgressBar"></span></div>
+          <div id="summaryText" class="result-content empty-result">完成会议后，系统会自动整理可审计的中文会议纪要。</div>
+          <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>重试会议纪要</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
+        </section>
 
-        <article class="panel minutes-panel" hidden>
-          <div class="panel-head">
-            <div>
-              <p class="section-label">MEETING NOTES</p>
-              <h2>中文会议纪要</h2>
-            </div>
-            <button id="retrySummary" class="text-button" type="button" hidden>生成会议纪要</button>
-          </div>
-          <pre id="summaryText" class="summary-text" aria-live="polite">停止录音后，完整逐句稿会分块发送给积墨 AI。纪要将在此处流式生成。</pre>
-          <div id="downloads" class="downloads" hidden>
-            <p>本次会议文件</p>
-            <div id="downloadLinks"></div>
-          </div>
-        </article>
-      </section>
+        <section class="result-card todo-card">
+          <div class="panel-heading compact"><div><h3>To-do-list</h3></div><span id="todoBadge" class="badge neutral">等待会议纪要</span></div>
+          <div id="todoText" class="todo-content empty-result">会议纪要完成后，系统会从中提取明确的行动项。</div>
+          <div class="result-actions"><button id="retryTodo" class="text-button" type="button" hidden>重试 To-do-list</button><button id="downloadTodo" class="text-button" type="button" hidden>下载 JSON</button></div>
+        </section>
 
-      <footer>
-        <span>音频本机处理</span>
-        <span id="diskStatus" hidden>磁盘检查中</span>
-        <span hidden>匿名说话人编号</span>
-      </footer>
-    </main>
-    <script type="module" src="/static/app.js?v=7"></script>
+        <section id="filesCard" class="result-card files-card" hidden>
+          <div class="panel-heading compact"><div><h3>本次文件</h3></div></div>
+          <div id="fileLinks" class="file-links"></div>
+        </section>
+
+      </aside>
+    </div>
+
+    <dialog id="newMeetingDialog" class="new-dialog">
+      <form method="dialog" id="newMeetingForm">
+        <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
+        <h3>开始新的记录</h3><p class="muted">当前会议仍在进行时不能新建另一场会议。</p>
+        <label for="dialogTitle">会议名称</label><input id="dialogTitle" type="text" maxlength="200" placeholder="例如：客户方案评审" />
+        <label for="dialogHotwords">专业词、姓名或产品名 <span>可选</span></label><input id="dialogHotwords" type="text" maxlength="2000" placeholder="用逗号分隔" />
+        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="dialogStart" class="primary-button" value="default" type="submit">开始会议 →</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/static/app.js?v=5"></script>
   </body>
 </html>

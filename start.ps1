@@ -1,74 +1,168 @@
+[CmdletBinding()]
 param(
-    [Alias("ServerOnly")]
-    [switch]$NoBrowser
+    [switch]$Reload,
+    [switch]$NoBrowser,
+    [switch]$SkipInstall,
+    [int]$Port = 8765
 )
 
+# Keep this launcher ASCII-only. Windows PowerShell 5.1 otherwise misreads a
+# UTF-8 script without a BOM and can fail before showing the real error.
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $projectRoot
-
 $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $venvPython)) {
-    # `py -3.11` exits with an error when that minor version is absent. With
-    # `$ErrorActionPreference = Stop`, probing a missing version aborts the
-    # script before it can reach an installed 3.11 runtime. Read the launcher
-    # inventory once instead, then select a supported interpreter explicitly.
-    $pythonExe = $null
-    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
-    if ($null -ne $pyCommand) {
-        $launcherInventory = @(& $pyCommand.Source -0p 2>$null)
-        foreach ($line in $launcherInventory) {
-            if ($line -match '^\s*-V:(3\.11)\s+(.+python\.exe)\s*$') {
-                $pythonExe = $Matches[3].Trim()
-                break
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+$baseUrl = "http://127.0.0.1:$Port"
+
+function Get-MeetingServiceState {
+    param([string]$BaseUrl)
+
+    try {
+        $response = Invoke-RestMethod -Uri "$BaseUrl/api/v2/health" -TimeoutSec 2
+        if ($null -eq $response.status -or $null -eq $response.capabilities -or $null -eq $response.languages) {
+            return $null
+        }
+        return $response
+    } catch {
+        return $null
+    }
+}
+
+function Test-PortListening {
+    param([int]$TargetPort)
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $result = $client.BeginConnect("127.0.0.1", $TargetPort, $null, $null)
+        if (-not $result.AsyncWaitHandle.WaitOne(500)) { return $false }
+        $client.EndConnect($result)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+try {
+    $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
+    if ($existingService) {
+        if ($existingService.status -eq "ready") {
+            Write-Host "Meeting v2 is already running and models are ready at $baseUrl"
+            if (-not $NoBrowser) { Start-Process $baseUrl | Out-Null }
+            return
+        }
+
+        Write-Host "Meeting v2 is already running; waiting for models to finish loading..."
+        for ($attempt = 0; $attempt -lt 240; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
+            if ($existingService -and $existingService.status -eq "ready") {
+                Write-Host "Meeting v2 models are ready at $baseUrl"
+                if (-not $NoBrowser) { Start-Process $baseUrl | Out-Null }
+                return
             }
+            if (-not $existingService -and -not (Test-PortListening -TargetPort $Port)) { break }
+        }
+        if ($existingService) {
+            $message = if ($existingService.message) { $existingService.message } else { $existingService.status }
+            throw "Meeting v2 did not become ready within 120 seconds: $message"
         }
     }
 
-    # Fall back to `python`/`python3` when the Python launcher is unavailable.
-    if ($null -eq $pythonExe) {
-        foreach ($commandName in @("python", "python3")) {
-            $command = Get-Command $commandName -ErrorAction SilentlyContinue
-            if ($null -eq $command) { continue }
-            $version = (& $command.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null).Trim()
-            if ($version -match '^3\.11$') {
-                $pythonExe = $command.Source
-                break
+    if (Test-PortListening -TargetPort $Port) {
+        throw "Port $Port is already in use by another application. Close it or launch Meeting v2 with a different -Port value."
+    }
+
+    if (-not $uv) {
+        throw "uv was not found. Install uv or create the Python 3.11 environment manually."
+    }
+
+    if (-not (Test-Path -LiteralPath $venvPython)) {
+        & $uv.Source venv --python 3.11 .venv
+        if ($LASTEXITCODE -ne 0) { throw "Creating the Python 3.11 virtual environment failed." }
+    }
+
+    if (-not $SkipInstall) {
+        Write-Host "Installing v2 dependencies..."
+        & $uv.Source pip install --python $venvPython -e ".[audio,dev]"
+        if ($LASTEXITCODE -ne 0) { throw "Installing v2 dependencies failed." }
+    }
+
+    $envPath = Join-Path $projectRoot ".env"
+    $envExamplePath = Join-Path $projectRoot ".env.example"
+    if (-not (Test-Path -LiteralPath $envPath)) {
+        if (-not (Test-Path -LiteralPath $envExamplePath)) {
+            throw "Neither .env nor .env.example exists."
+        }
+        Copy-Item -LiteralPath $envExamplePath -Destination $envPath
+        Write-Host "Created .env from .env.example."
+    }
+
+    $logDir = Join-Path $projectRoot "result"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $stdoutLog = Join-Path $logDir "server.stdout.log"
+    $stderrLog = Join-Path $logDir "server.stderr.log"
+    try {
+        Set-Content -LiteralPath $stdoutLog -Value "" -Encoding UTF8
+        Set-Content -LiteralPath $stderrLog -Value "" -Encoding UTF8
+    } catch [System.IO.IOException] {
+        $runStamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
+        $stdoutLog = Join-Path $logDir ("server.$runStamp.stdout.log")
+        $stderrLog = Join-Path $logDir ("server.$runStamp.stderr.log")
+        Write-Host "The previous server log is in use; using a new log file for this run."
+    }
+
+    $arguments = @("-m", "uvicorn", "realtime_meeting.server:app", "--host", "127.0.0.1", "--port", "$Port")
+    if ($Reload) { $arguments += "--reload" }
+    $serverProcess = Start-Process `
+        -FilePath $venvPython `
+        -ArgumentList $arguments `
+        -WorkingDirectory $projectRoot `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -WindowStyle Hidden `
+        -PassThru
+
+    $ready = $false
+    $lastStatus = "waiting for service"
+    for ($attempt = 0; $attempt -lt 240; $attempt++) {
+        Start-Sleep -Milliseconds 500
+        try {
+            $response = Invoke-RestMethod -Uri "$baseUrl/api/v2/health" -TimeoutSec 2
+            if ($response.status) { $lastStatus = [string]$response.message }
+            if ($response.status -eq "ready") { $ready = $true; break }
+        } catch {
+            if ($serverProcess.HasExited) {
+                $details = ""
+                if (Test-Path -LiteralPath $stderrLog) {
+                    $details = (Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue).Trim()
+                }
+                if (-not $details) { $details = "No server error output was captured." }
+                throw "The v2 server exited before it became ready (code $($serverProcess.ExitCode)). $details"
             }
         }
     }
-
-    if ($null -eq $pythonExe -or -not (Test-Path -LiteralPath $pythonExe)) {
-        throw "Python 3.11 is required. Install Python 3.11 and try again."
+    if (-not $ready) {
+        if ($serverProcess.HasExited) {
+            $details = (Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue).Trim()
+            throw "The v2 server exited before its models became ready (code $($serverProcess.ExitCode)). $details"
+        }
+        throw "The v2 models did not become ready within 120 seconds (last status: $lastStatus). See $stderrLog"
     }
-    & $pythonExe -m venv .venv
-    & $venvPython -m pip install --upgrade pip setuptools wheel
-    & $venvPython -m pip install "torch==2.11.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
-    & $venvPython -m pip install -e ".[dev]"
-}
 
-if (-not (Test-Path -LiteralPath (Join-Path $projectRoot ".env"))) {
-    Write-Warning "Create .env from .env.example and add the rotated Jimo authorization value before generating minutes."
+    Write-Host "Meeting v2 is running and models are ready at $baseUrl"
+    Write-Host "Server logs: $stdoutLog and $stderrLog"
+    if (-not $NoBrowser) { Start-Process $baseUrl | Out-Null }
+    Wait-Process -Id $serverProcess.Id
+} catch {
+    Write-Host ("Startup failed: " + $_.Exception.Message) -ForegroundColor Red
+    Write-Host "Press Enter to close this window." -ForegroundColor Yellow
+    if ($Host.Name -match "ConsoleHost") { Read-Host | Out-Null }
+    throw
+} finally {
+    if ($serverProcess -and -not $serverProcess.HasExited) {
+        Stop-Process -Id $serverProcess.Id -Force
+    }
 }
-
-# Existing virtual environments may predate the web-only client. Install the
-# project once more when the runtime dependencies are not available.
-$dependencyCheck = & $venvPython -c "import ctranslate2, fastapi, faster_whisper, funasr, huggingface_hub, numpy, opencc, torch, websockets" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    & $venvPython -m pip install -e ".[dev]"
-}
-
-# Fail early for an explicitly requested CUDA device instead of starting a
-# backend that can only discover the problem after the model download begins.
-$deviceCheck = & $venvPython -c "from realtime_meeting.config import load_settings; from realtime_meeting.runtime import choose_device; choose_device(load_settings().device)" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw "Configured MEETING_DEVICE is unavailable: $($deviceCheck -join ' ')"
-}
-
-$arguments = @("-m", "realtime_meeting.cli")
-if ($NoBrowser) {
-    $arguments += "--no-browser"
-} else {
-    $arguments += "--browser"
-}
-& $venvPython @arguments

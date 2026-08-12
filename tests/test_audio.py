@@ -1,78 +1,55 @@
 from __future__ import annotations
 
-import wave
-from pathlib import Path
-
 import numpy as np
 
-from realtime_meeting.audio import FsmnVAD, RotatingAudioWriter, SAMPLE_RATE, StreamSegmenter
+from realtime_meeting.audio import FRAME_BYTES, StreamSegmenter
 
 
-def pcm_tone(seconds: float, amplitude: int = 6000) -> bytes:
-    samples = int(seconds * SAMPLE_RATE)
-    timeline = np.arange(samples, dtype=np.float32) / SAMPLE_RATE
-    audio = np.sin(2 * np.pi * 220 * timeline) * amplitude
-    return audio.astype(np.int16).tobytes()
-
-
-def pcm_silence(seconds: float) -> bytes:
-    return np.zeros(int(seconds * SAMPLE_RATE), dtype=np.int16).tobytes()
-
-
-def test_fsmn_vad_adapter_reads_speech_intervals_without_loading_a_model():
-    class Model:
-        def generate(self, **_kwargs):
-            return [{"value": [[0, 20]]}]
-
-    vad = object.__new__(FsmnVAD)
-    vad.model = Model()
-    vad.cache = {}
-    vad.frame_start_ms = 0.0
-
-    assert vad(pcm_tone(0.02)) is True
-
-
-def test_stream_segmenter_commits_after_silence_and_emits_partial():
-    segmenter = StreamSegmenter(partial_interval_ms=500)
-    audio = pcm_silence(0.4) + pcm_tone(2.0) + pcm_silence(0.7)
+def test_segmenter_handles_odd_packet_and_emits_final_segment() -> None:
+    segmenter = StreamSegmenter(speech_start_ms=40, silence_ms=160, pre_roll_ms=40, partial_interval_ms=200)
+    speech = np.full(FRAME_BYTES // 2, 1200, dtype=np.int16).tobytes()
+    silence = np.zeros(FRAME_BYTES // 2, dtype=np.int16).tobytes()
     events = []
-    for offset in range(0, len(audio), 777):
-        events.extend(segmenter.feed(audio[offset : offset + 777]))
-    partials = [event for event in events if event.kind == "partial"]
+    events.extend(segmenter.feed(speech + b"\x00"))
+    for _ in range(15):
+        events.extend(segmenter.feed(speech))
+    for _ in range(10):
+        events.extend(segmenter.feed(silence))
     finals = [event for event in events if event.kind == "final"]
-    assert partials
-    assert len(finals) == 1
-    assert 0.0 <= finals[0].start < 0.5
-    assert 2.3 <= finals[0].end <= 2.7
-    assert segmenter.elapsed_seconds >= 3.0
+    assert finals
+    assert finals[0].start == 0
+    assert finals[0].end > finals[0].start
 
 
-def test_stream_segmenter_forces_long_utterance_cut():
-    segmenter = StreamSegmenter(max_utterance_ms=1000, partial_interval_ms=5000)
-    events = segmenter.feed(pcm_tone(2.4))
-    forced = [event for event in events if event.kind == "final" and event.forced]
-    assert len(forced) >= 2
-    assert all(event.end > event.start for event in forced)
+def test_model_vad_cannot_admit_low_energy_room_noise() -> None:
+    segmenter = StreamSegmenter(
+        speech_start_ms=40,
+        silence_ms=160,
+        minimum_rms=240.0,
+        vad=lambda _frame: True,
+    )
+    room_noise = np.full(FRAME_BYTES // 2, 180, dtype=np.int16).tobytes()
+    events = []
+    for _ in range(500):
+        events.extend(segmenter.feed(room_noise))
+    events.extend(segmenter.flush())
+    assert not events
 
 
-def test_stream_segmenter_accepts_quiet_microphone_signal():
-    # A laptop/Bluetooth microphone can deliver valid speech well below the
-    # old fixed 220-RMS gate. It should still produce a stable segment.
-    quiet = pcm_tone(1.6, amplitude=100)
-    events = StreamSegmenter().feed(quiet + pcm_silence(0.7))
-    assert any(event.kind == "final" for event in events)
-
-
-def test_audio_writer_rotates_bounded_segments_with_wav_fallback(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("realtime_meeting.audio.shutil.which", lambda _name: None)
-    writer = RotatingAudioWriter(tmp_path, segment_minutes=1)
-    writer.segment_samples = 1600
-    writer.write(pcm_tone(0.25))
-    segments = writer.close()
-    assert len(segments) == 3
-    assert [item["samples"] for item in segments] == [1600, 1600, 800]
-    for item in segments:
-        path = tmp_path / str(item["file"])
-        with wave.open(str(path), "rb") as handle:
-            assert handle.getframerate() == SAMPLE_RATE
-            assert handle.getnchannels() == 1
+def test_short_noise_burst_does_not_pass_utterance_admission() -> None:
+    segmenter = StreamSegmenter(
+        speech_start_ms=40,
+        silence_ms=160,
+        pre_roll_ms=40,
+        minimum_rms=240.0,
+        minimum_speech_ms=300,
+        vad=lambda _frame: True,
+    )
+    loud = np.full(FRAME_BYTES // 2, 1200, dtype=np.int16).tobytes()
+    silence = np.zeros(FRAME_BYTES // 2, dtype=np.int16).tobytes()
+    events = []
+    for _ in range(5):  # 100 ms click/bump-like burst
+        events.extend(segmenter.feed(loud))
+    for _ in range(10):
+        events.extend(segmenter.feed(silence))
+    assert not [event for event in events if event.kind == "final"]
