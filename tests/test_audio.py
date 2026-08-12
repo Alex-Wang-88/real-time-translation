@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from realtime_meeting.audio import RotatingAudioWriter, SAMPLE_RATE, StreamSegmenter
+from realtime_meeting.audio import FsmnVAD, RotatingAudioWriter, SAMPLE_RATE, StreamSegmenter
 
 
 def pcm_tone(seconds: float, amplitude: int = 6000) -> bytes:
@@ -17,6 +17,19 @@ def pcm_tone(seconds: float, amplitude: int = 6000) -> bytes:
 
 def pcm_silence(seconds: float) -> bytes:
     return np.zeros(int(seconds * SAMPLE_RATE), dtype=np.int16).tobytes()
+
+
+def test_fsmn_vad_adapter_reads_speech_intervals_without_loading_a_model():
+    class Model:
+        def generate(self, **_kwargs):
+            return [{"value": [[0, 20]]}]
+
+    vad = object.__new__(FsmnVAD)
+    vad.model = Model()
+    vad.cache = {}
+    vad.frame_start_ms = 0.0
+
+    assert vad(pcm_tone(0.02)) is True
 
 
 def test_stream_segmenter_commits_after_silence_and_emits_partial():

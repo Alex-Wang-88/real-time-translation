@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import time
 import wave
 from pathlib import Path
@@ -13,25 +14,69 @@ import httpx
 import websockets
 
 
-async def replay(base_url: str, wav_path: Path, speed: float) -> None:
+async def replay(base_url: str, wav_path: Path, speed: float, token: str | None = None) -> None:
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
-    async with httpx.AsyncClient(base_url=base_url, timeout=30) as client:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with httpx.AsyncClient(base_url=base_url, timeout=30, headers=headers) as client:
         meeting = (await client.post("/api/meetings", json={"hotwords": ""})).raise_for_status().json()
         meeting_id = meeting["id"]
         started = time.perf_counter()
 
         async with websockets.connect(f"{ws_url}/api/meetings/{meeting_id}/stream") as socket:
+            if token:
+                ticket = (
+                    await client.post(f"/api/meetings/{meeting_id}/stream-ticket")
+                ).raise_for_status().json()["ticket"]
+                await socket.send(json.dumps({"type": "auth", "ticket": ticket}))
+                auth_event = json.loads(await socket.recv())
+                if auth_event.get("type") != "auth_ok":
+                    raise RuntimeError(f"WebSocket authentication failed: {auth_event}")
+
+            initial_event = json.loads(await socket.recv())
+            if initial_event.get("type") != "snapshot":
+                raise RuntimeError(f"Expected initial snapshot, got: {initial_event}")
+            await socket.send(
+                json.dumps(
+                    {
+                        "type": "audio_config",
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "encoding": "pcm_s16le",
+                        "packet_ms": 40,
+                        "sequence_header": True,
+                    }
+                )
+            )
+            audio_config_ack = json.loads(await socket.recv())
+            if audio_config_ack.get("type") != "audio_config_ack":
+                raise RuntimeError(f"Audio configuration was rejected: {audio_config_ack}")
+
             async def receive_events() -> None:
                 async for message in socket:
                     event = json.loads(message)
-                    if event.get("type") in {"partial", "utterance", "status", "error", "summary_complete"}:
-                        if event.get("type") == "utterance":
+                    if event.get("type") in {
+                        "partial",
+                        "draft",
+                        "utterance",
+                        "utterance_update",
+                        "translation_update",
+                        "refinement_status",
+                        "status",
+                        "error",
+                        "summary_pending",
+                        "summary_complete",
+                    }:
+                        if event.get("type") == "draft":
+                            event["wall_latency_seconds"] = round(
+                                time.perf_counter() - started - float(event["end"]), 3
+                            )
+                        elif event.get("type") == "utterance":
                             item = event["utterance"]
                             event["wall_latency_seconds"] = round(
                                 time.perf_counter() - started - float(item["end"]), 3
                             )
                         print(json.dumps(event, ensure_ascii=False), flush=True)
-                    if event.get("type") == "summary_complete" or (
+                    if event.get("type") in {"summary_pending", "summary_complete"} or (
                         event.get("type") == "error" and event.get("code") == "summary_failed"
                     ):
                         return
@@ -40,9 +85,11 @@ async def replay(base_url: str, wav_path: Path, speed: float) -> None:
             with wave.open(str(wav_path), "rb") as wav:
                 if (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) != (16000, 1, 2):
                     raise ValueError("Replay input must be 16 kHz, mono, PCM16 WAV")
-                frames_per_chunk = 320
+                frames_per_chunk = 640
+                sequence = 0
                 while chunk := wav.readframes(frames_per_chunk):
-                    await socket.send(chunk)
+                    await socket.send(sequence.to_bytes(4, "little") + chunk)
+                    sequence += 1
                     await asyncio.sleep((frames_per_chunk / 16000) / speed)
 
             await asyncio.sleep(0.8)
@@ -61,8 +108,13 @@ def main() -> None:
     parser.add_argument("wav", type=Path)
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--token", help="API token for non-loopback deployments")
     args = parser.parse_args()
-    asyncio.run(replay(args.base_url.rstrip("/"), args.wav.resolve(), args.speed))
+    # Windows consoles may still expose a legacy code page. Keep replay
+    # diagnostics from failing after the server has already processed audio.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    asyncio.run(replay(args.base_url.rstrip("/"), args.wav.resolve(), args.speed, args.token))
 
 
 if __name__ == "__main__":

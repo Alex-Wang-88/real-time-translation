@@ -1,0 +1,38 @@
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/models/huggingface \
+    PATH=/opt/venv/bin:$PATH \
+    MEETING_HOST=0.0.0.0 \
+    MEETING_PORT=8765 \
+    MEETING_DEVICE=cuda \
+    MEETING_RESULTS_DIR=/data/meetings
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv ffmpeg libsndfile1 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 meeting
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY realtime_meeting ./realtime_meeting
+RUN python3.11 -m venv /opt/venv \
+    && python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir \
+        torch==2.11.0+cu128 torchaudio==2.11.0+cu128 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && python -m pip install --no-cache-dir .
+
+RUN mkdir -p /data/meetings /models/huggingface \
+    && chown -R meeting:meeting /data /models /app
+USER meeting
+
+VOLUME ["/data", "/models"]
+EXPOSE 8765
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=3 \
+  CMD curl --fail http://127.0.0.1:8765/health/ready || exit 1
+
+STOPSIGNAL SIGTERM
+CMD ["python", "-m", "realtime_meeting.cli", "--no-browser"]

@@ -11,6 +11,10 @@ const ui = {
   levelValue: document.querySelector("#levelValue"),
   micStatus: document.querySelector("#micStatus"),
   audioDebug: document.querySelector("#audioDebug"),
+  inputWarning: document.querySelector("#inputWarning"),
+  inputDeviceSelect: document.querySelector("#inputDeviceSelect"),
+  refreshInputDevices: document.querySelector("#refreshInputDevices"),
+  inputDeviceHint: document.querySelector("#inputDeviceHint"),
   hotwords: document.querySelector("#hotwords"),
   deviceSelect: document.querySelector("#deviceSelect"),
   deviceHint: document.querySelector("#deviceHint"),
@@ -48,22 +52,30 @@ const state = {
   audioFramesProduced: 0,
   audioFramesSent: 0,
   audioBytesSent: 0,
+  audioSequence: 0,
+  audioConfigReady: false,
   backendAudioPackets: 0,
   lastAudioLevel: 0,
   lastAudioLevelAt: 0,
   lastNonZeroLevelAt: 0,
   audioWarningShown: false,
   apiToken: new URLSearchParams(window.location.search).get("token") || "",
+  streamTicket: "",
+  utteranceNodes: new Map(),
+  latestUtteranceNode: null,
+  transcriptScrollFrame: 0,
+  scrollStateFrame: 0,
+  inputDeviceId: (() => { try { return localStorage.getItem("meeting_input_device") || ""; } catch { return ""; } })(),
   deviceRequest: (() => { try { return localStorage.getItem("meeting_device") || "auto"; } catch { return "auto"; } })(),
   switchingDevice: false,
 };
 
 const languageNames = {
-  zh: "中文", en: "英文", de: "德文", ru: "俄文", es: "西班牙文",
-  pt: "葡萄牙文", fr: "法文", it: "意大利文", ja: "日文", ko: "韩文",
-  ar: "阿拉伯文", uk: "乌克兰文", pl: "波兰文", nl: "荷兰文", tr: "土耳其文",
-  vi: "越南文",
+  zh: "中文", en: "英文", de: "德文",
 };
+const supportedLanguages = new Set(["zh", "en", "de"]);
+const MAX_RENDERED_UTTERANCES = 240;
+const SCROLL_BOTTOM_THRESHOLD = 80;
 const stageIndex = {
   checking: 0, loading: 0, microphone: 1, recording: 2, listening: 2,
   transcribing: 3, translating: 4, finalizing: 5, saving: 5,
@@ -85,15 +97,33 @@ function formatBytes(value) {
 
 function setMicLevel(value) {
   const normalized = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
-  const percent = Math.min(100, Math.max(0, Math.round(normalized * 420)));
+  const db = normalized > 0 ? 20 * Math.log10(normalized) : -60;
+  const percent = Math.min(100, Math.max(0, Math.round((Math.max(-60, db) + 60) * 100 / 60)));
   ui.levelBar.style.width = `${Math.max(2, percent)}%`;
   ui.levelValue.textContent = `${percent}%`;
   ui.levelTrack?.setAttribute("aria-valuenow", String(percent));
   state.lastAudioLevel = normalized;
   state.lastAudioLevelAt = performance.now();
-  if (normalized >= 0.003) state.lastNonZeroLevelAt = state.lastAudioLevelAt;
+  if (normalized >= 0.003) {
+    state.lastNonZeroLevelAt = state.lastAudioLevelAt;
+    clearInputWarning();
+  }
   if (percent >= 4) ui.micStatus.textContent = "正在接收声音";
   else if (state.meetingState === "recording") ui.micStatus.textContent = "已连接，等待发言";
+}
+
+function setInputWarning(message = "") {
+  // Keep the diagnostic node in the DOM for compatibility, but surface a
+  // warning through the fixed notice slot so showing/hiding it cannot move
+  // the page vertically.
+  ui.inputWarning.textContent = "";
+  ui.inputWarning.hidden = true;
+  if (message) showNotice(message, "warning");
+  else if (ui.notice?.classList.contains("warning")) clearNotice();
+}
+
+function clearInputWarning() {
+  setInputWarning("");
 }
 
 function resetMicFeedback(message = "等待麦克风") {
@@ -103,16 +133,18 @@ function resetMicFeedback(message = "等待麦克风") {
   state.audioFramesProduced = 0;
   state.audioFramesSent = 0;
   state.audioBytesSent = 0;
+  state.audioSequence = 0;
+  state.audioConfigReady = false;
   state.backendAudioPackets = 0;
   state.lastAudioLevel = 0;
   state.lastAudioLevelAt = 0;
   state.lastNonZeroLevelAt = 0;
   state.audioWarningShown = false;
+  clearInputWarning();
   ui.levelBar.style.width = "2%";
   ui.levelValue.textContent = "0%";
   ui.levelTrack?.setAttribute("aria-valuenow", "0");
   ui.micStatus.textContent = message;
-  ui.audioDebug.textContent = "开始会议后会显示音频帧和后端接收状态。";
 }
 
 function updateAudioDebug() {
@@ -184,6 +216,7 @@ function updateMainButton() {
   } else {
     ui.mainButtonText.textContent = "模型加载中";
   }
+  updateDeviceControls();
 }
 
 async function requestJson(url, options = {}) {
@@ -205,6 +238,11 @@ async function pollHealth() {
   try {
     const health = await requestJson("/api/health");
     state.health = health;
+    if (health.language_labels) {
+      for (const code of supportedLanguages) {
+        if (health.language_labels[code]) languageNames[code] = health.language_labels[code];
+      }
+    }
     setPill(ui.backendPill, health.status, health.status === "ready" ? "已就绪" : health.message);
     setPill(ui.gpuPill, health.status === "error" ? "error" : "ready", health.device?.toUpperCase() || "加载中");
     setPill(ui.jimoPill, health.jimo_configured ? "ready" : "error", health.jimo_configured ? "已配置" : "未配置");
@@ -243,10 +281,56 @@ function deviceLabel(value) {
   return "自动（推荐）";
 }
 
+async function refreshInputDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    ui.inputDeviceHint.textContent = "当前浏览器不支持设备枚举，将使用系统默认输入设备。";
+    return;
+  }
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter((device) => device.kind === "audioinput" && device.deviceId && device.deviceId !== "default");
+    const options = [new Option("系统默认（浏览器当前输入设备）", "")];
+    const seen = new Set();
+    devices.forEach((device, index) => {
+      if (seen.has(device.deviceId)) return;
+      seen.add(device.deviceId);
+      options.push(new Option(device.label || `麦克风 ${index + 1}`, device.deviceId));
+    });
+    ui.inputDeviceSelect.replaceChildren(...options);
+    const selected = options.some((option) => option.value === state.inputDeviceId);
+    if (!selected) state.inputDeviceId = "";
+    ui.inputDeviceSelect.value = state.inputDeviceId;
+    try {
+      if (state.inputDeviceId) localStorage.setItem("meeting_input_device", state.inputDeviceId);
+      else localStorage.removeItem("meeting_input_device");
+    } catch { /* ignore unavailable storage */ }
+    if (devices.length) {
+      ui.inputDeviceHint.textContent = `${devices.length} 个输入设备可用；选择后点击开始会议。`;
+    } else {
+      ui.inputDeviceHint.textContent = "尚未获得麦克风设备名称，点击开始会议后会请求权限。";
+    }
+  } catch (error) {
+    ui.inputDeviceHint.textContent = `无法读取输入设备：${error.message || "浏览器拒绝访问"}`;
+  }
+}
+
+function onInputDeviceChange() {
+  state.inputDeviceId = ui.inputDeviceSelect.value || "";
+  try {
+    if (state.inputDeviceId) localStorage.setItem("meeting_input_device", state.inputDeviceId);
+    else localStorage.removeItem("meeting_input_device");
+  } catch { /* ignore unavailable storage */ }
+  ui.inputDeviceHint.textContent = state.inputDeviceId
+    ? "已选择输入设备，点击开始会议后生效。"
+    : "将使用浏览器当前默认输入设备。";
+}
+
 function updateDeviceControls() {
   const health = state.health || {};
   const recording = state.meetingState === "recording";
   const busy = ["finalizing", "summarizing"].includes(state.meetingState) || state.stopping;
+  ui.inputDeviceSelect.disabled = recording || busy;
+  ui.refreshInputDevices.disabled = recording || busy;
   if (state.switchingDevice) {
     ui.deviceSelect.disabled = true;
     ui.deviceHint.textContent = "正在切换推理设备，请稍候（约 10–60 秒）…";
@@ -296,12 +380,25 @@ function stopTimer() {
 
 async function connectWebSocket(sessionId) {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const token = state.apiToken ? `?token=${encodeURIComponent(state.apiToken)}` : "";
-  const ws = new WebSocket(`${scheme}://${location.host}/api/meetings/${sessionId}/stream${token}`);
+  const ticket = await requestJson(`/api/meetings/${sessionId}/stream-ticket`, {
+    method: "POST",
+    body: "{}",
+  });
+  state.streamTicket = ticket.ticket || "";
+  const ws = new WebSocket(`${scheme}://${location.host}/api/meetings/${sessionId}/stream`);
   ws.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error("实时连接超时")), 6000);
-    ws.addEventListener("open", () => { window.clearTimeout(timer); resolve(); }, { once: true });
+    ws.addEventListener("open", () => {
+      window.clearTimeout(timer);
+      try {
+        ws.send(JSON.stringify({ type: "auth", ticket: state.streamTicket }));
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    }, { once: true });
     ws.addEventListener("error", () => { window.clearTimeout(timer); reject(new Error("无法建立实时连接")); }, { once: true });
   });
   state.ws = ws;
@@ -309,6 +406,7 @@ async function connectWebSocket(sessionId) {
     try { handleServerEvent(JSON.parse(event.data)); } catch { /* Ignore malformed status frames. */ }
   });
   ws.addEventListener("close", () => {
+    if (state.ws === ws) state.ws = null;
     if (state.meetingState === "recording") {
       stopCapture();
       state.meetingState = "finalizing";
@@ -321,7 +419,12 @@ async function connectWebSocket(sessionId) {
 }
 
 async function startCapture(stream) {
-  const context = new AudioContext({ latencyHint: "interactive" });
+  let context;
+  try {
+    context = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
+  } catch {
+    context = new AudioContext({ latencyHint: "interactive" });
+  }
   await context.audioWorklet.addModule("/static/audio-worklet.js");
   if (context.state === "suspended") await context.resume();
   if (context.state !== "running") throw new Error(`音频引擎未运行（${context.state}）`);
@@ -334,6 +437,17 @@ async function startCapture(stream) {
   source.connect(worklet);
   worklet.connect(silent);
   silent.connect(context.destination);
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({
+      type: "audio_config",
+      sample_rate: 16000,
+      channels: 1,
+      encoding: "pcm_s16le",
+      packet_ms: 40,
+      sequence_header: true,
+    }));
+    state.audioConfigReady = true;
+  }
   resetMicFeedback("麦克风已连接，等待发言");
   state.captureStartedAt = performance.now();
   worklet.port.onmessage = (event) => {
@@ -342,9 +456,14 @@ async function startCapture(stream) {
       const buffer = event.data.buffer;
       if (state.ws?.readyState === WebSocket.OPEN) {
         try {
-          state.ws.send(buffer);
+          const sourceBytes = new Uint8Array(buffer);
+          const packet = new Uint8Array(sourceBytes.byteLength + 4);
+          new DataView(packet.buffer).setUint32(0, state.audioSequence, true);
+          packet.set(sourceBytes, 4);
+          state.audioSequence += 1;
+          state.ws.send(packet.buffer);
           state.audioFramesSent += 1;
-          state.audioBytesSent += buffer.byteLength || 0;
+          state.audioBytesSent += sourceBytes.byteLength || 0;
         } catch (error) {
           ui.audioDebug.textContent = `音频发送失败：${error.message}`;
         }
@@ -359,6 +478,11 @@ async function startCapture(stream) {
   state.worklet = worklet;
   state.stream = stream;
   const settings = track.getSettings ? track.getSettings() : {};
+  if (settings.deviceId && settings.deviceId !== "default") {
+    state.inputDeviceId = settings.deviceId;
+    try { localStorage.setItem("meeting_input_device", state.inputDeviceId); } catch { /* ignore unavailable storage */ }
+    refreshInputDevices();
+  }
   const device = track.label || (settings.deviceId ? "已选择输入设备" : "默认输入设备");
   ui.audioDebug.textContent = `${device} · ${settings.sampleRate || context.sampleRate} Hz · 等待后端确认`;
   if (track.muted) ui.micStatus.textContent = "输入设备当前静音";
@@ -383,11 +507,16 @@ async function startCapture(stream) {
       ui.audioDebug.textContent = "浏览器未输出音频帧，请检查麦克风权限和输入设备。";
       if (elapsed > 3500 && !state.audioWarningShown) {
         state.audioWarningShown = true;
-        showNotice("麦克风已授权，但没有产生音频帧。请检查 Windows 输入设备、浏览器麦克风权限，并重新开始。", "warning");
+        const message = "麦克风已授权，但没有产生音频帧。请检查输入设备、浏览器麦克风权限，并重新开始。";
+        setInputWarning(message);
+        showNotice(message, "warning");
       }
     } else if (silentFor > 1800 && state.lastAudioLevel < 0.004) {
       ui.micStatus.textContent = "已连接，当前音量很低";
       ui.audioDebug.textContent = `已发送 ${state.audioFramesSent} 帧，但输入电平接近 0${state.backendAudioPackets ? " · 后端已收到" : ""}；请检查系统麦克风音量。`;
+      if (state.backendAudioPackets > 20) {
+        setInputWarning("未检测到有效声音，请检查输入设备、麦克风权限和系统输入音量。");
+      }
     } else {
       updateAudioDebug();
     }
@@ -408,14 +537,34 @@ async function stopCapture() {
   resetMicFeedback("录音已停止");
 }
 
+function microphoneErrorMessage(error) {
+  if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+    return "浏览器没有麦克风权限，请在地址栏或系统隐私设置中允许访问。";
+  }
+  if (error?.name === "NotFoundError") return "没有找到可用的麦克风输入设备。";
+  if (error?.name === "NotReadableError") return "麦克风已被其他程序占用，或当前输入设备无法读取。";
+  if (error?.name === "OverconstrainedError") return "所选输入设备当前不可用，请刷新设备后重试。";
+  return error?.message || "无法访问麦克风。";
+}
+
 async function startMeeting() {
   clearNotice();
   setStage("microphone", "正在请求麦克风权限");
   let requestedStream = null;
   let createdMeetingId = null;
   try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("当前页面无法访问麦克风，请使用 localhost 或 HTTPS 打开 Web 页面。");
+    }
+    const audioConstraints = {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (state.inputDeviceId) audioConstraints.deviceId = { exact: state.inputDeviceId };
     requestedStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: audioConstraints,
       video: false,
     });
     const meeting = await requestJson("/api/meetings", {
@@ -444,7 +593,7 @@ async function startMeeting() {
     }
     state.sessionId = null;
     state.meetingState = "idle";
-    showNotice(`无法开始会议：${error.message}`);
+    showNotice(`无法开始会议：${microphoneErrorMessage(error)}`);
     setStage("microphone", "请允许麦克风权限后重试");
     updateMainButton();
   }
@@ -466,6 +615,9 @@ async function stopMeeting() {
 
 function resetMeetingUi() {
   state.utterances = 0;
+  cancelTranscriptFrames();
+  state.utteranceNodes.clear();
+  state.latestUtteranceNode = null;
   ui.utteranceCount.textContent = "0 条稳定记录";
   ui.transcriptList.replaceChildren(ui.transcriptEmpty);
   ui.transcriptEmpty.hidden = false;
@@ -477,37 +629,105 @@ function resetMeetingUi() {
 }
 
 function sourceLine(item) {
-  return `[${formatTimestamp(item.start)} - ${formatTimestamp(item.end)}] 演讲人${item.speaker_id}（${languageNames[item.language] || item.language}）：“${item.text}”`;
+  const language = item.language === "yue" ? "zh" : item.language;
+  return `[${formatTimestamp(item.start)} - ${formatTimestamp(item.end)}] 演讲人${item.speaker_id}（${languageNames[language] || language}）：“${item.text}”`;
 }
 
 function translationLine(item) {
-  return `[${formatTimestamp(item.start)} - ${formatTimestamp(item.end)}] 演讲人${item.speaker_id}（中文翻译）：“${item.translation_zh ?? item.translation_en ?? ""}”`;
+  const status = item.translation_status || (item.translation_zh ? "ready" : "pending");
+  let text = item.translation_zh ?? item.translation_en ?? "";
+  if (status === "pending") text = text || "翻译中…";
+  if (status === "unsupported") text = text || "未配置该语种的本地翻译模型";
+  if (status === "failed") text = text || "翻译失败，保留原文";
+  return `[${formatTimestamp(item.start)} - ${formatTimestamp(item.end)}] 演讲人${item.speaker_id}（中文翻译）：“${text}”`;
+}
+
+function itemKey(item) {
+  return item.segment_id || `${state.sessionId || "meeting"}:${item.segment_revision || 0}:${item.id || 0}`;
+}
+
+function cancelTranscriptFrames() {
+  if (state.transcriptScrollFrame) cancelAnimationFrame(state.transcriptScrollFrame);
+  if (state.scrollStateFrame) cancelAnimationFrame(state.scrollStateFrame);
+  state.transcriptScrollFrame = 0;
+  state.scrollStateFrame = 0;
+}
+
+function scheduleTranscriptScroll() {
+  if (!state.following || state.transcriptScrollFrame) return;
+  state.transcriptScrollFrame = requestAnimationFrame(() => {
+    state.transcriptScrollFrame = 0;
+    if (state.following) ui.transcriptList.scrollTop = ui.transcriptList.scrollHeight;
+  });
+}
+
+function removeTranscriptNode(node) {
+  if (!node) return;
+  if (state.latestUtteranceNode === node) state.latestUtteranceNode = null;
+  const key = node.dataset.segmentId;
+  if (key && state.utteranceNodes.get(key) === node) state.utteranceNodes.delete(key);
+  node.remove();
+}
+
+function pruneTranscript() {
+  while (state.utteranceNodes.size > MAX_RENDERED_UTTERANCES) {
+    const oldest = state.utteranceNodes.values().next().value;
+    if (!oldest) break;
+    removeTranscriptNode(oldest);
+  }
+}
+
+function markLatestUtterance(card) {
+  if (state.latestUtteranceNode && state.latestUtteranceNode !== card) {
+    state.latestUtteranceNode.classList.remove("latest");
+  }
+  state.latestUtteranceNode = card;
+  card.classList.add("latest");
 }
 
 function appendUtterance(item) {
+  const language = item.language === "yue" ? "zh" : item.language;
+  if (!supportedLanguages.has(language)) return;
+  item = { ...item, language };
   ui.transcriptEmpty.hidden = true;
-  document.querySelectorAll(".utterance.latest").forEach((node) => node.classList.remove("latest"));
-  document.querySelector("#partialUtterance")?.remove();
-  const card = document.createElement("div");
-  card.className = "utterance latest";
-  const original = document.createElement("p");
-  const translation = document.createElement("p");
-  original.textContent = sourceLine(item);
-  translation.textContent = translationLine(item);
-  card.append(original, translation);
-  ui.transcriptList.append(card);
-  state.utterances += 1;
+  ui.transcriptList.querySelector("#partialUtterance")?.remove();
+  if (Number.isFinite(item.segment_revision)) {
+    ui.transcriptList.querySelector(`[data-draft-revision="${item.segment_revision}"]`)?.remove();
+  }
+  const key = itemKey(item);
+  let card = state.utteranceNodes.get(key);
+  const isNew = !card;
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "utterance";
+    card.dataset.segmentId = key;
+    card.append(document.createElement("p"), document.createElement("p"));
+    ui.transcriptList.append(card);
+    state.utteranceNodes.set(key, card);
+  }
+  markLatestUtterance(card);
+  card.classList.toggle("draft", item.recognition_stage === "fast" || item.stage === "draft");
+  card.dataset.start = String(item.start ?? 0);
+  card.dataset.end = String(item.end ?? 0);
+  card.dataset.speakerId = String(item.speaker_id ?? "?");
+  card.dataset.language = String(item.language ?? "");
+  card.firstElementChild.textContent = sourceLine(item);
+  card.lastElementChild.textContent = translationLine(item);
+  if (isNew) state.utterances += 1;
   ui.utteranceCount.textContent = `${state.utterances} 条稳定记录`;
   ui.languageBadge.textContent = languageNames[item.language] || "识别完成";
-  while (ui.transcriptList.querySelectorAll(".utterance:not(.partial)").length > 500) {
-    ui.transcriptList.querySelector(".utterance:not(.partial)")?.remove();
-  }
-  if (state.following) ui.transcriptList.scrollTop = ui.transcriptList.scrollHeight;
+  pruneTranscript();
+  scheduleTranscriptScroll();
 }
 
 function showPartial(event) {
+  const language = event.language === "yue" ? "zh" : event.language;
+  if (language && !supportedLanguages.has(language)) {
+    ui.transcriptList.querySelector("#partialUtterance")?.remove();
+    return;
+  }
   ui.transcriptEmpty.hidden = true;
-  let card = document.querySelector("#partialUtterance");
+  let card = ui.transcriptList.querySelector("#partialUtterance");
   if (!card) {
     card = document.createElement("div");
     card.id = "partialUtterance";
@@ -515,9 +735,10 @@ function showPartial(event) {
     card.append(document.createElement("p"));
     ui.transcriptList.append(card);
   }
-  const language = event.language ? ` · ${languageNames[event.language] || event.language}` : "";
-  card.querySelector("p").textContent = `${formatTimestamp(event.start)}${language}  ${event.text}`;
-  if (state.following) ui.transcriptList.scrollTop = ui.transcriptList.scrollHeight;
+  const label = language ? ` · ${languageNames[language] || language}` : "";
+  const text = `${formatTimestamp(event.start)}${label}  ${event.text}`;
+  if (card.firstElementChild.textContent !== text) card.firstElementChild.textContent = text;
+  scheduleTranscriptScroll();
 }
 
 function renderDownloads(files = []) {
@@ -538,10 +759,16 @@ function applySnapshot(meeting) {
   state.sessionId = meeting.id;
   state.meetingState = meeting.state;
   state.utterances = 0;
+  cancelTranscriptFrames();
+  state.utteranceNodes.clear();
+  state.latestUtteranceNode = null;
   ui.transcriptList.replaceChildren(ui.transcriptEmpty);
   for (const item of meeting.recent_utterances || []) appendUtterance(item);
   if (meeting.summary) ui.summaryText.textContent = meeting.summary;
-  if (meeting.current_language) ui.languageBadge.textContent = languageNames[meeting.current_language] || meeting.current_language;
+  if (meeting.current_language) {
+    const language = meeting.current_language === "yue" ? "zh" : meeting.current_language;
+    ui.languageBadge.textContent = languageNames[language] || "等待发言";
+  }
   if (meeting.state === "recording") startTimer(meeting.elapsed_seconds || 0);
   else ui.timer.textContent = formatClock(meeting.elapsed_seconds || 0);
   if (["finalizing", "summarizing"].includes(meeting.state)) {
@@ -581,6 +808,7 @@ async function restoreMeeting(meeting) {
 
 function handleServerEvent(event) {
   if (event.type === "snapshot") return applySnapshot(event.meeting);
+  if (event.type === "auth_ok" || event.type === "audio_config_ack") return;
   if (event.type === "status") {
     setStage(event.stage, event.message);
     if (event.state) state.meetingState = event.state;
@@ -591,10 +819,16 @@ function handleServerEvent(event) {
     updateMainButton();
   } else if (event.type === "partial") {
     showPartial(event);
+  } else if (event.type === "draft") {
+    showDraft(event);
   } else if (event.type === "partial_clear") {
-    document.querySelector("#partialUtterance")?.remove();
+    ui.transcriptList.querySelector("#partialUtterance")?.remove();
   } else if (event.type === "utterance") {
     appendUtterance(event.utterance);
+  } else if (event.type === "utterance_update") {
+    appendUtterance(event.utterance);
+  } else if (event.type === "translation_update") {
+    updateTranslation(event);
   } else if (event.type === "audio_input") {
     state.backendAudioPackets = event.packets_received || 0;
     if (Number.isFinite(event.level) && !state.lastAudioLevelAt) setMicLevel(event.level);
@@ -658,6 +892,9 @@ async function retrySummary() {
   setStage("summarizing", "正在重试生成会议纪要");
   updateMainButton();
   try {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      await connectWebSocket(state.sessionId);
+    }
     await requestJson(`/api/meetings/${state.sessionId}/retry-summary`, { method: "POST", body: "{}" });
   } catch (error) {
     state.meetingState = retryState;
@@ -670,17 +907,59 @@ async function retrySummary() {
   }
 }
 
+function showDraft(event) {
+  const language = event.language === "yue" ? "zh" : event.language;
+  if (language && !supportedLanguages.has(language)) return;
+  ui.transcriptEmpty.hidden = true;
+  ui.transcriptList.querySelector("#partialUtterance")?.remove();
+  let card = ui.transcriptList.querySelector(`[data-draft-revision="${event.revision}"]`);
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "utterance partial draft";
+    card.dataset.draftRevision = String(event.revision);
+    card.append(document.createElement("p"));
+    ui.transcriptList.append(card);
+  }
+  const label = language ? ` · ${languageNames[language] || language}` : "";
+  const text = `${formatTimestamp(event.start)}${label}  ${event.text}（精修中）`;
+  if (card.firstElementChild.textContent !== text) card.firstElementChild.textContent = text;
+  scheduleTranscriptScroll();
+}
+
+function updateTranslation(event) {
+  const card = state.utteranceNodes.get(event.segment_id);
+  if (!card) return;
+  const item = {
+    start: Number(card.dataset.start || 0),
+    end: Number(card.dataset.end || 0),
+    speaker_id: card.dataset.speakerId || "?",
+    language: card.dataset.language || "",
+    translation_zh: event.translation_zh || "",
+    translation_status: event.translation_status || "ready",
+  };
+  card.lastElementChild.textContent = translationLine(item);
+}
+
 ui.mainButton.addEventListener("click", () => {
   if (state.meetingState === "recording") stopMeeting();
   else startMeeting();
 });
+ui.inputDeviceSelect.addEventListener("change", onInputDeviceChange);
+ui.refreshInputDevices.addEventListener("click", () => refreshInputDevices());
 ui.deviceSelect.addEventListener("change", onDeviceChange);
 ui.retrySummary.addEventListener("click", retrySummary);
 ui.transcriptList.addEventListener("scroll", () => {
-  const distance = ui.transcriptList.scrollHeight - ui.transcriptList.scrollTop - ui.transcriptList.clientHeight;
-  state.following = distance < 80;
-  ui.jumpLatest.hidden = state.following;
-});
+  if (state.scrollStateFrame) return;
+  state.scrollStateFrame = requestAnimationFrame(() => {
+    state.scrollStateFrame = 0;
+    const distance = ui.transcriptList.scrollHeight - ui.transcriptList.scrollTop - ui.transcriptList.clientHeight;
+    const following = distance < SCROLL_BOTTOM_THRESHOLD;
+    if (following !== state.following) {
+      state.following = following;
+      ui.jumpLatest.hidden = following;
+    }
+  });
+}, { passive: true });
 ui.jumpLatest.addEventListener("click", () => {
   state.following = true;
   ui.transcriptList.scrollTop = ui.transcriptList.scrollHeight;
@@ -688,5 +967,9 @@ ui.jumpLatest.addEventListener("click", () => {
 });
 
 setStage("checking", "正在检查本机服务…");
+refreshInputDevices();
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => refreshInputDevices());
+}
 pollHealth();
 window.setInterval(pollHealth, 2500);

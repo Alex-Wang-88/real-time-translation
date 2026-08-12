@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light" />
     <title>实时会议转译</title>
     <meta name="description" content="本机多语言实时会议转写、中文翻译和会议纪要" />
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <link rel="stylesheet" href="/static/styles.css?v=5" />
   </head>
   <body>
     <main class="shell">
@@ -18,7 +18,7 @@
             <h1>实时会议转译</h1>
           </div>
         </div>
-        <div class="system-pills" aria-label="系统状态">
+        <div class="system-pills" aria-label="系统状态" hidden>
           <span class="pill" id="backendPill"><i></i><b>后端</b><em>检查中</em></span>
           <span class="pill" id="gpuPill"><i></i><b>计算</b><em>—</em></span>
           <span class="pill" id="jimoPill"><i></i><b>纪要</b><em>检查中</em></span>
@@ -29,7 +29,7 @@
         <div class="control-copy">
           <p class="section-label">会议控制台</p>
           <h2 id="controlTitle">让每种语言都清晰抵达</h2>
-          <p id="privacyNote">麦克风音频仅在本机处理；停止后才会发送文本生成纪要。</p>
+          <p id="privacyNote">支持中文（含方言）、英文和德语；麦克风音频仅在本机处理。</p>
         </div>
         <div class="control-center">
           <button id="mainButton" class="main-button" type="button" disabled aria-label="开始会议">
@@ -47,22 +47,34 @@
           <div class="level-track" role="meter" aria-label="麦克风音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <span id="levelBar"></span>
           </div>
-          <p id="audioDebug" class="audio-debug">开始会议后会显示音频帧和后端接收状态。</p>
+          <p id="audioDebug" class="audio-debug" hidden>开始会议后会显示音频帧和后端接收状态。</p>
+          <p id="inputWarning" class="input-warning" hidden role="alert"></p>
         </div>
         <div class="control-side">
-          <label for="hotwords">术语提示</label>
-          <input id="hotwords" type="text" maxlength="1000" placeholder="姓名、产品名、缩写（可选）" />
-          <label for="deviceSelect">推理设备</label>
-          <select id="deviceSelect" class="device-select">
+          <label for="inputDeviceSelect">输入设备</label>
+          <div class="input-device-controls">
+            <select id="inputDeviceSelect" class="input-device-select" aria-describedby="inputDeviceHint">
+              <option value="">系统默认（浏览器当前输入设备）</option>
+            </select>
+            <button id="refreshInputDevices" class="refresh-button" type="button" title="重新读取浏览器可用的麦克风">刷新</button>
+          </div>
+          <p id="inputDeviceHint" hidden>浏览器授权麦克风后会显示设备名称。</p>
+          <label for="hotwords" hidden>术语提示</label>
+          <input id="hotwords" type="text" maxlength="1000" placeholder="姓名、产品名、缩写（可选）" hidden />
+          <label for="deviceSelect" hidden>推理设备</label>
+          <select id="deviceSelect" class="device-select" hidden>
             <option value="auto">自动（推荐）</option>
             <option value="cpu">CPU（无显卡可用）</option>
             <option value="cuda">GPU（需 CUDA）</option>
           </select>
-          <p id="deviceHint">有独显时自动启用 GPU 加速</p>
+          <p id="deviceHint" hidden>有独显时自动启用 GPU 加速</p>
+        </div>
+        <div class="notice-slot">
+          <div id="notice" class="notice" hidden role="alert"></div>
         </div>
       </section>
 
-      <section class="status-panel" aria-labelledby="statusTitle">
+      <section class="status-panel" aria-labelledby="statusTitle" hidden>
         <div class="status-head">
           <div>
             <p class="section-label">处理进度</p>
@@ -80,7 +92,6 @@
           <li data-step="6"><span>07</span><b>AI 纪要</b></li>
           <li data-step="7"><span>08</span><b>完成</b></li>
         </ol>
-        <div id="notice" class="notice" hidden role="alert"></div>
       </section>
 
       <section class="workspace">
@@ -103,7 +114,7 @@
           </div>
         </article>
 
-        <article class="panel minutes-panel">
+        <article class="panel minutes-panel" hidden>
           <div class="panel-head">
             <div>
               <p class="section-label">MEETING NOTES</p>
@@ -121,10 +132,10 @@
 
       <footer>
         <span>音频本机处理</span>
-        <span id="diskStatus">磁盘检查中</span>
-        <span>匿名说话人编号</span>
+        <span id="diskStatus" hidden>磁盘检查中</span>
+        <span hidden>匿名说话人编号</span>
       </footer>
     </main>
-    <script type="module" src="/static/app.js?v=5"></script>
+    <script type="module" src="/static/app.js?v=7"></script>
   </body>
 </html>

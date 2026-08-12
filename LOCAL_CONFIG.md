@@ -31,8 +31,13 @@
 推荐的本地模型配置如下：
 
     MEETING_DEVICE=auto
-    MEETING_ASR_MODEL=large-v3-turbo
-    MEETING_TRANSLATION_MODEL=JustFrederik/nllb-200-distilled-1.3B-ct2-int8
+    MEETING_ASR_PRIMARY=FunAudioLLM/Fun-ASR-Nano-2512
+    MEETING_ASR_FALLBACK=large-v3-turbo
+    MEETING_ASR_REFINE=large-v3
+    MEETING_VAD=fsmn-vad
+    MEETING_TRANSLATION_PROFILE=opusmt-local
+    MEETING_TRANSLATION_MODEL_ROOT=models/opus-mt
+    MEETING_TRANSLATION_AUTODOWNLOAD=0
 
 ## 安全注意事项
 

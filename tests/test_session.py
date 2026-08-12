@@ -66,6 +66,19 @@ def test_summary_claim_is_single_use(tmp_path: Path):
     assert session.begin_summary() is False
 
 
+def test_partial_text_only_advances_on_a_stable_prefix(tmp_path: Path):
+    session = LiveMeetingSession(
+        Settings(results_dir=tmp_path, disk_warn_bytes=0, disk_stop_bytes=0),
+        ReadyRuntime(),
+    )
+
+    assert session._stable_partial_text(1, "hello world") == "hello world"
+    assert session._stable_partial_text(1, "hello world again") is None
+    assert session._stable_partial_text(1, "hello world again ") == "hello world again"
+    session._clear_partial_revision(1)
+    assert session._stable_partial_text(1, "你好世界") == "你好世界"
+
+
 def test_recovery_restores_terminal_state_audio_and_safe_files(tmp_path: Path):
     output_dir = tmp_path / "20260808-120000-recovered"
     output_dir.mkdir()

@@ -115,6 +115,11 @@ LANGUAGE_LABELS = {
     "zu": "祖鲁文",
 }
 
+# Active live mode is intentionally limited to this small, predictable set.
+# Keep the larger compatibility table above for archived records, but do not
+# advertise or export long-tail languages until they are enabled again.
+SUPPORTED_LANGUAGE_LABELS = {"zh": "中文", "en": "英文", "de": "德文"}
+
 
 def language_label(code: str | None) -> str:
     """Return a stable Chinese label for a Whisper language code.
@@ -136,6 +141,8 @@ SessionState = Literal[
     "starting",
     "recording",
     "finalizing",
+    "refining",
+    "refinement_error",
     "summary_pending",
     "summarizing",
     "complete",
@@ -157,10 +164,22 @@ class Utterance:
     # ``translation_en`` key is accepted when recovering JSONL written by
     # earlier builds (see ``from_dict`` below), but new records are explicit.
     translation_zh: str
+    segment_revision: int = 0
+    recognition_stage: Literal["fast", "refined"] = "refined"
+    translation_status: Literal[
+        "pending", "ready", "not_needed", "unsupported", "failed"
+    ] = "ready"
+    segment_id: str = ""
+    revision: int = 1
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Utterance":
         values = dict(payload)
+        values.setdefault("segment_revision", 0)
+        values.setdefault("recognition_stage", "refined")
+        values.setdefault("translation_status", "ready")
+        values.setdefault("revision", 1)
+        values.setdefault("segment_id", "")
         if "translation_zh" not in values:
             values["translation_zh"] = values.pop("translation_en", "")
         else:
@@ -193,8 +212,14 @@ class MeetingSnapshot:
     files: list[str] = field(default_factory=list)
     audio_bytes_received: int = 0
     audio_packets_received: int = 0
+    audio_packets_dropped: int = 0
+    audio_packets_out_of_order: int = 0
     audio_samples_received: int = 0
     audio_level: float = 0.0
+    pending_refinements: int = 0
+    failed_refinements: int = 0
+    owner_id: str = "local"
+    metrics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

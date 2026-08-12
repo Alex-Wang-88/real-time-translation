@@ -7,7 +7,7 @@ import wave
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import Any, BinaryIO, Callable, Literal
 
 import numpy as np
 
@@ -29,6 +29,79 @@ class SegmentEvent:
     forced: bool = False
 
 
+class FsmnVAD:
+    """Small synchronous adapter for FunASR's stateful FSMN-VAD model.
+
+    The segmenter remains usable without FunASR: a missing model or an
+    unexpected model response returns ``None`` and lets the adaptive energy
+    fallback decide. This keeps local tests and CPU-only installations safe.
+    """
+
+    def __init__(self, model_name: str = "fsmn-vad", device: str = "cpu") -> None:
+        from funasr import AutoModel
+
+        runtime_device = f"{device}:0" if device == "cuda" else device
+        try:
+            self.model = AutoModel(
+                model=model_name,
+                hub="hf",
+                trust_remote_code=True,
+                device=runtime_device,
+            )
+        except TypeError:
+            self.model = AutoModel(model=model_name, device=runtime_device)
+        self.cache: dict[str, Any] = {}
+        self.frame_start_ms = 0.0
+
+    def __call__(self, frame: bytes) -> bool | None:
+        audio = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+        try:
+            result = self.model.generate(
+                input=audio,
+                cache=self.cache,
+                is_final=False,
+            )
+        except TypeError:
+            result = self.model.generate(input=audio)
+        except Exception:
+            return None
+        payload = result[0] if isinstance(result, list) and result else result
+        frame_start_ms = self.frame_start_ms
+        self.frame_start_ms += FRAME_MS
+        if isinstance(payload, dict):
+            for key in ("is_speech", "speech", "speech_prob", "score"):
+                if key in payload:
+                    try:
+                        value = float(payload[key])
+                        return value > 0.5 if key != "is_speech" else bool(value)
+                    except (TypeError, ValueError):
+                        return None
+            info = payload.get("value")
+            if isinstance(info, (list, tuple)) and info:
+                # FSMN-VAD commonly returns accumulated speech intervals in
+                # milliseconds: ``[[start_ms, end_ms], ...]``. Decide for the
+                # current 20 ms frame while retaining the boundary format.
+                intervals = []
+                for interval in info:
+                    if isinstance(interval, (list, tuple)) and len(interval) >= 2:
+                        try:
+                            intervals.append((float(interval[0]), float(interval[1])))
+                        except (TypeError, ValueError):
+                            continue
+                if intervals:
+                    frame_end_ms = frame_start_ms + FRAME_MS
+                    decision = any(
+                        start_ms <= frame_end_ms and end_ms >= frame_start_ms
+                        for start_ms, end_ms in intervals
+                    )
+                    return decision
+                try:
+                    return float(info[-1]) > 0.5
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+
 class StreamSegmenter:
     """Adaptive energy VAD with pre-roll, stable silence commits and hard cuts."""
 
@@ -41,6 +114,7 @@ class StreamSegmenter:
         partial_interval_ms: int = 1500,
         max_utterance_ms: int = 12_000,
         minimum_rms: float = 60.0,
+        vad: Callable[[bytes], bool | None] | None = None,
     ) -> None:
         self.pre_roll_frames = max(1, pre_roll_ms // FRAME_MS)
         self.speech_start_frames = max(1, speech_start_ms // FRAME_MS)
@@ -48,6 +122,7 @@ class StreamSegmenter:
         self.partial_interval_frames = max(1, partial_interval_ms // FRAME_MS)
         self.max_frames = max(1, max_utterance_ms // FRAME_MS)
         self.minimum_rms = minimum_rms
+        self.vad = vad
         # Start with a conservative floor so a quiet microphone can trigger
         # speech detection during the first few hundred milliseconds. The
         # floor adapts upward while idle, so ordinary background noise is not
@@ -59,6 +134,8 @@ class StreamSegmenter:
         self._speech_run = 0
         self._silence_run = 0
         self._total_samples = 0
+        self._frames_processed = 0
+        self._speech_frames = 0
         self._revision = 0
         self._last_partial_frame_count = 0
 
@@ -70,7 +147,28 @@ class StreamSegmenter:
     def active(self) -> bool:
         return bool(self._active)
 
+    @property
+    def frames_processed(self) -> int:
+        return self._frames_processed
+
+    @property
+    def speech_frames(self) -> int:
+        return self._speech_frames
+
+    @property
+    def speech_ratio(self) -> float:
+        if not self._frames_processed:
+            return 0.0
+        return self._speech_frames / self._frames_processed
+
     def _is_speech(self, frame: bytes) -> bool:
+        if self.vad is not None:
+            try:
+                model_decision = self.vad(frame)
+            except Exception:
+                model_decision = None
+            if model_decision is not None:
+                return bool(model_decision)
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
         threshold = max(self.minimum_rms, self.noise_floor * 3.0)
@@ -94,6 +192,9 @@ class StreamSegmenter:
         frame_start = self._total_samples
         self._total_samples += FRAME_SAMPLES
         speech = self._is_speech(frame)
+        self._frames_processed += 1
+        if speech:
+            self._speech_frames += 1
         events: list[SegmentEvent] = []
 
         if not self._active:

@@ -1,6 +1,9 @@
 .env
 LOCAL_CONFIG_PRIVATE.md
 .venv/
+.venv_*/
+.workbuddy/
+*.lnk
 result/
 __pycache__/
 *.pyc

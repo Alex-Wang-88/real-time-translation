@@ -19,6 +19,18 @@ def test_clear_short_words_override_previous_language_at_a_switch() -> None:
     assert detector.detect("Guten", previous="en").code == "de"
 
 
+def test_short_german_sentence_overrides_strong_english_audio_hint() -> None:
+    detector = TrilingualDetector()
+    assert (
+        detector.detect(
+            "Was passierte?",
+            whisper_language="en",
+            whisper_confidence=0.92,
+        ).code
+        == "de"
+    )
+
+
 def test_latin_code_switch_is_split_into_independent_translation_units() -> None:
     detector = TrilingualDetector()
     assert detector.split_clauses("Guten Morgen Good morning") == [
@@ -78,32 +90,35 @@ def test_german_loanword_does_not_create_false_english_clause() -> None:
     )
 
 
-def test_non_trilingual_whisper_hints_are_preserved() -> None:
+def test_non_supported_whisper_hints_are_hidden() -> None:
     detector = TrilingualDetector()
-    assert detector.detect("паньями", whisper_language="ru", whisper_confidence=0.95).code == "ru"
-    assert detector.detect("Tienes ganas.", whisper_language="es", whisper_confidence=0.95).code == "es"
-    assert detector.detect("Então, vamos lá.", whisper_language="pt", whisper_confidence=0.95).code == "pt"
+    assert detector.detect("паньями", whisper_language="ru", whisper_confidence=0.95).code == "unknown"
+    assert detector.detect("Tienes ganas.", whisper_language="es", whisper_confidence=0.95).code == "unknown"
+    assert detector.detect("Então, vamos lá.", whisper_language="pt", whisper_confidence=0.95).code == "unknown"
 
 
-def test_script_and_foreign_markers_repair_an_english_whisper_hint() -> None:
+def test_foreign_scripts_do_not_leak_into_the_three_language_mode() -> None:
     detector = TrilingualDetector()
-    assert detector.detect("Ой, мой голос", whisper_language="en", whisper_confidence=0.9).code == "ru"
-    assert detector.detect("Tienes ganas.", whisper_language="en", whisper_confidence=0.9).code == "es"
-    assert detector.detect("e farlo", whisper_language="en", whisper_confidence=0.9).code == "it"
-    assert detector.detect("João", whisper_language="en", whisper_confidence=0.9).code == "pt"
+    assert detector.detect("Ой, мой голос", whisper_language="en", whisper_confidence=0.9).code == "unknown"
+    assert detector.detect("Tienes ganas.", whisper_language="en", whisper_confidence=0.9).code == "unknown"
+    assert detector.detect("e farlo", whisper_language="en", whisper_confidence=0.9).code == "unknown"
+    assert detector.detect("João", whisper_language="en", whisper_confidence=0.9).code == "unknown"
 
 
-def test_full_detector_covers_more_than_the_original_three_languages() -> None:
+def test_detector_restricts_live_mode_to_chinese_english_and_german() -> None:
     detector = TrilingualDetector()
-    assert detector.detect("Bonjour, comment allez-vous?", whisper_language="en").code == "fr"
-    assert detector.detect("Ciao, come stai?", whisper_language="en").code == "it"
-    assert detector.detect("Hej, hur mår du?", whisper_language="en").code == "sv"
-    assert detector.detect("مرحبًا بكم", whisper_language="en").code == "ar"
-    assert detector.detect("日本語で話しています", whisper_language="en").code == "ja"
-    assert detector.detect("Γεια σου", whisper_language="en").code == "el"
+    for text in (
+        "Bonjour, comment allez-vous?",
+        "Ciao, come stai?",
+        "Hej, hur mår du?",
+        "مرحبًا بكم",
+        "日本語で話しています",
+        "Γεια σου",
+    ):
+        assert detector.detect(text, whisper_language="en").code == "unknown"
 
 
-def test_ambiguous_non_english_hint_is_not_silently_relabelled_english() -> None:
+def test_ambiguous_non_supported_hint_stays_in_supported_mode() -> None:
     detector = TrilingualDetector()
     guess = detector.detect(
         "uncommon phrase",
@@ -111,4 +126,10 @@ def test_ambiguous_non_english_hint_is_not_silently_relabelled_english() -> None
         whisper_language="es",
         whisper_confidence=0.40,
     )
-    assert guess.code == "es"
+    assert guess.code == "en"
+
+
+def test_chinese_script_and_cantonese_hint_are_normalized_to_chinese() -> None:
+    detector = TrilingualDetector()
+    assert detector.detect("这是中文会议内容", previous="en").code == "zh"
+    assert detector.detect("你好，大家好", whisper_language="yue", whisper_confidence=0.95).code == "zh"

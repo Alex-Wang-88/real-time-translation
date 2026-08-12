@@ -16,12 +16,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--browser",
         action="store_true",
-        help="调试时启动后打开旧版浏览器页面（桌面客户端不需要）",
+        help="启动服务后自动打开 Web 页面",
     )
     parser.add_argument(
         "--no-browser",
         action="store_true",
-        help="兼容旧启动脚本；默认已经不会打开浏览器",
+        help="启动 Web 服务但不自动打开浏览器",
     )
     return parser
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .formatting import paired_text, source_line
-from .models import LANGUAGE_LABELS, Utterance, language_label
+from .models import SUPPORTED_LANGUAGE_LABELS, Utterance, language_label
 from .text_normalize import simplify_chinese
 
 
@@ -13,19 +13,33 @@ def load_utterances(path: Path) -> list[Utterance]:
     items: list[Utterance] = []
     if not path.exists():
         return items
+    positions: dict[str, int] = {}
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
                 item = Utterance.from_dict(json.loads(line))
                 if item.language == "zh":
                     item.text = simplify_chinese(item.text)
-                items.append(item)
+                key = item.segment_id or f"legacy:{item.id}"
+                previous_position = positions.get(key)
+                if previous_position is None:
+                    positions[key] = len(items)
+                    items.append(item)
+                    continue
+                previous = items[previous_position]
+                if (item.revision, item.recognition_stage == "refined") >= (
+                    previous.revision,
+                    previous.recognition_stage == "refined",
+                ):
+                    items[previous_position] = item
     return items
 
 
 def append_utterance(path: Path, item: Utterance) -> None:
     if item.language == "zh":
         item.text = simplify_chinese(item.text)
+    if not item.segment_id:
+        item.segment_id = f"legacy:{item.id}"
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
         handle.flush()
@@ -76,7 +90,7 @@ def export_live_result(
     _write(output_dir / "translated_zh.md", "# 整场会议中文译稿\n\n" + (pairs or "（未检测到有效发言）"))
     # Always keep the three original-language files for the original product
     # contract, then add any language actually detected in this meeting.
-    languages = list(LANGUAGE_LABELS)
+    languages = list(SUPPORTED_LANGUAGE_LABELS)
     for item in items:
         if item.language not in languages:
             languages.append(item.language)

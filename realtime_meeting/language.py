@@ -42,9 +42,10 @@ _ENGLISH_MARKERS = re.compile(
 # text-level language detection.
 _WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]+")
 _GERMAN_WORDS = frozenset(
-    "und aber nicht ist sind wir ich das der die ein eine mit für auf auch dass haben wird "
-    "egal morgen danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
-    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen"
+  "und aber nicht ist sind wir ich das der die ein eine mit für auf auch dass haben wird "
+  "egal morgen danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
+    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen passierte möchte "
+    "könnte sollte wieso warum welche welcher welches"
     .casefold()
     .split()
 )
@@ -71,9 +72,10 @@ _ENGLISH_SWITCH_WORDS = frozenset(
     .split()
 )
 _GERMAN_HINT_WORDS = frozenset(
-    "aber nicht sind wir ich das der die ein eine mit für auf auch dass haben wird egal morgen "
-    "danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
-    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen"
+  "aber nicht sind wir ich das der die ein eine mit für auf auch dass haben wird egal morgen "
+  "danke guten müssen hallo bitte ja nein heute treffen bereit willkommen vielen dank "
+    "den seit sturm deutschland millionen existenzen stehen sehr einfach zu sagen passierte möchte "
+    "könnte sollte wieso warum welche welcher welches"
     .casefold()
     .split()
 )
@@ -132,11 +134,28 @@ _TURKISH_WORDS = frozenset(
 )
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;.,，])\s*|(?<=[。！？!?；;.,，])")
 
+# Keep the live product focused on the three languages currently supported by
+# the UI. Whisper may report Cantonese as ``yue``; it is normalized to Chinese
+# so Chinese dialects stay in the same recognition and translation path.
+SUPPORTED_LANGUAGE_CODES = frozenset({"zh", "en", "de"})
+_CHINESE_LANGUAGE_ALIASES = frozenset(
+    {"zh", "zho", "cmn", "yue", "zh-cn", "zh-tw", "zh-hk"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LanguageGuess:
     code: str
     confidence: float
+
+
+def normalize_language_code(code: str | None) -> str | None:
+    normalized = (code or "").strip().casefold().replace("_", "-")
+    if normalized in _CHINESE_LANGUAGE_ALIASES or normalized.startswith("zh-"):
+        return "zh"
+    if normalized in SUPPORTED_LANGUAGE_CODES:
+        return normalized
+    return None
 
 
 def _script_language(text: str, hint: str | None) -> LanguageGuess | None:
@@ -244,12 +263,12 @@ def _latin_foreign_language(
 
 
 class MultilingualDetector:
-    """Detect Whisper's full language set without an English fallback.
+    """Detect the three live languages supported by the current product.
 
-    Lingua's full 75-language model provides a text-level second opinion,
-    while Whisper supplies the audio-level hint. The previous three-language
-    detector made every unknown Latin-script sentence look English; this
-    class can now return any language understood by Lingua or Whisper.
+    Lingua still supplies a text-level second opinion, while Whisper supplies
+    the audio-level hint. Only Chinese, English, and German can leave this
+    class as usable results; unsupported guesses become ``unknown`` instead
+    of appearing as a confident but misleading language label.
     """
 
     def __init__(self) -> None:
@@ -287,17 +306,23 @@ class MultilingualDetector:
         """
         text = text.strip()
         if not text:
-            return LanguageGuess(previous or "zh", 0.0)
-        hint = whisper_language.casefold().strip() if whisper_language else None
-        if hint and not _LANGUAGE_CODE_RE.fullmatch(hint):
+            return LanguageGuess(normalize_language_code(previous) or "zh", 0.0)
+        hint = normalize_language_code(whisper_language)
+        raw_hint = (whisper_language or "").casefold().strip()
+        if raw_hint and not _LANGUAGE_CODE_RE.fullmatch(raw_hint):
             hint = None
+        previous_code = normalize_language_code(previous)
         try:
             hint_confidence = float(whisper_confidence or 0.0)
         except (TypeError, ValueError):
             hint_confidence = 0.0
         scripted = _script_language(text, hint)
         if scripted is not None:
-            return scripted
+            return (
+                scripted
+                if scripted.code in SUPPORTED_LANGUAGE_CODES
+                else LanguageGuess("unknown", scripted.confidence)
+            )
         cjk_count = len(_CJK_RE.findall(text))
         letter_count = sum(ch.isalpha() for ch in text)
         if cjk_count >= 2 or (cjk_count and cjk_count / max(letter_count, 1) >= 0.3):
@@ -333,7 +358,11 @@ class MultilingualDetector:
         en_hits = len(_ENGLISH_MARKERS.findall(text))
         foreign = _latin_foreign_language(text, german_words, english_words)
         if foreign is not None:
-            return foreign
+            return (
+                foreign
+                if foreign.code in SUPPORTED_LANGUAGE_CODES
+                else LanguageGuess("unknown", foreign.confidence)
+            )
 
         # Full-language Lingua is used as a text-level second opinion after
         # deterministic script and switch-word checks.
@@ -341,45 +370,30 @@ class MultilingualDetector:
         if values:
             best = values[0]
             code = self._mapping.get(best.language)
-            if code and best.value >= 0.50:
+            if code in SUPPORTED_LANGUAGE_CODES and best.value >= 0.50:
                 if (
-                    hint in {"zh", "en", "de"}
+                    hint in SUPPORTED_LANGUAGE_CODES
                     and hint != code
                     and hint_confidence >= 0.75
                     and not (de_hits or en_hits or german_words or english_words)
                 ):
                     return LanguageGuess(hint, min(0.92, hint_confidence))
-                # A segment-level Whisper hint is especially useful for a
-                # one-word German ASR result such as a name or a technical
-                # term.  Do not override a strong text decision: this keeps
-                # an actual English clause inside a German audio window in
-                # English.  The 0.80 threshold is deliberately conservative
-                # and only repairs low-evidence conflicts.
-                if (
-                    hint
-                    and hint not in {"zh", "en", "de"}
-                    and hint_confidence >= 0.85
-                    and code in {"en", "de"}
-                    and best.value < 0.70
-                ):
-                    return LanguageGuess(hint, min(0.90, hint_confidence))
-                if (
-                    hint
-                    and hint != code
-                    and hint_confidence >= 0.75
-                    and best.value < 0.80
-                    and hint not in {"zh", "en", "de"}
-                    and not (de_hits or en_hits)
-                ):
-                    return LanguageGuess(hint, min(0.90, hint_confidence))
                 return LanguageGuess(code, float(best.value))
 
-        # Whisper is still the best signal for short or noisy clauses. The old
-        # 0.55 cutoff then fell back to English; 0.35 keeps a plausible
-        # Spanish, Arabic or other language hint visible.
+            # A strong supported Whisper hint is safer than presenting the
+            # best unsupported Lingua result. This is useful for Chinese
+            # dialects whose ASR text may contain few CJK characters.
+            if (
+                hint in SUPPORTED_LANGUAGE_CODES
+                and hint_confidence >= 0.75
+                and not (de_hits or en_hits or german_words or english_words)
+            ):
+                return LanguageGuess(hint, min(0.92, hint_confidence))
+
+        # Whisper remains useful for short or noisy clauses, but only the
+        # three supported language hints are allowed through.
         if (
-            hint
-            and hint not in {"zh", "en", "de"}
+            hint in SUPPORTED_LANGUAGE_CODES
             and hint_confidence >= 0.35
             and not (de_hits or en_hits or german_words or english_words)
         ):
@@ -389,27 +403,18 @@ class MultilingualDetector:
             return LanguageGuess("de", 0.55)
         if en_hits > de_hits:
             return LanguageGuess("en", 0.55)
-        if (
-            values
-            and hint in {"zh", "en", "de"}
-            and hint_confidence >= 0.75
-            and not (de_hits or en_hits or german_words or english_words)
-            and values[0].value < 0.50
-        ):
-            return LanguageGuess(hint, min(0.90, hint_confidence))
         if values:
             best = values[0]
             code = self._mapping.get(best.language)
             # Longer clauses should not inherit a previous language just
             # because the statistical confidence is modest.
-            if code and (best.value >= 0.35 or letter_count > 8):
+            if code in SUPPORTED_LANGUAGE_CODES and (best.value >= 0.35 or letter_count > 8):
                 return LanguageGuess(code, float(best.value))
         # Only genuinely ambiguous short backchannels inherit the previous
         # language.
-        if previous and letter_count <= 8:
-            return LanguageGuess(previous, 0.45)
-        # Never claim English merely because a short utterance was ambiguous.
-        return LanguageGuess(previous or hint or "unknown", 0.25)
+        if previous_code and letter_count <= 8:
+            return LanguageGuess(previous_code, 0.45)
+        return LanguageGuess("unknown", 0.25)
 
     def split_clauses(self, text: str) -> list[str]:
         clauses: list[str] = []

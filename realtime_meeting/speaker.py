@@ -6,12 +6,14 @@ from .audio import SAMPLE_RATE
 
 
 class OnlineSpeakerClusterer:
-    def __init__(self, device: str, threshold: float = 0.68) -> None:
-        from resemblyzer import VoiceEncoder
-
+    def __init__(self, device: str, threshold: float = 0.68, encoder=None) -> None:
         self.device = device
         self.threshold = threshold
-        self.encoder = VoiceEncoder(device=device)
+        if encoder is None:
+            from resemblyzer import VoiceEncoder
+
+            encoder = VoiceEncoder(device=device)
+        self.encoder = encoder
         self.clusters: list[np.ndarray] = []
         self.counts: list[int] = []
         self.last_speaker = 1

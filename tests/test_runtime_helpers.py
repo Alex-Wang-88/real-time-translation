@@ -91,6 +91,120 @@ def test_runtime_forces_multilingual_transcribe_task() -> None:
     assert runtime.asr.kwargs["multilingual"] is True
 
 
+def test_runtime_does_not_force_previous_language_into_whisper() -> None:
+    class Info:
+        language = "zh"
+        language_probability = 0.91
+
+    class Segment:
+        start = 0.0
+        end = 1.0
+        text = "中文内容"
+
+    class ASR:
+        def __init__(self):
+            self.kwargs = None
+
+        def transcribe(self, audio, **kwargs):
+            self.kwargs = kwargs
+            return iter([Segment()]), Info()
+
+    runtime = LiveModelRuntime("large-v3-turbo", "translation", "cpu")
+    runtime.ready = True
+    runtime.asr = ASR()
+    runtime._recognize(
+        np.zeros(16000, dtype=np.int16).tobytes(),
+        "",
+        None,
+        False,
+        language_hint="pt",
+    )
+    assert runtime.asr.kwargs["language"] is None
+
+
+def test_funasr_primary_route_accepts_supported_language_without_whisper() -> None:
+    class FunASR:
+        def generate(self, **kwargs):
+            assert kwargs["batch_size"] == 1
+            assert kwargs["itn"] is True
+            return [
+                {
+                    "text": "你好，世界",
+                    "language": "zh",
+                    "confidence": 0.93,
+                }
+            ]
+
+    class Whisper:
+        def transcribe(self, *_args, **_kwargs):
+            raise AssertionError("supported FunASR input should not reach Whisper")
+
+    runtime = LiveModelRuntime("funasr-nano", "translation", "cpu")
+    runtime.ready = True
+    runtime.fun_asr = FunASR()
+    runtime.asr = Whisper()
+    segments, language, confidence, model = runtime._recognize(
+        np.zeros(16000, dtype=np.int16).tobytes(),
+        "最近一句",
+        None,
+        False,
+    )
+
+    assert [segment.text for segment in segments] == ["你好，世界"]
+    assert language == "zh"
+    assert confidence == 0.93
+    assert model == "funasr"
+
+
+@pytest.mark.parametrize(
+    ("refine_model", "refinement_enabled", "expected_loads"),
+    [
+        ("large-v3-turbo", True, 1),
+        # The low-priority refine model is lazy-loaded after recording so it
+        # cannot compete with realtime ASR during startup.
+        ("large-v3", True, 1),
+        ("large-v3", False, 1),
+    ],
+)
+def test_runtime_deduplicates_identical_asr_weights(
+    monkeypatch,
+    refine_model: str,
+    refinement_enabled: bool,
+    expected_loads: int,
+) -> None:
+    import faster_whisper
+    import realtime_meeting.runtime as runtime_module
+    import resemblyzer
+
+    loaded: list[str] = []
+
+    class ASR:
+        def __init__(self, name, **_kwargs):
+            loaded.append(name)
+
+    class Translator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class Encoder:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(faster_whisper, "WhisperModel", ASR)
+    monkeypatch.setattr(runtime_module, "LiveChineseTranslator", Translator)
+    monkeypatch.setattr(resemblyzer, "VoiceEncoder", Encoder)
+    monkeypatch.setattr(LiveModelRuntime, "_warmup", lambda self: None)
+    runtime = LiveModelRuntime(
+        "large-v3-turbo", "translation", "cpu", refine_model, refinement_enabled
+    )
+    runtime.load()
+    assert len(loaded) == expected_loads
+    if refine_model == "large-v3-turbo":
+        assert runtime.refine_asr is runtime.asr
+    elif refinement_enabled:
+        assert runtime.refine_asr is None
+
+
 def test_nllb_mapping_covers_whispers_supported_languages_except_known_gaps() -> None:
     unsupported = {"br", "haw", "la"}
     assert unsupported.isdisjoint(NLLB_CODES)

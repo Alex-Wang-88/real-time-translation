@@ -1,7 +1,7 @@
 """Text normalization used for the Chinese source line.
 
 Whisper sometimes emits Traditional Chinese even when the meeting language is
-Chinese.  The desktop client and exported originals are specified as
+Chinese.  The Web client and exported originals are specified as
 Simplified Chinese, so normalize the source before it is stored or rendered.
 OpenCC provides the complete conversion table; the small fallback keeps the
 application safe if an old environment has not installed the optional wheel
