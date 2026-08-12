@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -12,8 +13,15 @@ from realtime_meeting.runtime import LiveChineseTranslator, choose_device
 
 
 def main() -> None:
-    audio = Path("result/meetings/db70e5e4-ae54-4bb8-b46c-0a756852277f/audio/audio-0001.flac")
-    device, compute_type = choose_device("auto")
+    parser = argparse.ArgumentParser(description="Run local ASR, VAD and translation smoke checks")
+    parser.add_argument("audio", type=Path, help="Existing speech audio file used for ASR and VAD")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--translation-root", type=Path, default=Path("models/opus-mt"))
+    args = parser.parse_args()
+    audio = args.audio.resolve()
+    if not audio.is_file():
+        parser.error(f"audio file does not exist: {audio}")
+    device, compute_type = choose_device(args.device)
     print(json.dumps({"device": device, "compute_type": compute_type}, ensure_ascii=True))
 
     for model_name, repository in (
@@ -69,7 +77,7 @@ def main() -> None:
     vad_result = vad.generate(input=str(audio))
     print(json.dumps({"vad_inference_seconds": round(time.perf_counter() - started, 3), "vad_result": vad_result}, ensure_ascii=True))
 
-    translator = LiveChineseTranslator(Path("models/opus-mt"), device)
+    translator = LiveChineseTranslator(args.translation_root, device)
     assets = translator.preflight()
     print(json.dumps({"translation_assets": assets}, ensure_ascii=True))
     for source, sentence in (

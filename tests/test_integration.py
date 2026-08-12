@@ -262,6 +262,14 @@ async def test_unsupported_translation_leaves_translation_empty(session: LiveMee
     await session.request_stop("user")
     await wait_until(session, lambda: session.recording_state == "complete")
     path = session.output_dir / "transcript.jsonl"
+    await wait_until(
+        session,
+        lambda: all(
+            item.translation_status != "pending"
+            for item in load_utterances(path)
+            if item.language != "zh"
+        ),
+    )
     utterances = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert utterances, "应当有转写内容"
     for item in utterances:

@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from realtime_meeting.config import Settings
+from realtime_meeting.exporter import append_utterance
+from realtime_meeting.models import Utterance
 from realtime_meeting.server import create_app
 from realtime_meeting.storage import LocalMeetingStore
 
@@ -72,3 +74,31 @@ def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> N
         deleted = client.delete(f"/api/v2/meetings/{meeting_id}", headers=headers)
         assert deleted.status_code == 200
         assert client.get(f"/api/v2/meetings/{meeting_id}", headers=headers).status_code == 404
+
+
+def test_browser_session_cookie_authenticates_api(tmp_path) -> None:
+    settings = Settings(host="0.0.0.0", api_token="browser-secret", results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
+    with TestClient(app) as client:
+        assert client.get("/api/v2/health").status_code == 401
+        assert client.post("/api/v2/auth/session", json={"token": "wrong"}).status_code == 401
+        login = client.post("/api/v2/auth/session", json={"token": "browser-secret"})
+        assert login.status_code == 204
+        assert "HttpOnly" in login.headers["set-cookie"] and "SameSite=strict" in login.headers["set-cookie"]
+        assert client.get("/api/v2/health").status_code == 200
+        assert client.post("/api/v2/meetings", json={"title": "浏览器鉴权"}).status_code == 201
+
+
+def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
+    settings = Settings(results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
+    with TestClient(app) as client:
+        created = client.post("/api/v2/meetings", json={"title": "长会议"}).json()
+        meeting = app.state.manager.get(created["id"])
+        assert meeting is not None
+        for index in range(501):
+            append_utterance(meeting.transcript_path, Utterance(index + 1, float(index), float(index + 1), 1, "zh", 1.0, f"发言{index}", segment_id=f"{index}:0"))
+        first = client.get(f"/api/v2/meetings/{meeting.id}/transcript?offset=0&limit=500").json()
+        second = client.get(f"/api/v2/meetings/{meeting.id}/transcript?offset=500&limit=500").json()
+        assert first["total"] == 501 and first["has_more"] is True and len(first["items"]) == 500
+        assert second["has_more"] is False and [item["text"] for item in second["items"]] == ["发言500"]

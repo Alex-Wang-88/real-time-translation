@@ -131,10 +131,24 @@ function markdownToHtml(markdown) {
 }
 
 async function requestJson(path, options = {}) {
+  const { authRetried = false, ...fetchOptions } = options;
   const response = await fetch(path, {
-    ...options,
+    ...fetchOptions,
+    credentials: "same-origin",
     headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) },
   });
+  if (response.status === 401 && path !== "/api/v2/auth/session" && !authRetried) {
+    const token = window.prompt("此会议服务需要访问令牌：");
+    if (!token) throw new Error("需要有效的会议服务访问令牌");
+    const login = await fetch("/api/v2/auth/session", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (!login.ok) throw new Error("访问令牌无效");
+    return requestJson(path, { ...options, authRetried: true });
+  }
   const text = await response.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch { payload = { detail: text }; }
@@ -377,6 +391,18 @@ async function loadMeetings() {
   renderMeetings();
 }
 
+async function loadFullTranscript(id) {
+  let offset = 0;
+  const limit = 1000;
+  while (state.meeting?.id === id) {
+    const page = await requestJson(`/api/v2/meetings/${encodeURIComponent(id)}/transcript?offset=${offset}&limit=${limit}`);
+    for (const item of page.items || []) upsertUtterance(item);
+    offset += (page.items || []).length;
+    if (!page.has_more || !(page.items || []).length) break;
+  }
+  if (state.meeting?.id === id) renderTranscript();
+}
+
 async function refreshCurrentMeeting() {
   if (!state.meeting || ["recording", "finalizing"].includes(state.meeting.recording_state)) return;
   try {
@@ -396,6 +422,7 @@ async function selectMeeting(id) {
     if (oldId !== id) closeStream(false);
     state.meeting = null;
     applySnapshot(snapshot, true);
+    await loadFullTranscript(snapshot.id);
     // The stream transports live audio and realtime events. Once recording has
     // finished, post-processing progress is delivered by the existing snapshot
     // polling instead of keeping an unnecessary websocket alive.

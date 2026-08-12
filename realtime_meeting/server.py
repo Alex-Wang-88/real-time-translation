@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -29,6 +29,10 @@ class MeetingCreate(BaseModel):
 
 class DeviceSwitch(BaseModel):
     device: str = Field(default="auto", pattern="^(auto|cpu|cuda)$")
+
+
+class BrowserLogin(BaseModel):
+    token: str = Field(min_length=1, max_length=4096)
 
 
 def create_app(
@@ -60,6 +64,13 @@ def create_app(
     active_runtime = runtime or build_runtime(config.device)
     repository = store or LocalMeetingStore(config.results_dir)
     manager = SessionManager(config, active_runtime, repository)
+
+    def purge_browser_sessions() -> None:
+        now = time.time()
+        for session_id, expires_at in tuple(app.state.browser_sessions.items()):
+            if expires_at <= now:
+                app.state.browser_sessions.pop(session_id, None)
+
     def authenticate_request(request: Request) -> str:
         if not config.api_auth_required:
             return "local"
@@ -71,6 +82,11 @@ def create_app(
             provided = provided[7:].strip()
         if not provided:
             provided = request.headers.get("x-meeting-token", "")
+        if not provided:
+            purge_browser_sessions()
+            session_id = request.cookies.get("meeting_session", "")
+            if session_id and app.state.browser_sessions.get(session_id, 0) > time.time():
+                return "browser"
         if not provided or not hmac.compare_digest(provided, expected):
             raise HTTPException(status_code=401, detail="需要有效的会议服务访问令牌")
         return "local"
@@ -155,10 +171,34 @@ def create_app(
     app.state.model_error = None
     app.state.model_message = getattr(active_runtime, "status", "等待加载")
     app.state.stream_tickets: dict[str, tuple[str, float]] = {}
+    app.state.browser_sessions: dict[str, float] = {}
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
         return FileResponse(web_dir / "index.html")
+
+    @app.post("/api/v2/auth/session", status_code=status.HTTP_204_NO_CONTENT)
+    async def browser_login(body: BrowserLogin, request: Request, response: Response) -> Response:
+        expected = config.api_token.strip()
+        if not config.api_auth_required:
+            response.status_code = status.HTTP_204_NO_CONTENT
+            return response
+        if not expected or not hmac.compare_digest(body.token.strip(), expected):
+            raise HTTPException(status_code=401, detail="访问令牌无效")
+        purge_browser_sessions()
+        session_id = secrets.token_urlsafe(32)
+        app.state.browser_sessions[session_id] = time.time() + 12 * 60 * 60
+        response.set_cookie(
+            "meeting_session",
+            session_id,
+            max_age=12 * 60 * 60,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path="/",
+        )
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
 
     @app.get("/health/live", include_in_schema=False)
     async def liveness() -> dict[str, str]:
@@ -237,6 +277,25 @@ def create_app(
     @app.get("/api/v2/meetings/{meeting_id}")
     async def get_meeting(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, Any]:
         return require_meeting(meeting_id).snapshot()
+
+    @app.get("/api/v2/meetings/{meeting_id}/transcript")
+    async def get_transcript(
+        meeting_id: str,
+        offset: int = 0,
+        limit: int = 500,
+        _principal: str = Depends(authenticate_request),
+    ) -> dict[str, Any]:
+        meeting = require_meeting(meeting_id)
+        safe_offset = max(0, offset)
+        safe_limit = min(1000, max(1, limit))
+        items = meeting.load_transcript()
+        return {
+            "items": [item.to_dict() for item in items[safe_offset:safe_offset + safe_limit]],
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "total": len(items),
+            "has_more": safe_offset + safe_limit < len(items),
+        }
 
     @app.delete("/api/v2/meetings/{meeting_id}")
     async def delete_meeting(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, Any]:

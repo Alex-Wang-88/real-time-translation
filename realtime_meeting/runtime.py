@@ -667,7 +667,26 @@ class LiveModelRuntime:
     def _audio(pcm: bytes) -> np.ndarray:
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _whisper(self, pcm: bytes, model: Any, *, refine: bool = False) -> tuple[str, str | None, float]:
+    @staticmethod
+    def _asr_prompt(recent_text: str = "", hotwords: str | None = None) -> str | None:
+        """Build a bounded Whisper prompt from meeting vocabulary and recent context."""
+        vocabulary = " ".join(str(hotwords or "").split())[:1000]
+        context = " ".join(str(recent_text or "").split())[-500:]
+        parts = []
+        if vocabulary:
+            parts.append(f"专业词和姓名：{vocabulary}")
+        if context:
+            parts.append(f"最近内容：{context}")
+        return "\n".join(parts) or None
+
+    def _whisper(
+        self,
+        pcm: bytes,
+        model: Any,
+        *,
+        refine: bool = False,
+        prompt: str | None = None,
+    ) -> tuple[str, str | None, float]:
         if model is None:
             return "", None, 0.0
         segments, info = model.transcribe(
@@ -675,13 +694,21 @@ class LiveModelRuntime:
             beam_size=5 if refine else 1,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=prompt or None,
         )
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
         language = getattr(info, "language", None)
         probability = float(getattr(info, "language_probability", 0.0) or 0.0)
         return text, language, probability
 
-    def _recognize(self, pcm: bytes, *, refine: bool = False) -> tuple[str, LanguageGuess, float, str, str]:
+    def _recognize(
+        self,
+        pcm: bytes,
+        *,
+        refine: bool = False,
+        recent_text: str = "",
+        hotwords: str | None = None,
+    ) -> tuple[str, LanguageGuess, float, str, str]:
         self.last_asr_error = None
         self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
         model = self._ensure_refine_model() if refine else self.primary
@@ -691,9 +718,13 @@ class LiveModelRuntime:
         try:
             if self.device == "cuda":
                 with self.gpu_manager.acquire_sync("asr_refine" if refine else "asr_realtime"):
-                    text, language, confidence = self._whisper(pcm, model, refine=refine)
+                    text, language, confidence = self._whisper(
+                        pcm, model, refine=refine, prompt=self._asr_prompt(recent_text, hotwords)
+                    )
             else:
-                text, language, confidence = self._whisper(pcm, model, refine=refine)
+                text, language, confidence = self._whisper(
+                    pcm, model, refine=refine, prompt=self._asr_prompt(recent_text, hotwords)
+                )
             guess = self.detector.detect(text, whisper_language=language, whisper_confidence=confidence)
             self.metrics["asr_calls"] = int(self.metrics.get("asr_calls", 0)) + 1
             return text, guess, confidence, model_name, "asr" if language else "detector"
@@ -726,7 +757,9 @@ class LiveModelRuntime:
             return self.refine
 
     def transcribe_partial(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
-        text, guess, confidence, model, language_source = self._recognize(event.pcm)
+        text, guess, confidence, model, language_source = self._recognize(
+            event.pcm, recent_text=recent_text, hotwords=hotwords
+        )
         return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
 
     def transcribe_draft(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
@@ -743,7 +776,9 @@ class LiveModelRuntime:
         speaker_clusterer: OnlineSpeakerClusterer | None = None,
         refined: bool = True,
     ) -> list[Utterance]:
-        text, whisper_guess, confidence, model, language_source = self._recognize(event.pcm, refine=refined)
+        text, whisper_guess, confidence, model, language_source = self._recognize(
+            event.pcm, refine=refined, recent_text=recent_text, hotwords=hotwords
+        )
         if not text:
             if refined and self.last_asr_error:
                 raise RuntimeError(

@@ -7,7 +7,7 @@ Create a JSON fixture with `samples`. Each sample can contain `audio`,
 Run the dependency-free regression report with:
 
 ```powershell
-\.venv\Scripts\python.exe scripts\benchmark.py tests\fixtures\benchmark.json --output result\benchmark.json
+.\.venv\Scripts\python.exe scripts\benchmark.py tests\fixtures\benchmark.json --output result\benchmark.json
 ```
 
 The report records WER/CER-style error rate, chrF-style translation overlap,
@@ -20,3 +20,11 @@ should also record the fixed Resemblyzer parameters (16 kHz input,
 weight size, and whether overlap metadata was produced. Resemblyzer is the only
 speaker-separation implementation; it does not provide a dedicated overlap
 model, so DER/JER fixtures must make that product boundary explicit.
+
+The checked-in fixture verifies the metric pipeline only. For a real local
+model smoke run, provide an existing speech recording explicitly; the script
+never depends on a historical meeting ID:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_test_local_models.py .\samples\speech.wav --device auto
+```

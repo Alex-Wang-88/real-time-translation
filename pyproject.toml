@@ -54,3 +54,13 @@ realtime_meeting = ["web/*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+filterwarnings = [
+  # Treat every other deprecation as a test failure so new warnings stay visible.
+  "error::DeprecationWarning",
+  # Resemblyzer 0.1.4 still imports SciPy's legacy morphology namespace.
+  "ignore:Please import `binary_dilation` from the `scipy.ndimage` namespace.*:DeprecationWarning:resemblyzer\\.audio",
+  # audioread imports Python 3.11 stdlib modules scheduled for removal in 3.13.
+  "ignore:'aifc' is deprecated and slated for removal in Python 3.13:DeprecationWarning:audioread\\.rawread",
+  "ignore:'audioop' is deprecated and slated for removal in Python 3.13:DeprecationWarning:audioread\\.rawread",
+  "ignore:'sunau' is deprecated and slated for removal in Python 3.13:DeprecationWarning:audioread\\.rawread",
+]

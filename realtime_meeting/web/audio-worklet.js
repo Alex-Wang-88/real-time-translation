@@ -6,6 +6,8 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     this.packetSamples = opts.packetSamples || 640;
     this.inputRate = sampleRate;
     this.output = [];
+    this.resampleInput = [];
+    this.resamplePosition = 0;
     this.sequence = 0;
     this.port.postMessage({ type: "ready", inputRate: this.inputRate, targetRate: this.targetRate });
   }
@@ -23,14 +25,20 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     for (const value of mono) sum += value * value;
     this.port.postMessage({ type: "level", value: Math.min(1, Math.sqrt(sum / Math.max(1, mono.length)) * 3) });
     const ratio = this.inputRate / this.targetRate;
-    const outputLength = Math.floor(mono.length / ratio);
-    for (let index = 0; index < outputLength; index += 1) {
-      const position = index * ratio;
+    this.resampleInput.push(...mono);
+    while (this.resamplePosition + 1 < this.resampleInput.length) {
+      const position = this.resamplePosition;
       const left = Math.floor(position);
-      const right = Math.min(left + 1, mono.length - 1);
+      const right = left + 1;
       const fraction = position - left;
-      const sample = mono[left] * (1 - fraction) + mono[right] * fraction;
+      const sample = this.resampleInput[left] * (1 - fraction) + this.resampleInput[right] * fraction;
       this.output.push(Math.max(-1, Math.min(1, sample)));
+      this.resamplePosition += ratio;
+    }
+    const consumed = Math.floor(this.resamplePosition);
+    if (consumed) {
+      this.resampleInput.splice(0, consumed);
+      this.resamplePosition -= consumed;
     }
     while (this.output.length >= this.packetSamples) {
       const packet = this.output.splice(0, this.packetSamples);
@@ -49,4 +57,3 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor("meeting-capture-processor", MeetingCaptureProcessor);
-

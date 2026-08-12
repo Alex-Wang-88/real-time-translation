@@ -272,6 +272,9 @@ class LiveMeetingSession:
             "model_metadata": self.model_metadata,
         }
 
+    def load_transcript(self) -> list[Utterance]:
+        return sorted(load_utterances(self.transcript_path), key=lambda item: (item.start, item.end, item.id))
+
     async def start(self) -> None:
         if self.recording_state not in {"starting", "recording"}:
             return

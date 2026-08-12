@@ -15,9 +15,10 @@
 要求 Python 3.11、Chrome 或 Edge。PowerShell 中执行：
 
 ```powershell
-Set-Location C:\Users\12992\Desktop\work\code\real-time-translation-v2
 .\start.ps1
 ```
+
+也可以在项目目录中双击 `启动会记.cmd`。两个启动方式都以启动文件所在目录为项目根目录，不依赖固定盘符或用户名。
 
 首次启动脚本会创建 `.venv`、安装基础依赖和音频依赖，并从 `.env.example` 创建 `.env`。启动后打开 <http://127.0.0.1:8765>。
 

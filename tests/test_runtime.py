@@ -59,3 +59,30 @@ def test_opus_mt_repository_and_target_tags_are_explicit() -> None:
     assert opus_mt_repository("en") == "Helsinki-NLP/opus-mt-en-zh"
     assert opus_mt_repository("de") == "Helsinki-NLP/opus-mt-de-ZH"
     assert OPUS_MT_TARGET_TAGS == {"en": ">>cmn_Hans<<", "de": ">>zh_cn<<"}
+
+
+def test_whisper_receives_bounded_hotwords_and_recent_context(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+
+    class Info:
+        language = "en"
+        language_probability = 0.9
+
+    class Model:
+        def __init__(self) -> None:
+            self.kwargs = {}
+
+        def transcribe(self, _audio, **kwargs):
+            self.kwargs = kwargs
+            return iter(()), Info()
+
+    model = Model()
+    runtime._whisper(b"\x00\x00" * 20, model, prompt=runtime._asr_prompt("previous decision", "Codex, Luna"))
+    assert model.kwargs["initial_prompt"] == "专业词和姓名：Codex, Luna\n最近内容：previous decision"
+    assert len(runtime._asr_prompt("x" * 1000, "y" * 2000) or "") <= 1520
