@@ -587,7 +587,7 @@ class LiveMeetingSession:
                 )
 
     async def request_stop(self, reason: str = "user") -> None:
-        if self.stop_task is None:
+        if self.stop_task is None or self.stop_task.done():
             self.stop_task = asyncio.create_task(self._finalize(reason), name=f"finalize-{self.id}")
         await asyncio.sleep(0)
 
@@ -642,6 +642,15 @@ class LiveMeetingSession:
             postprocess=self.postprocess.to_dict(),
             model_metadata=self.model_metadata,
         )
+
+    def _delete_audio_if_unretained(self) -> None:
+        if self.settings.keep_audio:
+            return
+        audio_dir = (self.output_dir / "audio").resolve()
+        audio_dir.relative_to(self.output_dir.resolve())
+        if audio_dir.exists():
+            shutil.rmtree(audio_dir)
+        self.audio_segments = []
 
     async def _warm_realtime_after_postprocess(self) -> None:
         warm_realtime = getattr(self.runtime, "warm_realtime", None)
@@ -764,6 +773,10 @@ class LiveMeetingSession:
             self._export_current_files()
             if self.postprocess.stages.get("diarization", {}).get("state") != "complete":
                 await self._run_diarization()
+            # Diarization is the final stage that needs the retained recording.
+            # Keep it available for retries until that stage succeeds, then
+            # honour MEETING_KEEP_AUDIO without weakening speaker alignment.
+            self._delete_audio_if_unretained()
             self._export_current_files()
             release_postprocess = getattr(self.runtime, "release_postprocess_models", None)
             if release_postprocess:
@@ -836,12 +849,6 @@ class LiveMeetingSession:
             await self.worker_task
         if self.audio_writer:
             self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
-        if not self.settings.keep_audio:
-            audio_dir = (self.output_dir / "audio").resolve()
-            audio_dir.relative_to(self.output_dir.resolve())
-            if audio_dir.exists():
-                shutil.rmtree(audio_dir)
-            self.audio_segments = []
         self.disconnect_stop_task = None
         self.ended_at = utc_now_iso()
         self.recording_state = "complete"
@@ -869,9 +876,36 @@ class LiveMeetingSession:
         await self.broadcast("recording_complete", meeting=self.snapshot())
         if items:
             self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"postprocess-{self.id}")
+        else:
+            self._delete_audio_if_unretained()
+            self._export_current_files()
+            self._write_state()
 
     async def _finalize(self, reason: str) -> None:
-        await self._finalize_fast(reason)
+        try:
+            await self._finalize_fast(reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.error = str(exc)
+            if self.worker_task and not self.worker_task.done():
+                self.worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.worker_task
+            if self.audio_writer:
+                with suppress(Exception):
+                    self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
+            self.ended_at = self.ended_at or utc_now_iso()
+            self.recording_state = "error"
+            self.disconnect_stop_task = None
+            self._write_state()
+            await self.broadcast(
+                "error",
+                code="finalize_failed",
+                message=self.error,
+                retryable=False,
+            )
+            await self.status("会议保存失败，可删除本次会议后重新开始", reason=reason)
 
     def begin_summary(self) -> bool:
         preprocessing_ready = all(
@@ -1111,7 +1145,12 @@ class SessionManager:
             raise CapacityLimitError("当前已达到实时会议并发上限")
         session = LiveMeetingSession(self.settings, self.runtime, self.store, title=title or "未命名会议", hotwords=hotwords)
         self.sessions[session.id] = session
-        await session.start()
+        try:
+            await session.start()
+        except Exception:
+            self.sessions.pop(session.id, None)
+            self.store.delete(session.id)
+            raise
         return session
 
     async def delete(self, meeting_id: str) -> bool:
@@ -1124,11 +1163,21 @@ class SessionManager:
         self.store.delete(meeting_id)
         return True
 
-    async def resume_pending(self) -> None:
+    async def resume_pending(self, *, model_tasks_ready: bool = True) -> None:
         for session in self.sessions.values():
-            if session.todo_state == "queued" and session.summary_state == "complete" and session.summary.strip():
+            if (
+                session.todo_state == "queued"
+                and session.summary_state == "complete"
+                and session.summary.strip()
+                and (session.todo_task is None or session.todo_task.done())
+            ):
                 session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")
-            elif session.postprocess.state in {"queued", "running"} and session.recording_state == "complete":
+            elif (
+                model_tasks_ready
+                and session.postprocess.state in {"queued", "running"}
+                and session.recording_state == "complete"
+                and (session.postprocess_task is None or session.postprocess_task.done())
+            ):
                 session.postprocess_task = asyncio.create_task(session.run_postprocess(), name=f"recover-postprocess-{session.id}")
             elif session.summary_state == "queued" and session.recording_state == "complete":
                 # Older versions queued summaries automatically. Migration keeps

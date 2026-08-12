@@ -31,7 +31,7 @@
   --shadow-lg: 0 24px 70px rgba(18, 33, 30, .22);
   --ring: 0 0 0 3px var(--accent-glow);
 
-  --font: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
 
   --ease: cubic-bezier(.22, .9, .3, 1);

@@ -71,7 +71,7 @@ Jimo 请求继续使用旧版兼容格式：`messages`、`sessionId`、`source: 
 
 `transcript.jsonl`、`transcript.json`、`transcript_events.jsonl`、`speaker_segments.json`、`meeting_transcript.md`、`translated_zh.md`、`original_zh.md`、`original_en.md`、`original_de.md`、`meeting_minutes.md`、`todo_list.json`、`todo_list.md`、`audio/`、`audio_manifest.json`、`manifest.json` 和 `session_state.json`。
 
-默认保留完整会议结果 30 天，服务启动时会删除超过 `MEETING_RETENTION_DAYS` 的已结束会议目录；设为 `0` 可关闭自动过期删除。设置 `MEETING_KEEP_AUDIO=0` 可在停止会议后立即删除录音，但保留转写、精修、纪要和 To-do-list 等结果。
+默认保留完整会议结果 30 天，服务启动时会删除超过 `MEETING_RETENTION_DAYS` 的已结束会议目录；设为 `0` 可关闭自动过期删除。设置 `MEETING_KEEP_AUDIO=0` 时，录音会暂时保留到 ASR 精修和说话人重排完成，随后自动删除；转写、精修、说话人结果、纪要和 To-do-list 会继续保留。后处理失败时会保留录音，以便重试。
 
 ## API
 
@@ -99,7 +99,7 @@ GET    /api/v2/meetings/{id}/files/{path}
 
 ## 并发边界
 
-本机默认 `MEETING_MAX_ACTIVE_MEETINGS=1`、`MEETING_GPU_WORKERS=1`、`MEETING_INFERENCE_QUEUE_SIZE=64`，针对 RTX 5060 Laptop 8 GB / 32 GB 内存的单会议稳定运行目标。队列有界，音频包、WebSocket ticket、文件下载和会议 ID 均有校验。WebSocket 短暂断线保留 15 秒恢复窗口，恢复窗口后仍无客户端才自动结束会议。
+本机默认 `MEETING_MAX_ACTIVE_MEETINGS=1`、`MEETING_INFERENCE_QUEUE_SIZE=64`、`MEETING_REFINEMENT_QUEUE_SIZE=16`，针对 RTX 5060 Laptop 8 GB / 32 GB 内存的单会议稳定运行目标。当前实现使用单个进程内 GPU 资源锁串行执行重任务，不提供可配置的 worker pool 或显存硬配额。队列有界，音频包、WebSocket ticket、文件下载和会议 ID 均有校验。WebSocket 短暂断线保留 15 秒恢复窗口，恢复窗口后仍无客户端才自动结束会议。
 
 企业部署的第一阶段基线是 10 路同时会议，但不把它当作单张 GPU 的承诺容量。应使用目标 GPU、中文/英文/德文混合音频和 30 分钟会议压测，确认安全流数。扩展拓扑、容量指标和切换点见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 

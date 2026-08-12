@@ -401,7 +401,6 @@ class LiveModelRuntime:
         translation_model_root: Path | None = None,
         translation_autodownload: bool = False,
         vad_model: str = "fsmn-vad",
-        gpu_memory_budget_mb: int = 7200,
         diarization_required: bool = True,
     ) -> None:
         self.asr_primary_name = asr_primary or asr_fallback or "large-v3-turbo"
@@ -413,7 +412,6 @@ class LiveModelRuntime:
         self.translation_model_root = translation_model_root
         self.translation_autodownload = translation_autodownload
         self.vad_model_name = vad_model
-        self.gpu_memory_budget_mb = gpu_memory_budget_mb
         self.diarization_required = diarization_required
         self.device = "cpu"
         self.compute_type = "int8"

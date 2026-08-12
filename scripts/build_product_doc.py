@@ -541,25 +541,47 @@ def add_source(doc: Document, title: str, url: str, note: str) -> None:
 
 def add_model_inventory(doc: Document) -> None:
     add_heading(doc, "模型、参数与部署清单", 2)
-    add_para(doc, "以下数据以 2026-08-12 本机实际运行环境、代码常量、模型元数据和实际推理结果为准。Whisper 同时列出 refs/main 当前快照大小与本机 HF cache 目录总量；large-v3 目录总量包含旧快照，不把缓存大小当成跨平台下载包大小承诺。OPUS-MT 已下载并转换为项目内 CTranslate2 int8 模型，VAD 也已完成真实加载和推理验证。")
+    add_para(doc, "以下数据以 2026-08-13 本机实际模型文件、代码常量和模型配置为准。参数量表示模型复杂度，磁盘大小表示当前量化/转换格式的本机占用，两者不能互相替代；不同平台、量化方式和缓存版本会造成文件大小差异。")
     add_matrix_table(
         doc,
         ["阶段", "实际模型/实现", "关键参数", "当前本机大小/状态"],
         [
-            ["实时 ASR", "faster-whisper；mobiuslabsgmbh/faster-whisper-large-v3-turbo（large-v3-turbo，809M 参数）", "WhisperModel；CUDA 时 int8_float16，CPU 时 int8；transcribe beam_size=1、vad_filter=False、condition_on_previous_text=False；常驻，停止后释放", "当前快照 1,621,665,983 B（1.51 GiB）；cache 目录 1,621,667,008 B；已缓存"],
-            ["会后 ASR 精修", "faster-whisper；Systran/faster-whisper-large-v3（large-v3，1,550M 参数）", "CUDA 时 int8_float16、CPU 时 int8；transcribe beam_size=5、vad_filter=False、condition_on_previous_text=False；停录保存后按需加载；与实时 ASR、说话人处理共用 GPU 锁串行", "当前快照 3,090,835,702 B（2.88 GiB）；cache 目录 5,229,931,767 B（4.87 GiB，含旧快照）；已缓存"],
-            ["VAD/实时分段", "FunASR AutoModel；funasr/fsmn-vad（FSMN）", "torchaudio 2.11.0+cu128；优先使用 Hugging Face 本地 snapshot；trust_remote_code=True；disable_update=True；CUDA 使用 cuda:0；浏览器输入 16 kHz mono PCM16；预滚动 240 ms、开始 80 ms、静音结束 350 ms、partial 900 ms、单段上限 8 s", "模型已缓存并在 CUDA 上真实加载；17.16 秒测试音频返回 2 个语音区间，VAD 推理约 0.20 秒；状态 ready"],
+            ["实时 ASR", "faster-whisper；mobiuslabsgmbh/faster-whisper-large-v3-turbo（large-v3-turbo，约 809M 参数）", "WhisperModel；CUDA 时 int8_float16，CPU 时 int8；transcribe beam_size=1、vad_filter=False、condition_on_previous_text=False；录音期间常驻，停止后释放", "当前 CTranslate2 快照 1,621,665,983 B（1.51 GiB）；已缓存"],
+            ["会后 ASR 精修", "faster-whisper；Systran/faster-whisper-large-v3（large-v3，约 1,550M 参数）", "CUDA 时 int8_float16、CPU 时 int8；transcribe beam_size=5、vad_filter=False、condition_on_previous_text=False；停录保存后按需加载；与其他 GPU 阶段串行", "当前 CTranslate2 快照 3,090,835,702 B（2.88 GiB）；已缓存"],
+            ["VAD/实时分段", "FunASR AutoModel；funasr/fsmn-vad（FSMN，428,738 参数）", "16 kHz；80 维 Mel，LFR 后输入维 400；4 层 FSMN；linear 250、projection 128；项目分段参数：预滚动 240 ms、开始 80 ms、静音结束 350 ms、partial 900 ms、单段上限 8 s", "模型权重 model.pt 1,721,366 B（1.64 MiB）；完整本机 snapshot 4,024,535 B（3.84 MiB）；ready"],
             ["语言识别", "Whisper 返回 language + language_probability 为主；文本规则与可选 Lingua 为后备", "ASR 语言置信度 ≥0.65 时优先采信；缺失/低置信度才进入中文字符、英德规则和 Lingua；正式范围 zh/en/de", "无独立语言大模型；置信度和 language_source 写入 Utterance"],
             ["说话人重排", "Resemblyzer voice encoder；本地 pretrained.pt；能量 VAD + embedding + cosine online clustering", "约 1,423,616 参数；16 kHz mono；能量帧 30 ms；最大静音间隔 250 ms；最短语音 350 ms；embedding context 1.6 s；hop 0.8 s；cluster threshold 0.68；重叠映射阈值 15%；匿名 speaker_1/...；无专门 overlap model", "17,090,379 B（16.30 MiB）；权重预检已就绪；运行时按需加载；唯一说话人实现，无授权、无运行时下载、无回退"],
-            ["本地翻译", "Helsinki-NLP/opus-mt-en-zh、Helsinki-NLP/opus-mt-de-ZH → CTranslate2 int8；SentencePiece", "Translator compute_type：CUDA int8_float16 / CPU int8；translate_batch beam_size=2、max_decoding_length=384、repetition_penalty=1.05；自动加入 Marian 目标语言标记和 EOS；批量和缓存；状态 ready/pending/not_needed/unsupported/failed", "models/opus-mt/en-zh 约 78.73 MiB、de-zh 约 76.92 MiB；model.bin、SentencePiece、metadata 均齐全；en/de 真实翻译冒烟通过"],
+            ["本地翻译", "Marian OPUS-MT → CTranslate2 int8；en→zh 77,943,296 参数；de→zh 76,363,776 参数", "两者均为 d_model=512、encoder 6 层、decoder 6 层；CUDA int8_float16 / CPU int8；beam_size=2、max_decoding_length=384、repetition_penalty=1.05；SentencePiece", "en→zh 82,552,022 B（78.73 MiB）；de→zh 80,656,414 B（76.92 MiB）；均已就绪"],
             ["纪要与 To-do", "Jimo SSE 外部服务；两个 share 节点分别承担 summary、todo", "客户端固定发送 messages、sessionId、source=api、extra={}；不在客户端注入 model/temperature；Authorization 仅服务端环境变量；总结按状态分块，To-do 读取已保存纪要", "外部模型名、temperature 由 Jimo 节点配置，不由当前代码实际注入；文档不把 README 示例当成客户端运行时事实"],
         ],
         [1500, 3000, 3300, 1560],
         body_size=8.0,
         header_size=8.4,
     )
+    add_para(doc, "本机必需本地模型合计约 4.56 GiB（按当前快照和项目转换目录求和，不含重复/旧缓存、Python/CUDA 依赖和积墨外部模型）。其中 Whisper 两套 ASR 约占 4.39 GiB，是主要磁盘占用。", style="Small Note")
     add_para(doc, "当前 HF refs/main：turbo=0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf；large-v3=edaa852ec7e145841d8ffdb056a99866b5f0a478。", style="Small Note")
-    add_para(doc, "部署环境（已核对）：Windows 11 家庭版（10.0.26200，x64，31.12 GiB RAM）；Python 3.11.14；FastAPI/Starlette/Uvicorn；faster-whisper 1.2.1；CTranslate2 4.8.1；FunASR 1.4.1；torchaudio 2.11.0+cu128；Resemblyzer 0.1.4；Lingua 2.1.1；SentencePiece 0.2.2；RTX 5060 Laptop GPU 8,151 MiB，驱动 610.88，CUDA 12.8，PyTorch 2.11.0+cu128，1 个 CUDA 设备；默认 MEETING_DEVICE=auto，MEETING_GPU_WORKERS=1，显存预算 7,200 MB，单活跃会议。", style="Small Note")
+    add_para(doc, "部署环境（已核对）：Windows 11 x64；AMD Ryzen AI 7 H 350（8 核 16 线程）；31.12 GiB RAM；RTX 5060 Laptop GPU 8,151 MiB，驱动 610.88；CUDA 12.8 / PyTorch 2.11.0+cu128；Python 3.11.14。默认 MEETING_DEVICE=auto、单活跃会议；GPU 重任务由单进程资源锁串行执行。", style="Small Note")
+
+    add_heading(doc, "部署资源配置建议", 2)
+    add_para(doc, "下表按当前单机架构给出部署口径。“已验证基线”是本机实际跑通环境；“最低可运行”只表示能够安装和执行，不代表实时延迟达标；生产发布前仍需使用目标机器和真实中英德混合音频做 30 分钟连续压测。")
+    add_matrix_table(
+        doc,
+        ["资源", "最低可运行（不承诺实时）", "推荐单机生产基线", "已验证本机 / 说明"],
+        [
+            ["CPU", "x64，至少 4 核 8 线程；CPU 模式可运行，但 large-v3 精修和本地翻译耗时可能明显增加", "8 核 16 线程或以上；GPU 推理时 CPU 仍负责 WebSocket、音频编解码、分段、文件与任务调度", "AMD Ryzen AI 7 H 350，8 核 16 线程；单活跃会议"],
+            ["系统内存", "16 GB；仅适合单会议、低并发和受控测试，需避免同时加载额外模型或大批量任务", "32 GB；为两套 Whisper、Python/CUDA 运行时、音频缓存和后处理留出余量", "31.12 GiB 可用物理内存；当前单会议基线"],
+            ["GPU", "可不配 GPU，使用 CPU int8；功能可运行但不承诺实时体验", "NVIDIA CUDA GPU，8 GB 显存或以上；驱动、CUDA 与 PyTorch wheel 必须匹配", "RTX 5060 Laptop GPU；CUDA 可用；单进程 GPU 资源锁串行调度"],
+            ["显存", "CPU 模式为 0；若启用 CUDA，不建议低于 8 GB", "8 GB 级；实时模型停止后释放，再加载 large-v3 精修，避免两套 ASR 同驻留", "物理显存 8,151 MiB；当前代码未实现显存硬配额"],
+            ["磁盘", "至少预留 15 GB 给程序、Python/CUDA 依赖和当前模型；录音/结果空间另计", "建议预留 20 GB 以上系统盘空间，并为 result/meetings 单独规划容量或对象存储", "必需模型约 4.56 GiB；当前 .venv 约 5.41 GiB；项目内 OPUS-MT 约 155.65 MiB；旧缓存会额外占用"],
+            ["系统与运行时", "Windows 10/11 x64；Python 3.11；Chrome 或 Edge；FFmpeg 建议安装", "Windows 11 x64；Python 3.11；CUDA 12.8 对应 PyTorch/torchaudio；生产关闭模型自动下载", "Windows 11；Python 3.11.14；CUDA 12.8；PyTorch/torchaudio 2.11.0+cu128"],
+            ["单机并发", "1 场；MEETING_MAX_ACTIVE_MEETINGS=1", "当前单进程基线 1 场。增加并发前必须压测；不能把 10 路目标理解为单张 8 GB GPU 的承诺", "默认 1 场活跃会议；实时与精修队列严格有界"],
+            ["网络", "本地 ASR、VAD、翻译和说话人重排可离线；首次准备模型时需要下载", "生产预下载并校验所有模型；仅纪要/To-do 使用积墨时需要访问外部 Jimo 节点", "生产建议 ASR_AUTODOWNLOAD=0、TRANSLATION_AUTODOWNLOAD=0"],
+        ],
+        [1300, 2600, 2800, 2660],
+        body_size=8.2,
+        header_size=8.5,
+    )
+    add_callout(doc, "容量边界", "企业第一阶段可以把 10 路同时会议作为压测目标，但当前单机产品基线仍是 1 路。多路部署应拆分为多个 GPU worker，并使用目标 GPU 测量首结果延迟、P50/P95、RTF、峰值显存、队列深度和恢复时间后再确定安全流数。", fill=PALE_GOLD, accent=GOLD)
 
 
 def build_document() -> None:
@@ -611,7 +633,7 @@ def build_document() -> None:
     add_callout(
         doc,
         "一句话定位",
-        "一套本地优先的实时会议系统：录音中提供低延迟多语言转写，停录后进行高精度精修、说话人重排、翻译、纪要和 To-do-list 生成；录音保存与后台后处理相互独立，任何后处理失败都不影响已保存的音频和快速转写。",
+        "一套本地优先的实时会议系统：录音中提供低延迟多语言转写；停录后自动完成高精度 ASR 精修、说话人重排和最终翻译，完成后由用户点击按钮生成纪要，并自动生成 To-do-list。录音保存与后台后处理相互独立，任何后处理失败都不影响已保存的音频和快速转写。",
         fill=LIGHT_TEAL,
         accent=TEAL,
     )
@@ -651,7 +673,7 @@ def build_document() -> None:
         doc,
         [
             ("实时可见", "不需要等整场会议结束才看到结果；通过 WebSocket 持续更新转写、语言和翻译状态。"),
-            ("保存优先", "停录后先完成音频、快速转写和 manifest 落盘，再异步进行精修和纪要；不再把“正在保存”与长时间后处理混为一谈。"),
+            ("保存优先", "停录后先完成音频、快速转写和 manifest 落盘，再异步进行 ASR 精修、说话人重排和最终翻译；三项完成后才开放“生成纪要和 To-do-list”按钮。"),
             ("结果可追溯", "TranscriptStore、transcript_events.jsonl、修订号、模型元数据和 speaker_segments.json 共同支撑结果审计与前端原地更新。"),
             ("故障可恢复", "后处理按阶段写入检查点；应用重启会把 running 任务重新排队，从最近完成阶段继续。"),
         ],
@@ -666,10 +688,10 @@ def build_document() -> None:
     add_callout(doc, "体验重点", "实时链路的目标不是在每个瞬间给出最终答案，而是持续给出可用的中间结果；最终质量由停录后的精修和说话人重排完成。", fill=PALE_GOLD, accent=GOLD)
 
     add_heading(doc, "2.2 录音已保存与后台后处理彻底解耦", 2)
-    add_para(doc, "这是产品体验的关键设计。录音状态 recording_state 只表示录音和快速结果是否已经落盘；postprocess 独立展示 ASR 精修、说话人重排、翻译、纪要和 To-do-list 的阶段状态。用户可以在录音已保存后立即查看和下载，后台任务即使排队、失败或需要重试，也不会让会议停留在无限期的“正在保存”。")
+    add_para(doc, "这是产品体验的关键设计。录音状态 recording_state 只表示录音和快速结果是否已经落盘；postprocess 独立展示 ASR 精修、说话人重排、翻译、纪要和 To-do-list 的阶段状态；前三项自动执行，纪要由用户按钮触发，成功后自动生成 To-do-list。用户可以在录音已保存后立即查看和下载，后台任务即使排队、失败或需要重试，也不会让会议停留在无限期的“正在保存”。")
 
     add_heading(doc, "2.3 会后精修与说话人重排", 2)
-    add_para(doc, "停录后按固定顺序执行：large-v3 ASR 精修 → Resemblyzer 声纹嵌入、能量 VAD 与余弦相似度聚类 → 将说话人时间段与转写句子按重叠比例对齐 → 使用最终文本批量翻译 → 积墨纪要 → To-do-list。实时阶段仅显示匿名“演讲人 1/2/…”，会后按照首次出现顺序稳定编号并原地更新。暂不做实名声纹录入和参与者身份绑定。")
+    add_para(doc, "停录后自动按固定顺序执行：large-v3 ASR 精修 → Resemblyzer 声纹嵌入、能量 VAD 与余弦相似度聚类 → 将说话人时间段与转写句子按重叠比例对齐 → 使用最终文本批量翻译。自动阶段全部完成后，用户点击按钮生成积墨纪要；纪要原子保存成功后自动生成 To-do-list。实时阶段仅显示匿名“演讲人 1/2/…”，会后按照首次出现顺序稳定编号并原地更新。暂不做实名声纹录入和参与者身份绑定。")
 
     add_heading(doc, "2.4 版本化结果，而不是覆盖式写文件", 2)
     add_para(doc, "精修可能改变句子数量、边界和说话人标签。系统通过稳定的 source_segment_id、revision、删除/替换事件和兼容旧字段的 Utterance 结构，避免旧句子残留在前端；历史会议仍可读取 transcript.json、transcript.jsonl、meeting_transcript.md、translated_zh.md 和 manifest.json。")
@@ -683,7 +705,7 @@ def build_document() -> None:
         "会前预检：确认 large-v3-turbo、large-v3、OPUS-MT、VAD 和 Resemblyzer 权重已准备；未就绪时阻止新建会议。",
         "录音中：采集音频并按 30 分钟滚动切片保存；实时 ASR 输出转写，在线聚类提供匿名演讲人，翻译按批次异步补充。",
         "停录瞬间：设置 recording_state=finalizing，刷新音频和快速 ASR 队列，写入音频清单与 manifest，随后立即置为 recording_state=complete 并广播 recording_complete。",
-        "后台后处理：由 postprocess 任务依次执行精修 ASR、Resemblyzer 说话人重排、对齐、翻译、会议纪要和 To-do-list；每一阶段写入持久化检查点。",
+        "后台后处理：postprocess 自动执行精修 ASR、Resemblyzer 说话人重排、对齐和最终翻译；全部完成后进入 ready_for_summary。用户点击按钮触发会议纪要，纪要成功后自动触发 To-do-list；每一阶段写入持久化检查点。",
         "结果交付：前端接收 postprocess_update 和单调递增的 snapshot_revision，原地更新原文、译文、说话人和下载文件；失败时展示具体阶段和重试入口。",
     ]:
         add_number(doc, text)
@@ -694,7 +716,7 @@ def build_document() -> None:
         ["状态对象", "状态值", "用户理解"],
         [
             ["recording_state", "starting / recording / finalizing / complete / error", "录音与快速结果是否已经保存"],
-            ["postprocess.state", "queued / running / complete / partial / error", "后台精修、重排、翻译和生成任务的总体状态"],
+            ["postprocess.state", "queued / running / ready_for_summary / complete / partial / error", "后台精修、重排、翻译和生成任务的总体状态"],
             ["postprocess.current_stage", "asr_refine / diarization(Resemblyzer) / translation / summary / todo", "当前正在处理的阶段"],
             ["snapshot_revision", "单调递增整数", "前端拒绝旧 snapshot，避免旧消息覆盖新状态"],
         ],
@@ -726,7 +748,7 @@ def build_document() -> None:
             ["产品形态", "独立的本地会议理解工作台：采集、转写、翻译、说话人、纪要和待办", "钉钉/企业微信/飞书：办公协作平台；腾讯会议：会议平台与会议资产", "竞品强在组织协作与会议生态；会记专注音频理解链和结果可追溯"],
             ["数据与部署", "ASR、翻译、Resemblyzer 说话人重排默认本地；仅将纪要/待办文本发送到积墨", "以云端会议、云录制、云端 AI 和组织权限为主；部分企业版支持更强的管理/混合云能力", "会记适合内网/敏感会议；竞品适合快速开通、统一管理和跨端协作"],
             ["实时转写/翻译", "实时中文/英文/德文转写；英文、德文本地译为简体中文", "腾讯会议支持实时字幕/转写与中英互译，企业版本语言更广；钉钉会议支持实时字幕与多语言翻译；飞书支持实时转写/翻译；企业微信持续完善字幕、转写和同传", "会记语言范围更聚焦，但推理链与数据边界可控"],
-            ["纪要与待办", "停录后按“精修→说话人重排→翻译→积墨纪要→To-do”生成，阶段可见、可重试", "普遍提供智能纪要、章节、重点、发言人和待办，并可与文档/任务/群聊联动", "竞品协作分发更强；会记更强调原文、修订和阶段检查点"],
+            ["纪要与待办", "停录后自动完成“精修→说话人重排→翻译”，用户按钮触发积墨纪要，成功后自动生成 To-do；阶段可见、可重试", "普遍提供智能纪要、章节、重点、发言人和待办，并可与文档/任务/群聊联动", "竞品协作分发更强；会记更强调原文、修订和阶段检查点"],
             ["说话人能力", "实时匿名编号；会后 Resemblyzer 重排；支持重叠片段元数据", "腾讯会议/飞书等支持发言人视图或声纹/身份关联；企业微信也提供转写/纪要能力", "会记默认不做实名声纹绑定，减少隐私和身份误识别风险"],
             ["集成与组织", "REST/WebSocket/API 文件下载；当前以单机/内网为主", "钉钉、企业微信、飞书接入组织通讯录、日历、文档、任务和消息；腾讯会议提供开放平台 API", "会记需通过企业版扩展层补齐 SSO、对象存储、队列和协作集成"],
             ["成本结构与使用成本", "本地 ASR、翻译和 Resemblyzer 说话人重排不产生远程 token；积墨按调用计费：0.03 元/会话，2 次会话/API 请求，即 0.06 元/请求。以 N 个转写块估算，无重试约 (N+2)×0.06 元，另计 GPU/服务器、存储、实施和运维", "私有化/专属版通常按项目报价，公开案例从约 25 万元/年到百万元级，可能包含软件授权、部署、定制、存储、运维、组织协同和容灾；腾讯会议完整混合云方案需商务询价", "会记应与竞品三年 TCO 比较：会记外部调用成本透明，但需要承担本地基础设施；竞品交付范围更大、采购金额更高，不能把单个合同清单项直接理解成完整私有化价格"],
@@ -832,13 +854,13 @@ def build_document() -> None:
             ["匿名演讲人数量", "实时匿名编号建议上限 10 人；会后 Resemblyzer 重排单场会议建议上限 20 人；接口/前端最多展示 32 个匿名演讲人", "产品规格", "超过展示上限时按“其他演讲人”聚合或转入人工校正；匿名编号不等于实名身份，首次出现顺序编号。"],
             ["单场会议时长", "建议连续录音 ≤4 小时；音频每 30 分钟滚动切片；后处理时长随音频长度近似线性增长", "运营建议", "超过 4 小时建议拆分会议或按阶段停录，避免单任务积压。"],
             ["单实例活跃会议", "默认 1 场；MEETING_MAX_ACTIVE_MEETINGS=1", "部署基线", "单 GPU 本地部署。增加到多场前需按 GPU worker 横向扩展并重新压测。"],
-            ["GPU worker/资源锁", "1 个 GPU worker；实时 ASR、large-v3、翻译和 Resemblyzer 共用 1 把 GPU 锁，严格串行", "已配置", "避免 8 GB 显存同时加载导致 OOM；后台后处理可排队。"],
-            ["有界队列", "实时推理 64；精修 16；待处理任务 64", "已配置", "有界队列防止无界增长；队列满时返回明确排队/拒绝状态。"],
+            ["GPU 资源锁", "实时 ASR、large-v3、翻译和 Resemblyzer 共用 1 把进程内 GPU 锁，严格串行", "已实现", "避免 8 GB 显存同时执行重推理；当前不提供可配置 worker pool 或显存硬配额。"],
+            ["有界队列", "实时推理 64；精修 16", "已配置", "两条音频处理队列有界；企业任务队列属于扩展能力。"],
             ["多人并发", "当前稳定基线：1 路活跃会议；企业压测目标：10 路同时会议", "基线/目标", "10 路是压测目标，不是单 GPU 承诺；需要目标 GPU、中英德混合语料和 30 分钟连续录音验收。"],
             ["断线恢复", "WebSocket 断线恢复窗口 15 s；stream ticket TTL 60 s；WebSocket 认证超时 5 s", "已配置", "窗口内恢复不会结束会议；前端通过 snapshot_revision 丢弃旧消息。"],
-            ["音频保留", "默认保留 30 天；可关闭音频保存或设置 retention_days=0 关闭自动过期删除", "已配置", "受磁盘容量、企业合规和删除策略影响。"],
+            ["音频保留", "完整会议结果默认保留 30 天；MEETING_KEEP_AUDIO=0 时，音频在精修和说话人重排成功后删除；失败时保留以便重试", "已配置", "retention_days=0 可关闭自动过期删除；受磁盘容量、企业合规和删除策略影响。"],
             ["质量指标", "WER、CER、语言识别准确率、BLEU、chrF、DER、JER、首结果延迟、分段延迟、RTF、P50/P95、峰值显存", "验收指标", "需要固定语料和 benchmark 才能给出具体数值。"],
-            ["GPU 基线", "RTX 5060 Laptop 8 GB / 32 GB RAM；显存预算约 7200 MB", "部署基线", "更换 GPU 需重选 CUDA/PyTorch wheel 并重新压测。"],
+            ["GPU 基线", "RTX 5060 Laptop 8 GB / 32 GB RAM；重任务串行执行", "部署基线", "当前未实施显存硬配额；更换 GPU 需重选 CUDA/PyTorch wheel 并重新压测。"],
         ],
         [1850, 2750, 1350, 3410],
         body_size=8.7,
@@ -914,14 +936,14 @@ def build_document() -> None:
     add_callout(
         doc,
         "对外介绍",
-        "会记是一套本地优先的实时会议工作台，支持中文、英文和德文会议的实时转写与中译。它在录音期间用轻量实时模型帮助参会者跟上讨论，停录后自动用更高质量 ASR 和说话人分离模型完成精修，再生成会议纪要和 To-do-list。与单纯字幕或云端会议机器人不同，会记把录音保存、后台后处理和结果修订拆开，既保留本地数据边界，也让失败可见、任务可重试、结果可追溯。",
+        "会记是一套本地优先的实时会议工作台，支持中文、英文和德文会议的实时转写与中译。它在录音期间用轻量实时模型帮助参会者跟上讨论，停录后自动用更高质量 ASR 和说话人分离模型完成精修；精修、重排和翻译全部完成后，用户点击按钮生成会议纪要，随后系统自动生成 To-do-list。与单纯字幕或云端会议机器人不同，会记把录音保存、后台后处理和结果修订拆开，既保留本地数据边界，也让失败可见、任务可重试、结果可追溯。",
         fill=LIGHT_TEAL,
         accent=TEAL,
         text_size=10.8,
     )
 
     add_heading(doc, "12. 资料依据与口径说明", 1)
-    add_para(doc, "产品与技术参数依据本仓库的 README.md、DEPLOYMENT.md、pyproject.toml、realtime_meeting/config.py、runtime.py、session.py、storage.py 和已实现的产品能力整理；竞品与模型资料为公开官方页面，访问日期：2026-08-12。公开产品能力可能随版本、地区和套餐变化。")
+    add_para(doc, "产品与技术参数依据本仓库的 README.md、DEPLOYMENT.md、pyproject.toml、realtime_meeting/config.py、runtime.py、session.py、storage.py 和已实现的产品能力整理；竞品与模型资料为公开官方页面，访问日期：2026-08-13。公开产品能力可能随版本、地区和套餐变化。")
     add_source(doc, "Whisper large-v3-turbo 模型卡", "https://huggingface.co/openai/whisper-large-v3-turbo", "用于模型能力、99 语言模型卡与 turbo/large-v3 解码层差异说明。")
     add_source(doc, "Resemblyzer 项目与 voice encoder", "https://github.com/resemble-ai/Resemblyzer", "用于本地 voice encoder、声纹 embedding 和 speaker verification/聚类实现口径；本项目按 16 kHz 单声道输入封装。")
     add_source(doc, "CTranslate2 性能文档", "https://opennmt.net/CTranslate2/performance.html", "用于量化、beam size 和本地翻译推理的技术依据。")

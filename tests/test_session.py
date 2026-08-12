@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from realtime_meeting.diarization import SpeakerSegment
 from realtime_meeting.models import TodoDocument, TodoItem, Utterance
 from realtime_meeting.audio import SAMPLE_RATE, SegmentEvent
 from realtime_meeting.session import LiveMeetingSession
@@ -41,6 +42,16 @@ class FakeRuntime:
         from realtime_meeting.runtime import TranslationResult
 
         return TranslationResult("我们会发送方案。", "ready", "fake")
+
+
+class DiarizationRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        self.paths_seen: list[Path] = []
+
+    def diarize_audio(self, paths):
+        self.paths_seen = list(paths)
+        assert all(path.is_file() for path in paths)
+        return [SpeakerSegment(0.0, 1.0, "speaker_1", 0.9)]
 
 
 class FakeSummarizer:
@@ -219,6 +230,127 @@ async def test_recovery_resumes_todo_for_completed_summary(settings) -> None:
     assert recovered.postprocess_task is None
     await recovered.todo_task
     assert recovered.todo_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_model_dependent_recovery_waits_for_runtime_readiness(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    meeting_id = "recover-postprocess"
+    output = store.meeting_dir(meeting_id)
+    output.mkdir(parents=True)
+    from realtime_meeting.exporter import append_utterance
+
+    append_utterance(output / "transcript.jsonl", Utterance(1, 0.0, 1.0, 1, "zh", 1.0, "恢复处理", segment_id="1:0"))
+    (output / "session_state.json").write_text(json.dumps({
+        "id": meeting_id,
+        "title": "恢复后处理",
+        "recording_state": "complete",
+        "summary_state": "idle",
+        "todo_state": "waiting_summary",
+        "postprocess": {
+            "state": "queued",
+            "stages": {
+                "asr_refine": {"state": "complete"},
+                "diarization": {"state": "complete"},
+                "translation": {"state": "complete"},
+                "summary": {"state": "idle"},
+                "todo": {"state": "idle"},
+            },
+        },
+    }), encoding="utf-8")
+
+    manager = SessionManager(settings, FakeRuntime(), store)
+    recovered = manager.get(meeting_id)
+    assert recovered is not None
+    await manager.resume_pending(model_tasks_ready=False)
+    assert recovered.postprocess_task is None
+    await manager.resume_pending(model_tasks_ready=True)
+    assert recovered.postprocess_task is not None
+    await recovered.postprocess_task
+
+
+@pytest.mark.asyncio
+async def test_create_failure_releases_capacity_and_removes_directory(settings, monkeypatch) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+
+    async def fail_start(_session):
+        raise RuntimeError("VAD initialization failed")
+
+    monkeypatch.setattr(LiveMeetingSession, "start", fail_start)
+    with pytest.raises(RuntimeError, match="VAD initialization failed"):
+        await manager.create("启动失败")
+    assert manager.sessions == {}
+    assert list(settings.results_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_marks_error_and_allows_delete(settings) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    session = await manager.create("保存失败")
+
+    class FailingWriter:
+        def close(self):
+            raise RuntimeError("FFmpeg close failed")
+
+    session.audio_writer = FailingWriter()
+    await session.request_stop()
+    assert session.stop_task is not None
+    await session.stop_task
+    assert session.recording_state == "error"
+    assert "FFmpeg close failed" in (session.error or "")
+    assert await manager.delete(session.id) is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_before_queue_shutdown_cancels_worker(settings) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    session = await manager.create("分段收尾失败")
+
+    class FailingSegmenter:
+        def flush(self):
+            raise RuntimeError("segment flush failed")
+
+    session.segmenter = FailingSegmenter()
+    session.audio_writer = None
+    await session.request_stop()
+    assert session.stop_task is not None
+    await session.stop_task
+    assert session.recording_state == "error"
+    assert session.worker_task is not None and session.worker_task.done()
+    assert await manager.delete(session.id) is True
+
+
+@pytest.mark.asyncio
+async def test_unretained_audio_is_deleted_only_after_diarization(settings) -> None:
+    settings.keep_audio = False
+    settings.enable_refinement = False
+    runtime = DiarizationRuntime()
+    session = LiveMeetingSession(settings, runtime, LocalMeetingStore(settings.results_dir), title="不留录音")
+    await session.start()
+    audio_path = session.output_dir / "audio" / "audio-0001.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"test audio")
+
+    class ExistingAudioWriter:
+        def close(self):
+            return [{"file": audio_path.name, "start_seconds": 0.0, "end_seconds": 1.0, "samples": 16000, "format": "wav"}]
+
+    session.audio_writer = ExistingAudioWriter()
+    from realtime_meeting.exporter import append_utterance
+
+    append_utterance(
+        session.transcript_path,
+        Utterance(1, 0.0, 1.0, 1, "zh", 1.0, "测试说话人", segment_id="1:0"),
+    )
+    await session.request_stop()
+    assert session.stop_task is not None
+    await session.stop_task
+    assert session.postprocess_task is not None
+    await session.postprocess_task
+
+    assert runtime.paths_seen == [audio_path]
+    assert not audio_path.exists()
+    assert session.audio_segments == []
 
 
 @pytest.mark.asyncio

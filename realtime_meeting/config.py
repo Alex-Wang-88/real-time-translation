@@ -62,10 +62,7 @@ class Settings:
     max_audio_packet_bytes: int = 262_144
     inference_queue_size: int = 64
     refinement_queue_size: int = 16
-    gpu_workers: int = 1
-    gpu_memory_budget_mb: int = 7200
     max_active_meetings: int = 1
-    max_pending_tasks: int = 64
     stream_ticket_ttl_seconds: int = 60
     websocket_auth_timeout_seconds: int = 5
     websocket_disconnect_grace_seconds: float = 15.0
@@ -130,10 +127,7 @@ def load_settings() -> Settings:
         max_audio_packet_bytes=_int("MEETING_MAX_AUDIO_PACKET_BYTES", 262_144, 1024),
         inference_queue_size=_int("MEETING_INFERENCE_QUEUE_SIZE", 64, 1),
         refinement_queue_size=_int("MEETING_REFINEMENT_QUEUE_SIZE", 16, 1),
-        gpu_workers=_int("MEETING_GPU_WORKERS", 1, 1),
-        gpu_memory_budget_mb=_int("MEETING_GPU_MEMORY_BUDGET_MB", 7200, 1024),
         max_active_meetings=_int("MEETING_MAX_ACTIVE_MEETINGS", 1, 1),
-        max_pending_tasks=_int("MEETING_MAX_PENDING_TASKS", 64, 1),
         stream_ticket_ttl_seconds=_int("MEETING_STREAM_TICKET_TTL_SECONDS", 60, 10),
         websocket_auth_timeout_seconds=_int("MEETING_WEBSOCKET_AUTH_TIMEOUT_SECONDS", 5, 1),
         websocket_disconnect_grace_seconds=min(120.0, max(0.0, _float("MEETING_WEBSOCKET_DISCONNECT_GRACE_SECONDS", 15.0, 0.0))),

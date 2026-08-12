@@ -57,7 +57,6 @@ def create_app(
             translation_model_root=config.translation_model_root,
             translation_autodownload=config.translation_autodownload,
             vad_model=config.vad_model,
-            gpu_memory_budget_mb=config.gpu_memory_budget_mb,
             diarization_required=config.diarization_required,
         )
 
@@ -127,11 +126,22 @@ def create_app(
                     )
                     if not app.state.runtime.ready or not getattr(app.state.runtime, "capabilities_ready", True):
                         app.state.model_error = getattr(app.state.runtime, "status", "模型未就绪")
+                    else:
+                        await manager.resume_pending(model_tasks_ready=True)
                 except Exception as exc:  # noqa: BLE001 - expose readiness failure
                     app.state.model_error = str(exc)
                     app.state.model_message = app.state.model_error
             app.state.model_task = asyncio.create_task(load_runtime(), name="load-v2-models")
-        await manager.resume_pending()
+            # To-do recovery does not require local models and can resume while
+            # the runtime loads. Model-dependent postprocess waits for success.
+            await manager.resume_pending(model_tasks_ready=False)
+        else:
+            await manager.resume_pending(
+                model_tasks_ready=bool(
+                    getattr(app.state.runtime, "ready", False)
+                    and getattr(app.state.runtime, "capabilities_ready", True)
+                )
+            )
 
     async def shutdown() -> None:
         task = app.state.model_task
@@ -139,6 +149,7 @@ def create_app(
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        cancelled: list[asyncio.Task[Any]] = []
         for meeting in manager.sessions.values():
             for task in (
                 meeting.worker_task,
@@ -148,9 +159,13 @@ def create_app(
                 meeting.postprocess_task,
                 meeting.stop_task,
                 meeting.disconnect_stop_task,
+                *meeting.translation_tasks,
             ):
                 if task and not task.done():
                     task.cancel()
+                    cancelled.append(task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
         close = getattr(app.state.runtime, "close", None)
         if close:
             with suppress(Exception):
