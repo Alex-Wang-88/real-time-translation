@@ -32,3 +32,9 @@ def test_summary_button_waits_for_automatic_refinement() -> None:
     assert 'const preprocessingReady = ["asr_refine", "diarization", "translation"].every' in source
     assert '"生成纪要和 To-do-list"' in source
     assert 'value.state === "ready_for_summary"' in source
+
+
+def test_failed_summary_stream_restores_committed_summary() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "summary: payload.summary ?? state.meeting.summary" in source
+    assert "summary_revision: payload.summary_revision ?? state.meeting.summary_revision" in source

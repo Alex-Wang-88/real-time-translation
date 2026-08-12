@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -163,25 +164,32 @@ class LocalMeetingStore:
     def purge_expired(self, retention_days: int) -> list[str]:
         if retention_days <= 0:
             return []
-        import time
-
-        cutoff = time.time() - retention_days * 86400
+        cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
         removed: list[str] = []
         with self._lock:
             for directory in self.root.iterdir():
-                if not directory.is_dir() or directory.stat().st_mtime >= cutoff:
+                if not directory.is_dir():
                     continue
                 state_path = directory / "session_state.json"
-                if state_path.is_file():
-                    try:
-                        state = json.loads(state_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        state = {}
-                    if isinstance(state, dict) and (
-                        state.get("recording_state") in {"starting", "recording", "finalizing"}
-                        or not state.get("ended_at")
-                    ):
-                        continue
+                if not state_path.is_file():
+                    continue
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(state, dict) or (
+                    state.get("recording_state") in {"starting", "recording", "finalizing"}
+                    or not state.get("ended_at")
+                ):
+                    continue
+                try:
+                    ended_at = datetime.fromisoformat(str(state["ended_at"]).replace("Z", "+00:00"))
+                    if ended_at.tzinfo is None:
+                        ended_at = ended_at.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                if ended_at.timestamp() >= cutoff:
+                    continue
                 removed.append(directory.name)
                 self.delete(directory.name)
         return removed

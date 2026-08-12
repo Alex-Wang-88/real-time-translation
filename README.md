@@ -71,7 +71,7 @@ Jimo 请求继续使用旧版兼容格式：`messages`、`sessionId`、`source: 
 
 `transcript.jsonl`、`transcript.json`、`transcript_events.jsonl`、`speaker_segments.json`、`meeting_transcript.md`、`translated_zh.md`、`original_zh.md`、`original_en.md`、`original_de.md`、`meeting_minutes.md`、`todo_list.json`、`todo_list.md`、`audio/`、`audio_manifest.json`、`manifest.json` 和 `session_state.json`。
 
-默认保留录音 30 天，设置 `MEETING_KEEP_AUDIO=0` 可关闭录音保留；`MEETING_RETENTION_DAYS=0` 表示不执行自动过期删除。
+默认保留完整会议结果 30 天，服务启动时会删除超过 `MEETING_RETENTION_DAYS` 的已结束会议目录；设为 `0` 可关闭自动过期删除。设置 `MEETING_KEEP_AUDIO=0` 可在停止会议后立即删除录音，但保留转写、精修、纪要和 To-do-list 等结果。
 
 ## API
 

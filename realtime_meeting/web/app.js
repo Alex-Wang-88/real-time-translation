@@ -666,7 +666,11 @@ async function handleEvent(payload) {
     setNotice(payload.message || "处理出现警告", "warning");
   } else if (type === "error") {
     setNotice(payload.message || "处理失败", "error");
-    if (state.meeting && payload.code === "summary_failed") state.meeting.summary_state = "error";
+    if (state.meeting && payload.code === "summary_failed") Object.assign(state.meeting, {
+      summary_state: "error",
+      summary: payload.summary ?? state.meeting.summary,
+      summary_revision: payload.summary_revision ?? state.meeting.summary_revision,
+    });
     if (state.meeting && payload.code === "todo_failed") state.meeting.todo_state = "error";
     renderSummary(state.meeting?.summary, state.meeting?.summary_state || "error");
     renderTodo(state.meeting?.todo, state.meeting?.todo_state || "error");

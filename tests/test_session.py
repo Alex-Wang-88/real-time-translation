@@ -84,6 +84,12 @@ class BlockingTodoGenerator:
         )
 
 
+class FailingStreamingSummarizer:
+    async def summarize(self, *args, **kwargs):
+        await kwargs["on_delta"]("未完成的新纪要")
+        raise RuntimeError("summary unavailable")
+
+
 @pytest.mark.asyncio
 async def test_summary_and_todo_are_independent_and_revisioned(settings) -> None:
     FakeSummarizer.calls = 0
@@ -173,6 +179,7 @@ def test_recovery_requeues_running_postprocessing_tasks(settings) -> None:
     assert recovered is not None
     assert recovered.summary_state == "idle"
     assert recovered.todo_state == "waiting_summary"
+    assert recovered.postprocess.state != "queued"
 
 
 @pytest.mark.asyncio
@@ -189,6 +196,17 @@ async def test_recovery_resumes_todo_for_completed_summary(settings) -> None:
             "summary_state": "complete",
             "todo_state": "running",
             "summary_revision": 1,
+            "postprocess": {
+                "state": "running",
+                "current_stage": "todo",
+                "stages": {
+                    "asr_refine": {"state": "complete"},
+                    "diarization": {"state": "complete"},
+                    "translation": {"state": "complete"},
+                    "summary": {"state": "complete"},
+                    "todo": {"state": "running"},
+                },
+            },
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -198,8 +216,52 @@ async def test_recovery_resumes_todo_for_completed_summary(settings) -> None:
     recovered.todo_factory = lambda _settings: FakeTodoGenerator()
     await manager.resume_pending()
     assert recovered.todo_task is not None
+    assert recovered.postprocess_task is None
     await recovered.todo_task
     assert recovered.todo_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_delete_rejects_completed_meeting_with_background_task(settings) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    session = LiveMeetingSession(settings, FakeRuntime(), manager.store)
+    session.recording_state = "complete"
+    session.todo_task = asyncio.create_task(asyncio.sleep(60))
+    manager.sessions[session.id] = session
+    try:
+        with pytest.raises(ValueError, match="后台任务"):
+            await manager.delete(session.id)
+        assert session.output_dir.exists()
+    finally:
+        session.todo_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session.todo_task
+
+
+@pytest.mark.asyncio
+async def test_failed_summary_retry_preserves_previous_committed_summary(settings) -> None:
+    session = LiveMeetingSession(
+        settings,
+        FakeRuntime(),
+        LocalMeetingStore(settings.results_dir),
+        summarizer_factory=lambda _settings: FailingStreamingSummarizer(),
+    )
+    session.recording_state = "complete"
+    for stage in ("asr_refine", "diarization", "translation"):
+        session.postprocess.update(stage, "complete")
+    session.summary = "# 已提交旧纪要"
+    session.summary_revision = 1
+    session.summary_state = "complete"
+    (session.output_dir / "meeting_minutes.md").write_text(session.summary + "\n", encoding="utf-8")
+
+    assert await session.request_summary()
+    assert session.summary_task is not None
+    await session.summary_task
+
+    assert session.summary_state == "error"
+    assert session.summary == "# 已提交旧纪要"
+    assert session.summary_revision == 1
+    assert (session.output_dir / "meeting_minutes.md").read_text(encoding="utf-8") == "# 已提交旧纪要\n"
 
 
 def test_refinement_event_survives_restart(settings) -> None:

@@ -115,6 +115,9 @@ def create_app(
         return meeting
 
     async def startup() -> None:
+        removed = await asyncio.to_thread(repository.purge_expired, config.retention_days)
+        for meeting_id in removed:
+            manager.sessions.pop(meeting_id, None)
         if load_models and not getattr(app.state.runtime, "ready", False):
             async def load_runtime() -> None:
                 try:

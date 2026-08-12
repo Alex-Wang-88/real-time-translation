@@ -257,6 +257,20 @@ class LiveMeetingSession:
     def active(self) -> bool:
         return self.recording_state in {"starting", "recording", "finalizing"}
 
+    @property
+    def has_active_tasks(self) -> bool:
+        tasks = (
+            self.worker_task,
+            self.stop_task,
+            self.disconnect_stop_task,
+            self.refinement_worker_task,
+            self.postprocess_task,
+            self.summary_task,
+            self.todo_task,
+            *self.translation_tasks,
+        )
+        return any(task is not None and not task.done() for task in tasks)
+
     async def add_client(self, websocket: WebSocket) -> None:
         if self.disconnect_stop_task and not self.disconnect_stop_task.done():
             self.disconnect_stop_task.cancel()
@@ -874,7 +888,6 @@ class LiveMeetingSession:
         self.summary_error = None
         self.todo_state = "stale" if self.summary_revision else "waiting_summary"
         self.todo_error = None
-        self.todo = None
         self.postprocess.state = "running"
         self.postprocess.error = None
         self.postprocess.update("summary", "running", current=0, total=1)
@@ -903,7 +916,7 @@ class LiveMeetingSession:
         if not claimed:
             self.begin_summary()
         await self.status("正在生成会议纪要")
-        self.summary = ""
+        candidate = ""
         try:
             summarizer = self.summarizer_factory(self.settings)
 
@@ -911,13 +924,16 @@ class LiveMeetingSession:
                 await self.broadcast("summary_progress", phase=kind, current=index, total=total)
 
             async def on_delta(content: str) -> None:
-                self.summary += content
+                nonlocal candidate
+                candidate += content
                 await self.broadcast("summary_delta", content=content)
 
             async def on_reset() -> None:
-                self.summary = ""
+                nonlocal candidate
+                candidate = ""
                 await self.broadcast("summary_reset")
 
+            await self.broadcast("summary_reset")
             result = await summarizer.summarize(
                 self.transcript_path,
                 self.id,
@@ -928,9 +944,11 @@ class LiveMeetingSession:
                 on_reset=on_reset,
                 attempt_id=f"{self.id}:{self.summary_revision + 1}:{uuid.uuid4().hex}",
             )
-            self.summary = result.strip()
-            self.summary_revision += 1
-            atomic_write_text(self.output_dir / "meeting_minutes.md", self.summary + "\n")
+            candidate = result.strip()
+            next_revision = self.summary_revision + 1
+            atomic_write_text(self.output_dir / "meeting_minutes.md", candidate + "\n")
+            self.summary = candidate
+            self.summary_revision = next_revision
             self.summary_state = "complete"
             self.todo_state = "queued"
             self.summary_error = None
@@ -945,7 +963,14 @@ class LiveMeetingSession:
             self.summary_error = str(exc)
             self.postprocess.fail("summary", self.summary_error)
             self._write_state()
-            await self.broadcast("error", code="summary_failed", message=self.summary_error, retryable=True)
+            await self.broadcast(
+                "error",
+                code="summary_failed",
+                message=self.summary_error,
+                retryable=True,
+                summary=self.summary,
+                summary_revision=self.summary_revision,
+            )
             await self.broadcast("postprocess_update", meeting=self.snapshot())
 
     def begin_todo(self) -> bool:
@@ -1039,13 +1064,36 @@ class SessionManager:
                     },
                 }).to_dict()
             if payload.get("recording_state") == "complete":
-                if payload.get("summary_state") == "running":
+                summary_was_running = payload.get("summary_state") == "running"
+                if summary_was_running:
                     payload["summary_state"] = "idle"
                     payload["todo_state"] = "waiting_summary"
+                    postprocess = payload.get("postprocess")
+                    if not isinstance(postprocess, dict):
+                        postprocess = PostprocessTracker({
+                            "state": "ready_for_summary",
+                            "stages": {
+                                "asr_refine": {"state": "complete"},
+                                "diarization": {"state": "complete"},
+                                "translation": {"state": "complete"},
+                                "summary": {"state": "idle"},
+                                "todo": {"state": "idle"},
+                            },
+                        }).to_dict()
+                        payload["postprocess"] = postprocess
+                    postprocess["state"] = "ready_for_summary"
+                    postprocess["current_stage"] = None
+                    postprocess["error"] = None
+                    stages = postprocess.get("stages")
+                    if isinstance(stages, dict):
+                        for stage in ("summary", "todo"):
+                            if isinstance(stages.get(stage), dict):
+                                stages[stage]["state"] = "idle"
+                                stages[stage]["error"] = None
                 elif payload.get("todo_state") == "running":
                     payload["todo_state"] = "queued" if payload.get("summary_state") == "complete" else "waiting_summary"
                 postprocess = payload.get("postprocess")
-                if isinstance(postprocess, dict) and postprocess.get("state") == "running":
+                if isinstance(postprocess, dict) and postprocess.get("state") == "running" and not summary_was_running:
                     postprocess["state"] = "queued"
             self.sessions[meeting_id] = LiveMeetingSession(self.settings, self.runtime, self.store, meeting_id=meeting_id, recovered_state=payload)
 
@@ -1068,8 +1116,8 @@ class SessionManager:
 
     async def delete(self, meeting_id: str) -> bool:
         session = self.sessions.get(meeting_id)
-        if session and session.active:
-            raise ValueError("会议进行中，不能删除")
+        if session and (session.active or session.has_active_tasks):
+            raise ValueError("会议或后台任务进行中，不能删除")
         if meeting_id not in self.sessions and not self.store.meeting_dir(meeting_id).exists():
             return False
         self.sessions.pop(meeting_id, None)
@@ -1078,7 +1126,9 @@ class SessionManager:
 
     async def resume_pending(self) -> None:
         for session in self.sessions.values():
-            if session.postprocess.state in {"queued", "running"} and session.recording_state == "complete":
+            if session.todo_state == "queued" and session.summary_state == "complete" and session.summary.strip():
+                session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")
+            elif session.postprocess.state in {"queued", "running"} and session.recording_state == "complete":
                 session.postprocess_task = asyncio.create_task(session.run_postprocess(), name=f"recover-postprocess-{session.id}")
             elif session.summary_state == "queued" and session.recording_state == "complete":
                 # Older versions queued summaries automatically. Migration keeps
@@ -1086,5 +1136,3 @@ class SessionManager:
                 session.summary_state = "idle"
                 session.todo_state = "waiting_summary"
                 session._write_state()
-            elif session.todo_state == "queued" and session.summary_state == "complete" and session.summary.strip():
-                session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")

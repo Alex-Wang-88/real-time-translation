@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import pytest
@@ -25,6 +27,30 @@ class ReadyRuntime:
 
     def new_speaker_clusterer(self):
         return None
+
+
+def test_startup_purges_only_confirmed_expired_meetings(tmp_path) -> None:
+    settings = Settings(
+        results_dir=tmp_path / "meetings",
+        translation_model_root=tmp_path / "models",
+        retention_days=1,
+    )
+    store = LocalMeetingStore(settings.results_dir)
+    expired = store.meeting_dir("expired")
+    expired.mkdir(parents=True)
+    (expired / "session_state.json").write_text(json.dumps({
+        "id": "expired",
+        "recording_state": "complete",
+        "ended_at": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+    }), encoding="utf-8")
+    corrupt = store.meeting_dir("corrupt")
+    corrupt.mkdir(parents=True)
+    (corrupt / "session_state.json").write_text("not-json", encoding="utf-8")
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=store)
+    with TestClient(app):
+        assert not expired.exists()
+        assert app.state.manager.get("expired") is None
+        assert corrupt.exists()
 
 
 def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> None:
