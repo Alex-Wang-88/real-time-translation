@@ -27,6 +27,8 @@ class MeetingCreate(BaseModel):
 
 
 class MeetingSettingsUpdate(BaseModel):
+    settings: dict[str, Any] = Field(default_factory=dict)
+    # Kept for clients from the first settings panel version.
     asr_settings: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -344,7 +346,10 @@ def create_app(
     ) -> dict[str, Any]:
         meeting = require_meeting(meeting_id)
         try:
-            meeting.configure_asr_settings(body.asr_settings)
+            values = dict(body.settings)
+            if body.asr_settings:
+                values["asr_settings"] = body.asr_settings
+            meeting.configure_meeting_settings(values)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return meeting.snapshot()

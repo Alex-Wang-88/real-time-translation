@@ -45,6 +45,7 @@ class DiarizationEngine:
         device: str = "cpu",
         *,
         required: bool = False,
+        parameters: dict[str, Any] | None = None,
     ) -> None:
         self.device = device
         self.required = required
@@ -54,6 +55,16 @@ class DiarizationEngine:
         self.status = "not_loaded"
         self.error: str | None = None
         self.model_name = "resemblyzer/voice_encoder"
+        self.parameters = {
+            "max_silence_gap_seconds": MAX_SILENCE_GAP_SECONDS,
+            "min_speech_seconds": MIN_SPEECH_SECONDS,
+            "embedding_context_seconds": EMBEDDING_CONTEXT_SECONDS,
+            "embedding_hop_seconds": EMBEDDING_HOP_SECONDS,
+            "cluster_threshold": CLUSTER_THRESHOLD,
+            "overlap_include_threshold": OVERLAP_INCLUDE_THRESHOLD,
+        }
+        if isinstance(parameters, dict):
+            self.parameters.update(parameters)
 
     @staticmethod
     def _module_available(name: str) -> bool:
@@ -150,14 +161,27 @@ class DiarizationEngine:
         self.ready = False
         gc.collect()
 
-    def diarize(self, audio: Path | str | Iterable[Path | str]) -> list[SpeakerSegment]:
+    def diarize(
+        self,
+        audio: Path | str | Iterable[Path | str],
+        parameters: dict[str, Any] | None = None,
+    ) -> list[SpeakerSegment]:
         if not self.ready and not self.load():
             raise RuntimeError(self.error or "diarization model is not ready")
         sources = [audio] if isinstance(audio, (str, Path)) else list(audio)
-        return self._diarize_resemblyzer(sources)
+        active = dict(self.parameters)
+        if isinstance(parameters, dict):
+            active.update(parameters)
+        return self._diarize_resemblyzer(sources, active)
 
     @staticmethod
-    def _speech_intervals(waveform: Any, sample_rate: int) -> list[tuple[float, float]]:
+    def _speech_intervals(
+        waveform: Any,
+        sample_rate: int,
+        *,
+        max_silence_gap_seconds: float = MAX_SILENCE_GAP_SECONDS,
+        min_speech_seconds: float = MIN_SPEECH_SECONDS,
+    ) -> list[tuple[float, float]]:
         import numpy as np
 
         frame_size = max(1, int(sample_rate * ENERGY_FRAME_SECONDS))
@@ -173,8 +197,8 @@ class DiarizationEngine:
         upper = float(np.percentile(rms, 80))
         threshold = max(0.004, min(noise_floor * 2.5, upper * 0.6))
         active = rms >= threshold
-        max_gap = max(1, int(MAX_SILENCE_GAP_SECONDS / ENERGY_FRAME_SECONDS))
-        min_frames = max(1, int(MIN_SPEECH_SECONDS / ENERGY_FRAME_SECONDS))
+        max_gap = max(1, int(max_silence_gap_seconds / ENERGY_FRAME_SECONDS))
+        min_frames = max(1, int(min_speech_seconds / ENERGY_FRAME_SECONDS))
         intervals: list[tuple[float, float]] = []
         start: int | None = None
         gap = 0
@@ -213,12 +237,15 @@ class DiarizationEngine:
         return float(np.dot(left, right) / (left_norm * right_norm))
 
     @staticmethod
-    def _merge_segments(segments: Iterable[SpeakerSegment]) -> list[SpeakerSegment]:
+    def _merge_segments(
+        segments: Iterable[SpeakerSegment],
+        max_silence_gap_seconds: float = MAX_SILENCE_GAP_SECONDS,
+    ) -> list[SpeakerSegment]:
         merged: list[SpeakerSegment] = []
         for item in sorted(segments, key=lambda value: (value.start, value.end, value.label)):
             if item.end <= item.start:
                 continue
-            if merged and merged[-1].label == item.label and item.start <= merged[-1].end + MAX_SILENCE_GAP_SECONDS:
+            if merged and merged[-1].label == item.label and item.start <= merged[-1].end + max_silence_gap_seconds:
                 previous = merged[-1]
                 previous.end = max(previous.end, item.end)
                 previous.confidence = max(previous.confidence, item.confidence)
@@ -226,7 +253,11 @@ class DiarizationEngine:
                 merged.append(SpeakerSegment(item.start, item.end, item.label, item.confidence))
         return merged
 
-    def _diarize_resemblyzer(self, sources: list[Path | str]) -> list[SpeakerSegment]:
+    def _diarize_resemblyzer(
+        self,
+        sources: list[Path | str],
+        parameters: dict[str, Any] | None = None,
+    ) -> list[SpeakerSegment]:
         """Local no-token diarization using voice embeddings and online clustering.
 
         Resemblyzer supplies the embedding model locally.  A short-term
@@ -237,6 +268,14 @@ class DiarizationEngine:
         import librosa
         import numpy as np
 
+        values = dict(self.parameters)
+        if isinstance(parameters, dict):
+            values.update(parameters)
+        max_silence_gap_seconds = max(0.05, min(1.0, float(values.get("max_silence_gap_seconds", MAX_SILENCE_GAP_SECONDS))))
+        min_speech_seconds = max(0.2, min(2.0, float(values.get("min_speech_seconds", MIN_SPEECH_SECONDS))))
+        embedding_context_seconds = max(0.5, min(4.0, float(values.get("embedding_context_seconds", EMBEDDING_CONTEXT_SECONDS))))
+        embedding_hop_seconds = max(0.25, min(2.0, float(values.get("embedding_hop_seconds", EMBEDDING_HOP_SECONDS))))
+        cluster_threshold = max(0.4, min(0.95, float(values.get("cluster_threshold", CLUSTER_THRESHOLD))))
         clusters: list[dict[str, Any]] = []
         output: list[SpeakerSegment] = []
         offset = 0.0
@@ -250,12 +289,17 @@ class DiarizationEngine:
                 # retryable stage while the recording is still retained.
                 raise RuntimeError(f"无法读取说话人重排音频 {Path(source).name}: {exc}") from exc
             duration = len(waveform) / max(1, sample_rate)
-            for interval_start, interval_end in self._speech_intervals(waveform, sample_rate):
+            for interval_start, interval_end in self._speech_intervals(
+                waveform,
+                sample_rate,
+                max_silence_gap_seconds=max_silence_gap_seconds,
+                min_speech_seconds=min_speech_seconds,
+            ):
                 cursor = interval_start
                 interval_duration = interval_end - interval_start
                 while cursor < interval_end - 1e-3:
-                    context_end = min(interval_end, cursor + EMBEDDING_CONTEXT_SECONDS)
-                    output_end = min(interval_end, cursor + (EMBEDDING_HOP_SECONDS if interval_duration > EMBEDDING_CONTEXT_SECONDS else interval_duration))
+                    context_end = min(interval_end, cursor + embedding_context_seconds)
+                    output_end = min(interval_end, cursor + (embedding_hop_seconds if interval_duration > embedding_context_seconds else interval_duration))
                     chunk = waveform[int(cursor * sample_rate): int(context_end * sample_rate)]
                     label_index = 0
                     confidence = 0.35
@@ -276,7 +320,7 @@ class DiarizationEngine:
                             if similarity > best_similarity:
                                 best_similarity = similarity
                                 label_index = index
-                        if not clusters or best_similarity < CLUSTER_THRESHOLD:
+                        if not clusters or best_similarity < cluster_threshold:
                             label_index = len(clusters)
                             clusters.append({"centroid": np.asarray(embedding), "count": 1})
                             confidence = 0.55
@@ -304,7 +348,7 @@ class DiarizationEngine:
                         break
                     cursor = output_end
             offset += duration
-        return self._merge_segments(output)
+        return self._merge_segments(output, max_silence_gap_seconds)
 
 
 def normalize_speaker_labels(segments: Iterable[SpeakerSegment]) -> list[SpeakerSegment]:
@@ -315,7 +359,11 @@ def normalize_speaker_labels(segments: Iterable[SpeakerSegment]) -> list[Speaker
     return [SpeakerSegment(item.start, item.end, mapping[item.label], item.confidence) for item in ordered]
 
 
-def align_speakers(utterances: Iterable[Utterance], segments: Iterable[SpeakerSegment]) -> list[Utterance]:
+def align_speakers(
+    utterances: Iterable[Utterance],
+    segments: Iterable[SpeakerSegment],
+    overlap_include_threshold: float = OVERLAP_INCLUDE_THRESHOLD,
+) -> list[Utterance]:
     """Project diarization intervals onto transcript utterances.
 
     The original utterance objects are copied by mutation so their stable IDs
@@ -340,7 +388,7 @@ def align_speakers(utterances: Iterable[Utterance], segments: Iterable[SpeakerSe
             continue
         overlaps.sort(key=lambda value: (value[0], value[1].confidence), reverse=True)
         dominant_overlap, dominant = overlaps[0]
-        ids = [numeric[segment.label] for overlap, segment in overlaps if overlap / duration >= OVERLAP_INCLUDE_THRESHOLD]
+        ids = [numeric[segment.label] for overlap, segment in overlaps if overlap / duration >= overlap_include_threshold]
         if not ids:
             ids = [numeric[dominant.label]]
         item.speaker_id = ids[0]

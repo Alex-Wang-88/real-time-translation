@@ -207,3 +207,39 @@ def test_asr_settings_are_persisted_clamped_and_locked_after_start(tmp_path) -> 
         )
         assert locked.status_code == 409
         assert client.post(f"/api/v2/meetings/{meeting_id}/stop").status_code == 202
+
+
+def test_full_meeting_settings_are_clamped_and_template_ready(tmp_path) -> None:
+    settings = Settings(results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
+    with TestClient(app) as client:
+        created = client.post("/api/v2/meetings", json={"title": "完整设置"})
+        meeting_id = created.json()["id"]
+        updated = client.patch(
+            f"/api/v2/meetings/{meeting_id}/settings",
+            json={
+                "settings": {
+                    "speech_start_ms": 9999,
+                    "max_utterance_seconds": 0,
+                    "retry_temperature": 0.8,
+                    "translation_beam_size": 99,
+                    "speaker_cluster_threshold": 0.1,
+                    "enable_refinement": False,
+                    "keep_audio": False,
+                }
+            },
+        )
+        assert updated.status_code == 200
+        values = updated.json()["meeting_settings"]
+        assert values["speech_start_ms"] == 1000
+        assert values["max_utterance_seconds"] == 2
+        assert values["retry_temperature"] == 0.8
+        assert values["translation_beam_size"] == 8
+        assert values["speaker_cluster_threshold"] == 0.4
+        assert values["enable_refinement"] is False
+        assert values["keep_audio"] is False
+        assert updated.json()["asr_settings"]["realtime_beam_size"] == 5
+
+        state_file = app.state.manager.get(meeting_id).output_dir / "session_state.json"
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["meeting_settings"] == values

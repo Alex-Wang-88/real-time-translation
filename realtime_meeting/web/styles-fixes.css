@@ -1,6 +1,6 @@
-.meeting-entry { width: 100%; margin-bottom: 8px; padding: 12px; border: 0; border-radius: 10px; color: #b8ccc4; background: transparent; text-align: left; }
-.meeting-entry:hover { background: #1a302a; }
-.meeting-entry.active { color: #e8faf2; background: #1f4036; }
+.meeting-entry { width: 100%; margin-bottom: 6px; padding: 11px; border: 1px solid transparent; border-radius: 8px; color: #4e5969; background: transparent; text-align: left; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+.meeting-entry:hover { border-color: #d5e0f5; color: #1d2129; background: #f7f9fd; }
+.meeting-entry.active { border-color: #c9ddff; color: #0e42c3; background: #e8f3ff; }
 .meeting-entry-title { display: block; overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.meeting-entry-meta, .meeting-entry-state { display: block; margin-top: 5px; color: #6b8a80; font-size: 9px; }
-.meeting-entry-state.live { color: #ed9b76; }
+.meeting-entry-meta, .meeting-entry-state { display: block; margin-top: 5px; color: #86909c; font-size: 9px; }
+.meeting-entry-state.live { color: #165dff; }

@@ -227,7 +227,7 @@ class LiveChineseTranslator:
         self.autodownload = autodownload
         self.models: dict[str, tuple[Any, Any, Any, str, str]] = {}
         self.failed: dict[str, str] = {}
-        self.cache: dict[tuple[str, str], TranslationResult] = {}
+        self.cache: dict[tuple[str, str, int, int, float], TranslationResult] = {}
 
     def _find(self, source: str) -> Path | None:
         if not self.model_root:
@@ -328,8 +328,27 @@ class LiveChineseTranslator:
             self.progress(f"translation model {source} is unavailable: {exc}")
             return None
 
-    def translate_many(self, texts: list[str], source: str) -> list[TranslationResult]:
+    def translate_many(
+        self,
+        texts: list[str],
+        source: str,
+        settings: dict[str, Any] | None = None,
+    ) -> list[TranslationResult]:
         source = normalize_language_code(source) or source
+        values = settings if isinstance(settings, dict) else {}
+        try:
+            beam_size = max(1, min(8, int(float(values.get("translation_beam_size", 2)))))
+        except (TypeError, ValueError):
+            beam_size = 2
+        try:
+            max_decoding_length = max(64, min(1024, int(float(values.get("translation_max_decoding_length", 384)))))
+        except (TypeError, ValueError):
+            max_decoding_length = 384
+        try:
+            repetition_penalty = max(1.0, min(2.0, float(values.get("translation_repetition_penalty", 1.05))))
+        except (TypeError, ValueError):
+            repetition_penalty = 1.05
+        cache_suffix = (beam_size, max_decoding_length, repetition_penalty)
         results: list[TranslationResult | None] = [None] * len(texts)
         pending: list[tuple[int, str]] = []
         for index, text in enumerate(texts):
@@ -340,8 +359,8 @@ class LiveChineseTranslator:
                 results[index] = TranslationResult(simplify_chinese(value), "not_needed")
             elif source not in {"en", "de"}:
                 results[index] = TranslationResult("", "unsupported", error=f"unsupported source language: {source}")
-            elif (source, value) in self.cache:
-                results[index] = self.cache[(source, value)]
+            elif (source, value, *cache_suffix) in self.cache:
+                results[index] = self.cache[(source, value, *cache_suffix)]
             else:
                 pending.append((index, value))
         loaded = self._load(source) if pending else None
@@ -360,9 +379,9 @@ class LiveChineseTranslator:
                 pieces = [[target_tag] + source_sp.encode(value, out_type=str) + ["</s>"] for _, value in pending]
                 generated = translator.translate_batch(
                     pieces,
-                    beam_size=2,
-                    max_decoding_length=384,
-                    repetition_penalty=1.05,
+                    beam_size=beam_size,
+                    max_decoding_length=max_decoding_length,
+                    repetition_penalty=repetition_penalty,
                 )
                 for (index, value), hypothesis in zip(pending, generated):
                     tokens = list(hypothesis.hypotheses[0])
@@ -378,7 +397,7 @@ class LiveChineseTranslator:
         final = [item or TranslationResult("", "failed", error="translator returned no result") for item in results]
         for index, value in pending:
             if final[index].status in {"ready", "failed"}:
-                self.cache[(source, value)] = final[index]
+                self.cache[(source, value, *cache_suffix)] = final[index]
         return final
 
 
@@ -467,10 +486,7 @@ class LiveModelRuntime:
         self.detector = MultilingualDetector()
         self.speaker_encoder = None
         self.vad: Any | None = None
-        self.diarization = DiarizationEngine(
-            "cpu",
-            required=diarization_required,
-        )
+        self.diarization = DiarizationEngine("cpu", required=diarization_required)
         self.gpu_manager = GpuResourceManager()
         self.realtime_engine = RealtimeAsrEngine(
             self.asr_primary_name,
@@ -689,8 +705,9 @@ class LiveModelRuntime:
         self._event("postprocess_released", model=self.asr_refine_name)
         gc.collect()
 
-    def new_speaker_clusterer(self) -> OnlineSpeakerClusterer:
-        return OnlineSpeakerClusterer(self.device, encoder=self.speaker_encoder)
+    def new_speaker_clusterer(self, threshold: float | None = None) -> OnlineSpeakerClusterer:
+        value = max(0.4, min(0.95, float(threshold if threshold is not None else 0.68)))
+        return OnlineSpeakerClusterer(self.device, threshold=value, encoder=self.speaker_encoder)
 
     def new_vad(self) -> Callable[[bytes], bool | None] | None:
         if self.vad is None:
@@ -783,17 +800,19 @@ class LiveModelRuntime:
         beam_size: int | None = None,
         best_of: int | None = None,
         temperature: float = 0.0,
+        thresholds: dict[str, float] | None = None,
     ) -> _WhisperDecode:
         if model is None:
             return _WhisperDecode("", None, 0.0)
         selected_beam_size = beam_size or (self.asr_refine_beam_size if refine else self.asr_realtime_beam_size)
+        values = thresholds or {}
         options = {
             "beam_size": selected_beam_size,
             "best_of": best_of or self.asr_best_of,
             "temperature": temperature,
-            "compression_ratio_threshold": self.asr_compression_ratio_threshold,
-            "log_prob_threshold": self.asr_log_prob_threshold,
-            "no_speech_threshold": self.asr_no_speech_threshold,
+            "compression_ratio_threshold": values.get("compression_ratio_threshold", self.asr_compression_ratio_threshold),
+            "log_prob_threshold": values.get("log_prob_threshold", self.asr_log_prob_threshold),
+            "no_speech_threshold": values.get("no_speech_threshold", self.asr_no_speech_threshold),
             "vad_filter": False,
             "condition_on_previous_text": False,
             "initial_prompt": prompt or None,
@@ -843,43 +862,51 @@ class LiveModelRuntime:
             temperature=max(temperature_values) if temperature_values else temperature,
         )
 
-    def _decode_needs_retry(self, result: _WhisperDecode) -> bool:
+    def _decode_needs_retry(self, result: _WhisperDecode, thresholds: dict[str, float] | None = None) -> bool:
+        values = thresholds or {}
+        no_speech_threshold = values.get("no_speech_threshold", self.asr_no_speech_threshold)
+        log_prob_threshold = values.get("log_prob_threshold", self.asr_log_prob_threshold)
+        compression_ratio_threshold = values.get("compression_ratio_threshold", self.asr_compression_ratio_threshold)
         if not result.text or not self._has_speech_text(result.text):
             return False
         if (
             result.no_speech_prob is not None
-            and result.no_speech_prob > self.asr_no_speech_threshold
-            and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
+            and result.no_speech_prob > no_speech_threshold
+            and (result.avg_logprob is None or result.avg_logprob < log_prob_threshold)
         ):
             return False
         return self._has_repetitive_loop(result.text) or (
             result.avg_logprob is not None
-            and result.avg_logprob < self.asr_log_prob_threshold
+            and result.avg_logprob < log_prob_threshold
         ) or (
             result.compression_ratio is not None
-            and result.compression_ratio > self.asr_compression_ratio_threshold
+            and result.compression_ratio > compression_ratio_threshold
         )
 
-    def _discard_decode_result(self, result: _WhisperDecode) -> str | None:
+    def _discard_decode_result(self, result: _WhisperDecode, thresholds: dict[str, float] | None = None) -> str | None:
+        values = thresholds or {}
+        no_speech_threshold = values.get("no_speech_threshold", self.asr_no_speech_threshold)
+        log_prob_threshold = values.get("log_prob_threshold", self.asr_log_prob_threshold)
+        compression_ratio_threshold = values.get("compression_ratio_threshold", self.asr_compression_ratio_threshold)
         if not result.text:
             return "empty"
         if not self._has_speech_text(result.text):
             return "punctuation_only"
         if (
             result.no_speech_prob is not None
-            and result.no_speech_prob > self.asr_no_speech_threshold
-            and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
+            and result.no_speech_prob > no_speech_threshold
+            and (result.avg_logprob is None or result.avg_logprob < log_prob_threshold)
         ):
             return "no_speech"
         severe_compression = (
             result.compression_ratio is not None
-            and result.compression_ratio > max(5.0, self.asr_compression_ratio_threshold * 2)
+            and result.compression_ratio > max(5.0, compression_ratio_threshold * 2)
         )
         if self._has_repetitive_loop(result.text) or severe_compression or (
             result.compression_ratio is not None
-            and result.compression_ratio > self.asr_compression_ratio_threshold
+            and result.compression_ratio > compression_ratio_threshold
             and result.avg_logprob is not None
-            and result.avg_logprob < self.asr_log_prob_threshold
+            and result.avg_logprob < log_prob_threshold
         ):
             return "repetitive_hallucination"
         normalized = re.sub(r"[\s\W_]+", "", result.text.casefold(), flags=re.UNICODE)
@@ -890,26 +917,34 @@ class LiveModelRuntime:
             return "filler_only"
         return None
 
-    def _decode_quality(self, result: _WhisperDecode) -> float:
+    def _decode_quality(self, result: _WhisperDecode, thresholds: dict[str, float] | None = None) -> float:
+        values = thresholds or {}
+        no_speech_threshold = values.get("no_speech_threshold", self.asr_no_speech_threshold)
+        compression_ratio_threshold = values.get("compression_ratio_threshold", self.asr_compression_ratio_threshold)
         score = result.avg_logprob if result.avg_logprob is not None else -10.0
-        if result.compression_ratio is not None and result.compression_ratio > self.asr_compression_ratio_threshold:
-            score -= min(2.0, result.compression_ratio - self.asr_compression_ratio_threshold)
-        if result.no_speech_prob is not None and result.no_speech_prob > self.asr_no_speech_threshold:
-            score -= result.no_speech_prob - self.asr_no_speech_threshold
+        if result.compression_ratio is not None and result.compression_ratio > compression_ratio_threshold:
+            score -= min(2.0, result.compression_ratio - compression_ratio_threshold)
+        if result.no_speech_prob is not None and result.no_speech_prob > no_speech_threshold:
+            score -= result.no_speech_prob - no_speech_threshold
         if not self._has_speech_text(result.text):
             score -= 10.0
         return score
 
-    def _select_decode_result(self, first: _WhisperDecode, retry: _WhisperDecode) -> _WhisperDecode:
-        first_discarded = self._discard_decode_result(first) is not None
-        retry_discarded = self._discard_decode_result(retry) is not None
+    def _select_decode_result(
+        self,
+        first: _WhisperDecode,
+        retry: _WhisperDecode,
+        thresholds: dict[str, float] | None = None,
+    ) -> _WhisperDecode:
+        first_discarded = self._discard_decode_result(first, thresholds) is not None
+        retry_discarded = self._discard_decode_result(retry, thresholds) is not None
         if first_discarded != retry_discarded:
             return retry if first_discarded else first
         if not retry.text or not self._has_speech_text(retry.text):
             return first
         if not first.text or not self._has_speech_text(first.text):
             return retry
-        return retry if self._decode_quality(retry) >= self._decode_quality(first) else first
+        return retry if self._decode_quality(retry, thresholds) >= self._decode_quality(first, thresholds) else first
 
     def _recognize(
         self,
@@ -941,6 +976,19 @@ class LiveModelRuntime:
             realtime_beam_size = bounded_int("realtime_beam_size", self.asr_realtime_beam_size, 1, 10)
             refine_beam_size = bounded_int("refine_beam_size", self.asr_refine_beam_size, 1, 12)
             best_of = bounded_int("best_of", self.asr_best_of, 1, 12)
+            def bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+                try:
+                    value = float(overrides.get(name, default))
+                except (TypeError, ValueError):
+                    value = default
+                return max(minimum, min(maximum, value))
+
+            thresholds = {
+                "retry_temperature": bounded_float("retry_temperature", self.asr_retry_temperature, 0.0, 1.0),
+                "log_prob_threshold": bounded_float("log_prob_threshold", self.asr_log_prob_threshold, -10.0, 0.0),
+                "no_speech_threshold": bounded_float("no_speech_threshold", self.asr_no_speech_threshold, 0.0, 1.0),
+                "compression_ratio_threshold": bounded_float("compression_ratio_threshold", self.asr_compression_ratio_threshold, 1.0, 10.0),
+            }
             initial_beam_size = refine_beam_size if refine else realtime_beam_size
 
             def decode(
@@ -959,13 +1007,14 @@ class LiveModelRuntime:
                     beam_size=beam_size,
                     best_of=best_of,
                     temperature=temperature,
+                    thresholds=thresholds,
                 )
                 self.metrics["asr_calls"] = int(self.metrics.get("asr_calls", 0)) + 1
                 return result
 
             def decode_with_retry() -> _WhisperDecode:
                 result = decode(0.0, initial_beam_size, best_of, prompt, language_hint)
-                if self._decode_needs_retry(result):
+                if self._decode_needs_retry(result, thresholds):
                     self.metrics["asr_decode_retries"] = int(self.metrics.get("asr_decode_retries", 0)) + 1
                     self._event(
                         "asr_decode_retry",
@@ -977,7 +1026,7 @@ class LiveModelRuntime:
                         prompt_cleared=True,
                     )
                     retry = decode(
-                        self.asr_retry_temperature,
+                        thresholds["retry_temperature"],
                         max(initial_beam_size, 5),
                         max(best_of, 5),
                         None,
@@ -985,7 +1034,7 @@ class LiveModelRuntime:
                         # reconsider the language on the retry as well.
                         None,
                     )
-                    result = self._select_decode_result(result, retry)
+                    result = self._select_decode_result(result, retry, thresholds)
                     result.retry_used = True
                 return result
 
@@ -994,7 +1043,7 @@ class LiveModelRuntime:
                     result = decode_with_retry()
             else:
                 result = decode_with_retry()
-            discard_reason = self._discard_decode_result(result)
+            discard_reason = self._discard_decode_result(result, thresholds)
             if discard_reason:
                 self.metrics["asr_discarded_results"] = int(self.metrics.get("asr_discarded_results", 0)) + 1
                 self._event(
@@ -1132,30 +1181,44 @@ class LiveModelRuntime:
         kwargs["refined"] = True
         return self.transcribe_final(event, **kwargs)
 
-    def translate_text(self, text: str, source_language: str) -> TranslationResult:
+    def translate_text(
+        self,
+        text: str,
+        source_language: str,
+        translation_settings: dict[str, Any] | None = None,
+    ) -> TranslationResult:
         if self.translator is None:
             return TranslationResult("", "unsupported", error="translator is not ready")
         self.metrics["translation_calls"] = int(self.metrics.get("translation_calls", 0)) + 1
         if self.device == "cuda":
             with self.gpu_manager.acquire_sync("translation"):
-                return self.translator.translate_many([text], source_language)[0]
-        return self.translator.translate_many([text], source_language)[0]
+                return self.translator.translate_many([text], source_language, translation_settings)[0]
+        return self.translator.translate_many([text], source_language, translation_settings)[0]
 
-    def translate_text_batch(self, texts: list[str], source_language: str) -> list[TranslationResult]:
+    def translate_text_batch(
+        self,
+        texts: list[str],
+        source_language: str,
+        translation_settings: dict[str, Any] | None = None,
+    ) -> list[TranslationResult]:
         if self.translator is None:
             return [TranslationResult("", "unsupported", error="translator is not ready") for _ in texts]
         self.metrics["translation_calls"] = int(self.metrics.get("translation_calls", 0)) + len(texts)
         if self.device == "cuda":
             with self.gpu_manager.acquire_sync("translation"):
-                return self.translator.translate_many(texts, source_language)
-        return self.translator.translate_many(texts, source_language)
+                return self.translator.translate_many(texts, source_language, translation_settings)
+        return self.translator.translate_many(texts, source_language, translation_settings)
 
-    def diarize_audio(self, audio_paths: list[Path]) -> list[Any]:
+    def diarize_audio(
+        self,
+        audio_paths: list[Path],
+        diarization_settings: dict[str, Any] | None = None,
+    ) -> list[Any]:
         if self.device == "cuda":
             with self.gpu_manager.acquire_sync("diarization"):
-                result = self.diarization.diarize(audio_paths)
+                result = self.diarization.diarize(audio_paths, diarization_settings)
         else:
-            result = self.diarization.diarize(audio_paths)
+            result = self.diarization.diarize(audio_paths, diarization_settings)
         return result
 
     def capability_snapshot(self) -> dict[str, Any]:

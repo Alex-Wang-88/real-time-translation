@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 try:
     from dotenv import load_dotenv
@@ -115,6 +116,52 @@ ASR_SETTING_LIMITS: dict[str, tuple[int, int]] = {
     "vad_minimum_speech_ms": (0, 2000),
 }
 
+# These are the controls that are safe and meaningful to change for one
+# meeting.  Deployment concerns such as model paths, API credentials, queue
+# sizes and network ports intentionally stay in ``Settings``.  Keeping this
+# schema in one place also gives the future template importer a stable
+# contract instead of having to know about individual HTML controls.
+MEETING_SETTING_LIMITS: dict[str, tuple[float, float]] = {
+    "volume_threshold_percent": (0.0, 30.0),
+    "speech_start_ms": (40.0, 1000.0),
+    "audio_pre_roll_ms": (40.0, 1000.0),
+    "silence_ms": (160.0, 2000.0),
+    "vad_minimum_speech_ms": (0.0, 2000.0),
+    "vad_minimum_speech_ratio": (0.0, 1.0),
+    "max_utterance_seconds": (2.0, 12.0),
+    "partial_interval_ms": (100.0, 5000.0),
+    "audio_segment_minutes": (1.0, 120.0),
+    "realtime_beam_size": (1.0, 10.0),
+    "refine_beam_size": (1.0, 12.0),
+    "best_of": (1.0, 12.0),
+    "retry_temperature": (0.0, 1.0),
+    "log_prob_threshold": (-10.0, 0.0),
+    "no_speech_threshold": (0.0, 1.0),
+    "compression_ratio_threshold": (1.0, 10.0),
+    "translation_beam_size": (1.0, 8.0),
+    "translation_max_decoding_length": (64.0, 1024.0),
+    "translation_repetition_penalty": (1.0, 2.0),
+    "speaker_cluster_threshold": (0.4, 0.95),
+    "speaker_min_speech_seconds": (0.2, 2.0),
+    "speaker_max_silence_gap_seconds": (0.05, 1.0),
+    "speaker_overlap_include_threshold": (0.0, 1.0),
+}
+
+MEETING_BOOLEAN_SETTINGS = (
+    "enable_refinement",
+    "enable_postprocess",
+    "diarization_required",
+    "keep_audio",
+)
+
+
+def _volume_percent_from_rms(value: float) -> float:
+    try:
+        result = float(value) / 32768.0 * 3.0 * 100.0
+    except (TypeError, ValueError):
+        result = 0.0
+    return round(max(0.0, min(30.0, result)), 1)
+
 
 def default_asr_settings(settings: Settings) -> dict[str, int]:
     return {
@@ -123,6 +170,92 @@ def default_asr_settings(settings: Settings) -> dict[str, int]:
         "best_of": settings.asr_best_of,
         "silence_ms": settings.silence_ms,
         "vad_minimum_speech_ms": settings.vad_minimum_speech_ms,
+    }
+
+
+def default_meeting_settings(settings: Settings) -> dict[str, Any]:
+    """Return the user-facing settings for a newly created meeting."""
+    asr = default_asr_settings(settings)
+    return {
+        "volume_threshold_percent": _volume_percent_from_rms(settings.vad_minimum_rms),
+        "speech_start_ms": settings.speech_start_ms,
+        "audio_pre_roll_ms": settings.audio_pre_roll_ms,
+        "silence_ms": asr["silence_ms"],
+        "vad_minimum_speech_ms": asr["vad_minimum_speech_ms"],
+        "vad_minimum_speech_ratio": settings.vad_minimum_speech_ratio,
+        "max_utterance_seconds": settings.max_utterance_seconds,
+        "partial_interval_ms": settings.partial_interval_ms,
+        "audio_segment_minutes": settings.audio_segment_minutes,
+        "realtime_beam_size": asr["realtime_beam_size"],
+        "refine_beam_size": asr["refine_beam_size"],
+        "best_of": asr["best_of"],
+        "retry_temperature": settings.asr_retry_temperature,
+        "log_prob_threshold": settings.asr_log_prob_threshold,
+        "no_speech_threshold": settings.asr_no_speech_threshold,
+        "compression_ratio_threshold": settings.asr_compression_ratio_threshold,
+        "translation_beam_size": 2,
+        "translation_max_decoding_length": 384,
+        "translation_repetition_penalty": 1.05,
+        "speaker_cluster_threshold": 0.68,
+        "speaker_min_speech_seconds": 0.35,
+        "speaker_max_silence_gap_seconds": 0.25,
+        "speaker_overlap_include_threshold": 0.15,
+        "enable_refinement": settings.enable_refinement,
+        "enable_postprocess": settings.enable_postprocess,
+        "diarization_required": settings.diarization_required,
+        "keep_audio": settings.keep_audio,
+    }
+
+
+def _flatten_meeting_settings(values: object) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        return {}
+    result = dict(values)
+    # Accept grouped objects now so a later template file can be organized by
+    # panel without changing the persisted flat representation.
+    for group in ("audio", "segmentation", "asr", "translation", "speaker", "processing"):
+        nested = values.get(group)
+        if isinstance(nested, dict):
+            result.update(nested)
+    legacy_asr = values.get("asr_settings")
+    if isinstance(legacy_asr, dict):
+        result.update(legacy_asr)
+    return result
+
+
+def normalize_meeting_settings(values: object, settings: Settings) -> dict[str, Any]:
+    """Clamp user-editable meeting settings while preserving safe defaults."""
+    source = _flatten_meeting_settings(values)
+    defaults = default_meeting_settings(settings)
+    normalized: dict[str, Any] = {}
+    integer_fields = {
+        "speech_start_ms", "audio_pre_roll_ms", "silence_ms",
+        "vad_minimum_speech_ms", "partial_interval_ms", "audio_segment_minutes",
+        "realtime_beam_size", "refine_beam_size", "best_of",
+        "translation_beam_size", "translation_max_decoding_length",
+    }
+    for name, (minimum, maximum) in MEETING_SETTING_LIMITS.items():
+        default = defaults[name]
+        try:
+            value = float(source.get(name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        value = max(minimum, min(maximum, value))
+        normalized[name] = int(round(value)) if name in integer_fields else round(value, 4)
+    for name in MEETING_BOOLEAN_SETTINGS:
+        value = source.get(name, defaults[name])
+        if isinstance(value, str):
+            normalized[name] = value.strip().casefold() in {"1", "true", "yes", "on"}
+        else:
+            normalized[name] = bool(value)
+    return normalized
+
+
+def asr_settings_from_meeting(values: object, settings: Settings) -> dict[str, int]:
+    normalized = normalize_meeting_settings(values, settings)
+    return {
+        name: int(normalized[name])
+        for name in ASR_SETTING_LIMITS
     }
 
 

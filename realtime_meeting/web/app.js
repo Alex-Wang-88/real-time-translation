@@ -8,13 +8,130 @@ const RECOMMENDED_ASR_SETTINGS = Object.freeze({
   vad_minimum_speech_ms: 450,
 });
 
-const ASR_SETTING_FIELDS = [
-  { key: "realtime_beam_size", input: "asrRealtimeBeamSize", output: "asrRealtimeBeamValue", format: (value) => String(value) },
-  { key: "refine_beam_size", input: "asrRefineBeamSize", output: "asrRefineBeamValue", format: (value) => String(value) },
-  { key: "best_of", input: "asrBestOf", output: "asrBestOfValue", format: (value) => String(value) },
-  { key: "silence_ms", input: "asrSilenceMs", output: "asrSilenceValue", format: (value) => `${value} ms` },
-  { key: "vad_minimum_speech_ms", input: "asrMinimumSpeechMs", output: "asrMinimumSpeechValue", format: (value) => `${value} ms` },
+const RECOMMENDED_MEETING_SETTINGS = Object.freeze({
+  ...RECOMMENDED_ASR_SETTINGS,
+  volume_threshold_percent: 2.2,
+  speech_start_ms: 80,
+  audio_pre_roll_ms: 240,
+  vad_minimum_speech_ratio: 0.12,
+  max_utterance_seconds: 8,
+  partial_interval_ms: 900,
+  audio_segment_minutes: 30,
+  retry_temperature: 0.2,
+  log_prob_threshold: -1,
+  no_speech_threshold: 0.6,
+  compression_ratio_threshold: 2.4,
+  translation_beam_size: 2,
+  translation_max_decoding_length: 384,
+  translation_repetition_penalty: 1.05,
+  speaker_cluster_threshold: 0.68,
+  speaker_min_speech_seconds: 0.35,
+  speaker_max_silence_gap_seconds: 0.25,
+  speaker_overlap_include_threshold: 0.15,
+  enable_refinement: true,
+  enable_postprocess: true,
+  diarization_required: true,
+  keep_audio: true,
+});
+
+const SETTINGS_TEMPLATE_DEFINITIONS = Object.freeze({
+  balanced: Object.freeze({
+    label: "均衡实时",
+    description: "适合日常中文/英文/德文会议，兼顾出字速度和识别质量。",
+    values: Object.freeze({ ...RECOMMENDED_MEETING_SETTINGS }),
+  }),
+  low_latency: Object.freeze({
+    label: "低延迟速记",
+    description: "更快刷新逐句稿，适合讨论密集、希望尽快看到草稿的会议。",
+    values: Object.freeze({
+      ...RECOMMENDED_MEETING_SETTINGS,
+      speech_start_ms: 60,
+      audio_pre_roll_ms: 160,
+      silence_ms: 400,
+      vad_minimum_speech_ms: 250,
+      vad_minimum_speech_ratio: 0.08,
+      max_utterance_seconds: 6,
+      partial_interval_ms: 400,
+      realtime_beam_size: 3,
+      refine_beam_size: 4,
+      best_of: 3,
+      retry_temperature: 0.15,
+      log_prob_threshold: -1.2,
+      no_speech_threshold: 0.65,
+      translation_beam_size: 1,
+      translation_max_decoding_length: 256,
+      translation_repetition_penalty: 1.02,
+      speaker_cluster_threshold: 0.62,
+      speaker_min_speech_seconds: 0.25,
+      speaker_max_silence_gap_seconds: 0.2,
+      speaker_overlap_include_threshold: 0.1,
+    }),
+  }),
+  quality: Object.freeze({
+    label: "高质量会议",
+    description: "增加识别和翻译搜索宽度，适合正式会议、口音较重或需要复核的录音。",
+    values: Object.freeze({
+      ...RECOMMENDED_MEETING_SETTINGS,
+      volume_threshold_percent: 2.5,
+      speech_start_ms: 120,
+      audio_pre_roll_ms: 320,
+      silence_ms: 900,
+      vad_minimum_speech_ms: 600,
+      vad_minimum_speech_ratio: 0.16,
+      max_utterance_seconds: 10,
+      partial_interval_ms: 1200,
+      audio_segment_minutes: 60,
+      realtime_beam_size: 8,
+      refine_beam_size: 10,
+      best_of: 9,
+      retry_temperature: 0.25,
+      log_prob_threshold: -0.8,
+      no_speech_threshold: 0.55,
+      compression_ratio_threshold: 2.2,
+      translation_beam_size: 3,
+      translation_max_decoding_length: 512,
+      translation_repetition_penalty: 1.1,
+      speaker_cluster_threshold: 0.74,
+      speaker_min_speech_seconds: 0.5,
+      speaker_max_silence_gap_seconds: 0.3,
+      speaker_overlap_include_threshold: 0.2,
+    }),
+  }),
+});
+
+const SETTINGS_BOOLEAN_KEYS = ["enable_refinement", "enable_postprocess", "diarization_required", "keep_audio"];
+
+const MEETING_NUMBER_FIELDS = [
+  { key: "volume_threshold_percent", slider: "volumeThreshold", input: "volumeThresholdValue", min: 0, max: 30, step: 0.1 },
+  { key: "speech_start_ms", slider: "asrSpeechStartMs", input: "asrSpeechStartMsValue", min: 40, max: 1000, step: 10 },
+  { key: "audio_pre_roll_ms", slider: "asrAudioPreRollMs", input: "asrAudioPreRollMsValue", min: 40, max: 1000, step: 10 },
+  { key: "silence_ms", slider: "asrSilenceMs", input: "asrSilenceMsValue", min: 160, max: 2000, step: 10 },
+  { key: "vad_minimum_speech_ms", slider: "asrMinimumSpeechMs", input: "asrMinimumSpeechMsValue", min: 0, max: 2000, step: 10 },
+  { key: "vad_minimum_speech_ratio", slider: "asrSpeechRatio", input: "asrSpeechRatioValue", min: 0, max: 1, step: 0.01 },
+  { key: "max_utterance_seconds", slider: "asrMaxUtteranceSeconds", input: "asrMaxUtteranceSecondsValue", min: 2, max: 12, step: 0.5 },
+  { key: "partial_interval_ms", slider: "asrPartialIntervalMs", input: "asrPartialIntervalMsValue", min: 100, max: 5000, step: 50 },
+  { key: "realtime_beam_size", slider: "asrRealtimeBeamSize", input: "asrRealtimeBeamSizeValue", min: 1, max: 10, step: 1 },
+  { key: "refine_beam_size", slider: "asrRefineBeamSize", input: "asrRefineBeamSizeValue", min: 1, max: 12, step: 1 },
+  { key: "best_of", slider: "asrBestOf", input: "asrBestOfValue", min: 1, max: 12, step: 1 },
+  { key: "retry_temperature", slider: "asrRetryTemperature", input: "asrRetryTemperatureValue", min: 0, max: 1, step: 0.05 },
+  { key: "log_prob_threshold", slider: "asrLogProbThreshold", input: "asrLogProbThresholdValue", min: -10, max: 0, step: 0.1 },
+  { key: "no_speech_threshold", slider: "asrNoSpeechThreshold", input: "asrNoSpeechThresholdValue", min: 0, max: 1, step: 0.01 },
+  { key: "compression_ratio_threshold", slider: "asrCompressionRatioThreshold", input: "asrCompressionRatioThresholdValue", min: 1, max: 10, step: 0.1 },
+  { key: "translation_beam_size", slider: "translationBeamSize", input: "translationBeamSizeValue", min: 1, max: 8, step: 1 },
+  { key: "translation_max_decoding_length", slider: "translationMaxLength", input: "translationMaxLengthValue", min: 64, max: 1024, step: 16 },
+  { key: "translation_repetition_penalty", slider: "translationRepetitionPenalty", input: "translationRepetitionPenaltyValue", min: 1, max: 2, step: 0.01 },
+  { key: "audio_segment_minutes", slider: "audioSegmentMinutes", input: "audioSegmentMinutesValue", min: 1, max: 120, step: 1 },
+  { key: "speaker_cluster_threshold", slider: "speakerClusterThreshold", input: "speakerClusterThresholdValue", min: 0.4, max: 0.95, step: 0.01 },
+  { key: "speaker_min_speech_seconds", slider: "speakerMinSpeech", input: "speakerMinSpeechValue", min: 0.2, max: 2, step: 0.05 },
+  { key: "speaker_max_silence_gap_seconds", slider: "speakerMaxGap", input: "speakerMaxGapValue", min: 0.05, max: 1, step: 0.05 },
+  { key: "speaker_overlap_include_threshold", slider: "speakerOverlap", input: "speakerOverlapValue", min: 0, max: 1, step: 0.01 },
 ];
+
+// Keep the old name as a small compatibility surface for extensions and
+// static checks from the first settings panel version.
+const ASR_SETTING_FIELDS = MEETING_NUMBER_FIELDS.filter((field) => [
+  "realtime_beam_size", "refine_beam_size", "best_of", "silence_ms", "vad_minimum_speech_ms",
+].includes(field.key));
 
 // The live microphone level is normalized to 0-100%.  Keep this separate
 // from the 0-30% background-noise filter threshold range.
@@ -34,10 +151,16 @@ const state = {
   intentionalClose: false,
   transcript: new Map(),
   transcriptNodes: new Map(),
+  draft: null,
+  draftNode: null,
   transcriptNearBottom: true,
+  summaryStreaming: false,
+  summaryRenderFrame: null,
   timer: null,
   volumeThresholdPercent: 2.2,
   asrSettings: { ...RECOMMENDED_ASR_SETTINGS },
+  meetingSettings: { ...RECOMMENDED_MEETING_SETTINGS },
+  settingsTemplate: "balanced",
   microphoneLevelPercent: 0,
   pendingMicrophoneLevel: 0,
   microphoneLevelFrame: null,
@@ -108,6 +231,10 @@ const dom = {
   asrSettingsDialog: $("#asrSettingsDialog"),
   asrSettingsForm: $("#asrSettingsForm"),
   asrSettingsNotice: $("#asrSettingsNotice"),
+  settingsTabs: document.querySelectorAll("[data-settings-tab]"),
+  settingsPanels: document.querySelectorAll("[data-settings-panel]"),
+  settingsTemplateSelect: $("#settingsTemplateSelect"),
+  settingsTemplateHint: $("#settingsTemplateHint"),
   resetAsrSettings: $("#resetAsrSettings"),
   saveAsrSettings: $("#saveAsrSettings"),
 };
@@ -261,8 +388,9 @@ function setConnection(message, kind = "neutral") {
 function setVolumeThreshold(value, propagate = true) {
   const threshold = Math.max(0, Math.min(30, Number(value) || 0));
   state.volumeThresholdPercent = Math.round(threshold * 10) / 10;
+  state.meetingSettings.volume_threshold_percent = state.volumeThresholdPercent;
   if (dom.volumeThreshold) dom.volumeThreshold.value = String(state.volumeThresholdPercent);
-  if (dom.volumeThresholdValue) dom.volumeThresholdValue.textContent = `${state.volumeThresholdPercent.toFixed(1)}%`;
+  if (dom.volumeThresholdValue) dom.volumeThresholdValue.value = state.volumeThresholdPercent.toFixed(1);
   if (dom.volumeThresholdSummary) dom.volumeThresholdSummary.textContent = `${state.volumeThresholdPercent.toFixed(1)}%`;
   renderMicrophoneLevel(state.microphoneLevelPercent, Boolean(state.stream));
   if (!propagate) return;
@@ -273,25 +401,128 @@ function setVolumeThreshold(value, propagate = true) {
   }
 }
 
-function renderAsrSettings(settings = state.asrSettings) {
-  const values = { ...RECOMMENDED_ASR_SETTINGS, ...(settings || {}) };
-  for (const field of ASR_SETTING_FIELDS) {
-    const input = $(`#${field.input}`);
-    const output = $(`#${field.output}`);
-    if (!input || !output) continue;
-    const value = Number(values[field.key]);
-    input.value = String(Number.isFinite(value) ? value : RECOMMENDED_ASR_SETTINGS[field.key]);
-    output.textContent = field.format(input.value);
+function clampMeetingValue(field, value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return Number(RECOMMENDED_MEETING_SETTINGS[field.key]);
+  const step = Number(field.step) || 1;
+  const stepped = Math.round((numeric - field.min) / step) * step + field.min;
+  const precision = String(step).includes(".") ? String(step).split(".")[1].length : 0;
+  return Number(Math.max(field.min, Math.min(field.max, stepped)).toFixed(precision));
+}
+
+function normalizeComparableSettings(settings = {}) {
+  const normalized = {};
+  for (const field of MEETING_NUMBER_FIELDS) normalized[field.key] = clampMeetingValue(field, settings[field.key]);
+  for (const key of SETTINGS_BOOLEAN_KEYS) normalized[key] = Boolean(settings[key]);
+  return normalized;
+}
+
+function settingsEqual(left, right) {
+  const a = normalizeComparableSettings(left);
+  const b = normalizeComparableSettings(right);
+  return MEETING_NUMBER_FIELDS.every((field) => a[field.key] === b[field.key])
+    && SETTINGS_BOOLEAN_KEYS.every((key) => a[key] === b[key]);
+}
+
+function findSettingsTemplate(settings) {
+  for (const [id, template] of Object.entries(SETTINGS_TEMPLATE_DEFINITIONS)) {
+    if (settingsEqual(settings, template.values)) return id;
+  }
+  return "custom";
+}
+
+function updateTemplatePicker(templateId = state.settingsTemplate) {
+  const select = dom.settingsTemplateSelect;
+  if (!select) return;
+  const isKnownTemplate = Object.prototype.hasOwnProperty.call(SETTINGS_TEMPLATE_DEFINITIONS, templateId);
+  const selected = isKnownTemplate || templateId === "custom" ? templateId : "custom";
+  select.value = selected;
+  const custom = selected === "custom";
+  if (dom.settingsTemplateHint) {
+    dom.settingsTemplateHint.textContent = custom ? "自定义模板" : "预设模板";
+    dom.settingsTemplateHint.className = `settings-template-status${custom ? " custom" : ""}`;
+    dom.settingsTemplateHint.title = custom
+      ? "当前参数包含手动调整"
+      : SETTINGS_TEMPLATE_DEFINITIONS[selected]?.description || "";
+  }
+  select.title = custom
+    ? "当前参数包含手动调整"
+    : SETTINGS_TEMPLATE_DEFINITIONS[selected]?.description || "";
+}
+
+function markSettingsCustom() {
+  if (state.settingsTemplate === "custom") return;
+  state.settingsTemplate = "custom";
+  updateTemplatePicker("custom");
+}
+
+function applySettingsTemplate(templateId) {
+  const template = SETTINGS_TEMPLATE_DEFINITIONS[templateId];
+  if (!template) return;
+  state.settingsTemplate = templateId;
+  renderMeetingSettings(template.values);
+  updateTemplatePicker(templateId);
+  if (dom.asrSettingsNotice) dom.asrSettingsNotice.textContent = `${template.label}：${template.description}`;
+}
+
+function setMeetingField(field, value, { updateState = true } = {}) {
+  const normalized = clampMeetingValue(field, value);
+  const slider = $(`#${field.slider}`);
+  const input = $(`#${field.input}`);
+  if (slider) slider.value = String(normalized);
+  if (input) input.value = String(normalized);
+  if (updateState) state.meetingSettings[field.key] = normalized;
+  if (field.key === "volume_threshold_percent") {
+    state.volumeThresholdPercent = normalized;
+    if (dom.volumeThresholdSummary) dom.volumeThresholdSummary.textContent = `${normalized.toFixed(1)}%`;
+    renderMicrophoneLevel(state.microphoneLevelPercent, Boolean(state.stream));
+  }
+}
+
+function renderMeetingSettings(settings = state.meetingSettings, { updateState = true } = {}) {
+  const values = { ...RECOMMENDED_MEETING_SETTINGS, ...(settings || {}) };
+  if (updateState) {
+    state.meetingSettings = { ...state.meetingSettings, ...values };
+    state.settingsTemplate = findSettingsTemplate(state.meetingSettings);
+    updateTemplatePicker(state.settingsTemplate);
+  }
+  for (const field of MEETING_NUMBER_FIELDS) setMeetingField(field, values[field.key], { updateState });
+  if (updateState) setVolumeThreshold(values.volume_threshold_percent, false);
+  const toggles = {
+    enable_refinement: "settingEnableRefinement",
+    enable_postprocess: "settingEnablePostprocess",
+    diarization_required: "settingDiarizationRequired",
+    keep_audio: "settingKeepAudio",
+  };
+  for (const [key, id] of Object.entries(toggles)) {
+    const input = $(`#${id}`);
+    if (input) input.checked = Boolean(values[key]);
+    if (updateState) state.meetingSettings[key] = Boolean(values[key]);
   }
   const editable = state.meeting?.recording_state === "created";
   dom.openAsrSettings.disabled = !state.meeting;
   dom.openAsrSettings.title = editable ? "调整识别设置" : "识别设置只能在录音开始前调整";
-  for (const field of ASR_SETTING_FIELDS) {
+  for (const field of MEETING_NUMBER_FIELDS) {
+    const slider = $(`#${field.slider}`);
     const input = $(`#${field.input}`);
+    if (slider) slider.disabled = !editable && field.key !== "volume_threshold_percent";
+    if (input) input.disabled = !editable && field.key !== "volume_threshold_percent";
+  }
+  for (const id of ["settingEnableRefinement", "settingEnablePostprocess", "settingDiarizationRequired", "settingKeepAudio"]) {
+    const input = $(`#${id}`);
     if (input) input.disabled = !editable;
   }
+  // The audio threshold is live even though other meeting settings are locked
+  // at the start of recording.
+  const audioThresholdEditable = ["created", "starting", "recording"].includes(state.meeting?.recording_state);
+  if (dom.volumeThreshold) dom.volumeThreshold.disabled = !audioThresholdEditable;
+  if (dom.volumeThresholdValue) dom.volumeThresholdValue.disabled = !audioThresholdEditable;
   dom.resetAsrSettings.disabled = !editable;
   dom.saveAsrSettings.disabled = !editable;
+}
+
+function renderAsrSettings(settings = state.asrSettings) {
+  renderMeetingSettings({ ...state.meetingSettings, ...RECOMMENDED_ASR_SETTINGS, ...(settings || {}) });
 }
 
 function moveAudioSettingsIntoDialog() {
@@ -313,9 +544,23 @@ function readAsrSettings() {
   return Object.fromEntries(ASR_SETTING_FIELDS.map((field) => [field.key, Number($(`#${field.input}`).value)]));
 }
 
+function readMeetingSettings() {
+  const values = {};
+  for (const field of MEETING_NUMBER_FIELDS) values[field.key] = clampMeetingValue(field, $(`#${field.input}`)?.value);
+  for (const [key, id] of Object.entries({
+    enable_refinement: "settingEnableRefinement",
+    enable_postprocess: "settingEnablePostprocess",
+    diarization_required: "settingDiarizationRequired",
+    keep_audio: "settingKeepAudio",
+  })) values[key] = Boolean($(`#${id}`)?.checked);
+  state.settingsTemplate = findSettingsTemplate(values);
+  updateTemplatePicker(state.settingsTemplate);
+  return values;
+}
+
 function openAsrSettings() {
   if (!state.meeting) return;
-  renderAsrSettings(state.asrSettings);
+  renderMeetingSettings(state.meetingSettings);
   dom.asrSettingsNotice.textContent = state.meeting.recording_state === "created"
     ? "推荐值适合中文会议和实时识别；音频输入调整会立即应用，识别参数需要点击“保存设置”。"
     : "本次会议已经开始或结束，识别设置已锁定。请新建会议后再调整。";
@@ -328,7 +573,7 @@ async function saveAsrSettings() {
   try {
     const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/settings`, {
       method: "PATCH",
-      body: JSON.stringify({ asr_settings: readAsrSettings() }),
+      body: JSON.stringify({ settings: readMeetingSettings(), asr_settings: readAsrSettings() }),
     });
     applySnapshot(snapshot, false);
     dom.asrSettingsDialog.close();
@@ -414,11 +659,27 @@ function renderMeetings() {
 }
 
 function clearTranscript() {
+  clearDraft();
   state.transcript.clear();
   state.transcriptNodes.clear();
   dom.transcriptList.replaceChildren();
   dom.transcriptList.append(dom.transcriptEmpty);
   dom.transcriptEmpty.hidden = false;
+}
+
+function clearDraft() {
+  state.draft = null;
+  state.draftNode?.remove();
+  state.draftNode = null;
+  if (dom.transcriptEmpty && !state.transcript.size) dom.transcriptEmpty.hidden = false;
+}
+
+function draftMatchesUtterance(utterance) {
+  if (!state.draft || !utterance) return false;
+  const revision = String(state.draft.revision ?? "");
+  const sourceSegmentId = String(utterance.source_segment_id ?? "");
+  const segmentId = String(utterance.segment_id ?? "");
+  return revision !== "" && (revision === sourceSegmentId || segmentId.startsWith(`${revision}:`));
 }
 
 function upsertUtterance(utterance, transcript = state.transcript) {
@@ -441,25 +702,58 @@ function upsertUtterance(utterance, transcript = state.transcript) {
 
 function createTranscriptNode() {
   const article = document.createElement("article");
-  article.className = "transcript-item";
-  article.innerHTML = `<div class="transcript-meta"><time></time><span class="speaker-tag"></span><span class="language-tag"></span></div><p class="original-line"></p><div class="translation-line" hidden><span>中译</span><b></b></div>`;
+  article.className = "transcript-item transcript-message";
+  article.innerHTML = `<div class="transcript-meta"><span class="speaker-avatar" aria-hidden="true"></span><span class="speaker-tag"></span><time></time><span class="language-tag"></span></div><div class="transcript-bubbles"><p class="transcript-bubble original-bubble"></p><div class="transcript-bubble translation-bubble" hidden><span class="translation-label">中文翻译</span><b></b><span class="translation-pending" hidden><i></i><i></i><i></i></span></div></div>`;
   return article;
 }
 
 function updateTranscriptNode(article, item) {
   const lang = item.language || "unknown";
   article.dataset.segmentId = item.segment_id;
+  const speaker = Number(item.speaker_id);
+  article.dataset.speaker = Number.isFinite(speaker) ? String(speaker) : "unknown";
   article.querySelector("time").textContent = `${formatTime(item.start).slice(3)} – ${formatTime(item.end).slice(3)}`;
   article.querySelector(".speaker-tag").textContent = `演讲人 ${item.speaker_id ?? "?"}`;
   article.querySelector(".language-tag").textContent = lang.toUpperCase();
-  article.querySelector(".original-line").textContent = item.text || "";
-  const translation = article.querySelector(".translation-line");
-  translation.hidden = !(item.translation_zh && lang !== "zh");
-  translation.querySelector("b").textContent = item.translation_zh || "";
+  article.querySelector(".original-bubble").textContent = item.text || "";
+  const translation = article.querySelector(".translation-bubble");
+  const translated = Boolean(item.translation_zh && lang !== "zh");
+  const pending = lang !== "zh" && !translated && item.translation_status !== "unsupported";
+  const unsupported = lang !== "zh" && !translated && item.translation_status === "unsupported";
+  translation.hidden = lang === "zh" || unsupported;
+  translation.classList.toggle("is-pending", pending);
+  translation.querySelector("b").textContent = translated ? item.translation_zh : "";
+  translation.querySelector(".translation-label").textContent = pending ? "中文翻译" : "中文翻译";
+  translation.querySelector(".translation-pending").hidden = !pending;
+}
+
+function createDraftNode() {
+  const article = document.createElement("article");
+  article.className = "transcript-item transcript-message transcript-draft";
+  article.innerHTML = `<div class="transcript-meta"><span class="speaker-avatar draft-avatar" aria-hidden="true">✦</span><span class="speaker-tag">实时识别</span><time></time><span class="language-tag"></span></div><div class="transcript-bubbles"><p class="transcript-bubble original-bubble"><span class="draft-text"></span><span class="streaming-cursor" aria-hidden="true"></span></p><div class="draft-status"><span class="status-pulse"></span><span>正在识别</span></div></div>`;
+  return article;
+}
+
+function renderDraft(draft) {
+  if (!draft?.text) {
+    clearDraft();
+    return;
+  }
+  if (!state.draftNode) {
+    state.draftNode = createDraftNode();
+    dom.transcriptList.append(state.draftNode);
+  }
+  state.draft = { ...draft };
+  state.draftNode.querySelector(".draft-text").textContent = draft.text;
+  state.draftNode.querySelector("time").textContent = draft.start != null ? formatTime(draft.start).slice(3) : "实时";
+  state.draftNode.querySelector(".language-tag").textContent = draft.language ? String(draft.language).toUpperCase() : "";
+  dom.transcriptEmpty.hidden = true;
+  updateTranscriptViewport(true);
 }
 
 function updateTranscriptViewport(autoScroll, itemCount = state.transcript.size) {
-  dom.transcriptEmpty.hidden = itemCount > 0;
+  const hasDraft = Boolean(state.draftNode);
+  dom.transcriptEmpty.hidden = itemCount > 0 || hasDraft;
   dom.utteranceCount.textContent = `${itemCount} 条记录`;
   const shouldScroll = autoScroll || state.transcriptNearBottom;
   if (shouldScroll) requestAnimationFrame(() => { dom.transcriptList.scrollTop = dom.transcriptList.scrollHeight; });
@@ -485,11 +779,12 @@ function renderTranscriptItem(segmentId, autoScroll = false) {
 function removeTranscriptItem(segmentId) {
   state.transcriptNodes.get(segmentId)?.remove();
   state.transcriptNodes.delete(segmentId);
-  if (!state.transcript.size && !dom.transcriptEmpty.isConnected) dom.transcriptList.append(dom.transcriptEmpty);
+  if (!state.transcript.size && !state.draftNode && !dom.transcriptEmpty.isConnected) dom.transcriptList.append(dom.transcriptEmpty);
   updateTranscriptViewport(false);
 }
 
 function renderTranscript(autoScroll = false) {
+  clearDraft();
   const items = [...state.transcript.values()].sort((a, b) => (a.start || 0) - (b.start || 0));
   state.transcriptNodes.clear();
   dom.transcriptList.replaceChildren();
@@ -508,18 +803,40 @@ function renderSummary(summary, summaryState) {
   const stages = state.meeting?.postprocess?.stages || {};
   const preprocessingReady = ["asr_refine", "diarization", "translation"].every((key) => stages[key]?.state === "complete");
   dom.summaryBadge.textContent = summaryLabels[summaryState] || stateText(summaryState);
-  dom.summaryBadge.className = `badge ${summaryState === "complete" ? "success" : summaryState === "error" ? "danger" : "neutral"}`;
+  dom.summaryBadge.className = `badge ${summaryState === "complete" ? "success" : summaryState === "error" ? "danger" : summaryState === "running" ? "live" : "neutral"}`;
   dom.summaryText.classList.toggle("empty-result", !value);
+  dom.summaryText.classList.toggle("is-streaming", state.summaryStreaming && summaryState === "running");
   dom.summaryText.innerHTML = value
     ? markdownToHtml(value)
     : preprocessingReady
       ? "ASR 精修、说话人重排和翻译已经完成，可以生成会议纪要和 To-do-list。"
       : "停止会议后会先自动完成 ASR 精修、说话人重排和翻译。";
+  if (state.summaryStreaming && summaryState === "running" && value) {
+    const cursor = document.createElement("span");
+    cursor.className = "streaming-cursor summary-cursor";
+    cursor.setAttribute("aria-label", "正在生成");
+    dom.summaryText.append(cursor);
+  }
   dom.retrySummary.hidden = !(preprocessingReady && ["idle", "error", "complete"].includes(summaryState));
   dom.retrySummary.disabled = !preprocessingReady || summaryState === "running";
   dom.retrySummary.textContent = summaryState === "complete" ? "重新生成纪要和 To-do-list" : "生成纪要和 To-do-list";
   dom.downloadSummary.hidden = !value || !state.meeting?.files?.includes("meeting_minutes.md");
   dom.summaryProgress.hidden = !["queued", "running"].includes(summaryState);
+}
+
+function scheduleSummaryRender(summaryState = "running") {
+  if (state.summaryRenderFrame != null) return;
+  state.summaryRenderFrame = window.requestAnimationFrame(() => {
+    state.summaryRenderFrame = null;
+    renderSummary(state.meeting?.summary, summaryState);
+  });
+}
+
+function cancelSummaryRender() {
+  if (state.summaryRenderFrame != null) {
+    window.cancelAnimationFrame(state.summaryRenderFrame);
+    state.summaryRenderFrame = null;
+  }
 }
 
 function renderTodo(todo, todoState) {
@@ -595,15 +912,33 @@ function applySnapshot(snapshot, replace = false) {
   if (state.meeting?.id === snapshot.id && Number(snapshot.snapshot_revision || 0) < Number(state.meeting.snapshot_revision || 0)) return;
   const changed = state.meeting?.id !== snapshot.id;
   state.meeting = { ...(state.meeting || {}), ...snapshot };
+  if (changed || replace || state.meeting.recording_state !== "recording") clearDraft();
+  if (state.meeting.summary_state !== "running") {
+    state.summaryStreaming = false;
+    cancelSummaryRender();
+  }
   if (changed && snapshot.volume_threshold_percent != null) setVolumeThreshold(snapshot.volume_threshold_percent, false);
   if (snapshot.asr_settings) {
     state.asrSettings = { ...RECOMMENDED_ASR_SETTINGS, ...snapshot.asr_settings };
+  }
+  if (snapshot.meeting_settings) {
+    state.meetingSettings = { ...RECOMMENDED_MEETING_SETTINGS, ...snapshot.meeting_settings };
+  } else {
+    state.meetingSettings = {
+      ...RECOMMENDED_MEETING_SETTINGS,
+      ...state.meetingSettings,
+      ...state.asrSettings,
+      ...(snapshot.volume_threshold_percent != null ? { volume_threshold_percent: snapshot.volume_threshold_percent } : {}),
+    };
   }
   const isCreated = state.meeting.recording_state === "created";
   const canAdjustAudio = ["created", "starting", "recording"].includes(state.meeting.recording_state);
   const canStop = ["starting", "recording"].includes(state.meeting.recording_state);
   dom.volumeThreshold.disabled = !canAdjustAudio;
-  if (!dom.asrSettingsDialog.open) renderAsrSettings(state.asrSettings);
+  if (!dom.asrSettingsDialog.open) {
+    state.settingsTemplate = findSettingsTemplate(state.meetingSettings);
+    renderMeetingSettings(state.meetingSettings);
+  }
   const meetingIndex = state.meetings.findIndex((meeting) => meeting.id === snapshot.id);
   if (meetingIndex >= 0) state.meetings[meetingIndex] = { ...state.meetings[meetingIndex], ...snapshot };
   else state.meetings.unshift(snapshot);
@@ -703,6 +1038,7 @@ async function selectMeeting(id) {
     const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(id)}`);
     const oldId = state.meeting?.id;
     if (oldId !== id) {
+      clearDraft();
       if (state.meeting?.recording_state === "created") stopAudioCapture();
       closeStream(false);
     }
@@ -918,6 +1254,7 @@ async function handleEvent(payload) {
     if (payload.meeting) applySnapshot(payload.meeting, false);
     if (payload.message) dom.recordingHint.textContent = payload.message;
   } else if (type === "utterance") {
+    if (draftMatchesUtterance(payload.utterance)) clearDraft();
     const changed = upsertUtterance(payload.utterance);
     if (state.meeting) state.meeting.utterance_count = Math.max(state.meeting.utterance_count || 0, state.transcript.size);
     if (changed) renderTranscriptItem(payload.utterance.segment_id, true);
@@ -935,11 +1272,13 @@ async function handleEvent(payload) {
       renderTranscriptItem(payload.segment_id);
     }
   } else if (type === "draft") {
+    renderDraft(payload);
     dom.recordingHint.textContent = payload.text ? `正在识别：${payload.text}` : "正在接收麦克风音频。";
     if (payload.language) dom.languageIndicator.textContent = `当前语言：${String(payload.language).toUpperCase()}`;
   } else if (type === "audio_input") {
     if (state.meeting) Object.assign(state.meeting, payload);
   } else if (type === "recording_complete") {
+    clearDraft();
     stopAudioCapture();
     applySnapshot(payload.meeting, false);
     // ASR refinement, diarization and translation are server-side
@@ -954,12 +1293,17 @@ async function handleEvent(payload) {
     if (payload.total) dom.summaryProgressBar.style.width = `${Math.round((payload.current / payload.total) * 100)}%`;
   } else if (type === "summary_delta") {
     if (state.meeting) state.meeting.summary = `${state.meeting.summary || ""}${payload.content || ""}`;
-    renderSummary(state.meeting?.summary, "running");
+    state.summaryStreaming = true;
+    scheduleSummaryRender("running");
   } else if (type === "summary_reset") {
+    cancelSummaryRender();
     if (state.meeting) state.meeting.summary = "";
+    state.summaryStreaming = true;
     renderSummary("", "running");
   } else if (type === "summary_complete") {
+    cancelSummaryRender();
     if (state.meeting) Object.assign(state.meeting, { summary: payload.content, summary_revision: payload.summary_revision, summary_state: "complete", files: payload.files || state.meeting.files, todo_state: "queued" });
+    state.summaryStreaming = false;
     renderSummary(payload.content, "complete");
     renderTodo(null, "queued");
     renderFiles(state.meeting?.files || []);
@@ -980,6 +1324,10 @@ async function handleEvent(payload) {
       summary_revision: payload.summary_revision ?? state.meeting.summary_revision,
     });
     if (state.meeting && payload.code === "todo_failed") state.meeting.todo_state = "error";
+    if (payload.code === "summary_failed") {
+      state.summaryStreaming = false;
+      cancelSummaryRender();
+    }
     renderSummary(state.meeting?.summary, state.meeting?.summary_state || "error");
     renderTodo(state.meeting?.todo, state.meeting?.todo_state || "error");
   }
@@ -1048,7 +1396,7 @@ async function stopMeeting() {
 
 async function retrySummary() {
   if (!state.meeting) return;
-  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" }); state.meeting.summary_state = "running"; renderSummary(state.meeting.summary, "running"); setNotice("正在生成会议纪要，完成后会自动生成 To-do-list。", "info"); }
+  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" }); state.meeting.summary_state = "running"; state.summaryStreaming = true; renderSummary(state.meeting.summary, "running"); setNotice("正在生成会议纪要，完成后会自动生成 To-do-list。", "info"); }
   catch (error) { setNotice(error.message, "error"); }
 }
 
@@ -1122,14 +1470,67 @@ function bindEvents() {
     event.preventDefault();
     saveAsrSettings();
   });
-  dom.resetAsrSettings.addEventListener("click", () => renderAsrSettings(RECOMMENDED_ASR_SETTINGS));
-  for (const field of ASR_SETTING_FIELDS) {
-    $(`#${field.input}`).addEventListener("input", (event) => {
-      $(`#${field.output}`).textContent = field.format(event.target.value);
+  dom.resetAsrSettings.addEventListener("click", () => applySettingsTemplate("balanced"));
+  dom.settingsTemplateSelect?.addEventListener("change", () => {
+    const selected = dom.settingsTemplateSelect.value;
+    if (selected === "custom") {
+      updateTemplatePicker("custom");
+      return;
+    }
+    applySettingsTemplate(selected);
+  });
+  for (const tab of dom.settingsTabs) {
+    tab.addEventListener("click", () => {
+      const selected = tab.dataset.settingsTab;
+      for (const item of dom.settingsTabs) {
+        const active = item.dataset.settingsTab === selected;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-selected", String(active));
+      }
+      for (const panel of dom.settingsPanels) panel.hidden = panel.dataset.settingsPanel !== selected;
     });
   }
+  for (const field of MEETING_NUMBER_FIELDS) {
+    const slider = $(`#${field.slider}`);
+    const input = $(`#${field.input}`);
+    slider?.addEventListener("input", (event) => {
+      setMeetingField(field, event.target.value, { updateState: false });
+      markSettingsCustom();
+    });
+    input?.addEventListener("input", (event) => {
+      if (event.target.value !== "" && Number.isFinite(Number(event.target.value))) {
+        setMeetingField(field, event.target.value, { updateState: false });
+        markSettingsCustom();
+      }
+    });
+    input?.addEventListener("change", (event) => {
+      setMeetingField(field, event.target.value, { updateState: false });
+      markSettingsCustom();
+    });
+  }
+  for (const [key, id] of Object.entries({
+    enable_refinement: "settingEnableRefinement",
+    enable_postprocess: "settingEnablePostprocess",
+    diarization_required: "settingDiarizationRequired",
+    keep_audio: "settingKeepAudio",
+  })) {
+    $(`#${id}`)?.addEventListener("change", markSettingsCustom);
+  }
   $("#refreshDevices").addEventListener("click", () => refreshDevices().catch(() => {}));
-  dom.volumeThreshold.addEventListener("input", () => setVolumeThreshold(dom.volumeThreshold.value));
+  dom.volumeThreshold.addEventListener("input", () => {
+    setVolumeThreshold(dom.volumeThreshold.value);
+    markSettingsCustom();
+  });
+  dom.volumeThresholdValue.addEventListener("input", () => {
+    if (dom.volumeThresholdValue.value !== "" && Number.isFinite(Number(dom.volumeThresholdValue.value))) {
+      setVolumeThreshold(dom.volumeThresholdValue.value);
+      markSettingsCustom();
+    }
+  });
+  dom.volumeThresholdValue.addEventListener("change", () => {
+    setVolumeThreshold(dom.volumeThresholdValue.value);
+    markSettingsCustom();
+  });
   dom.inputDevice.addEventListener("change", async () => {
     if (dom.inputDeviceSummary) dom.inputDeviceSummary.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
     if (state.meeting?.recording_state === "recording") {

@@ -25,7 +25,11 @@ from .audio import (
     rms_to_volume_threshold_percent,
     volume_threshold_percent_to_rms,
 )
-from .config import Settings, normalize_asr_settings
+from .config import (
+    Settings,
+    asr_settings_from_meeting,
+    normalize_meeting_settings,
+)
 from .diarization import align_speakers, write_segments
 from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
 from .jimo import MeetingSummarizer, TodoGenerator
@@ -67,7 +71,15 @@ class LiveMeetingSession:
         self.settings = settings
         self.runtime = runtime
         self.store = store
-        self.asr_settings = normalize_asr_settings(payload.get("asr_settings"), settings)
+        restored_settings: dict[str, Any] = {}
+        if isinstance(payload.get("meeting_settings"), dict):
+            restored_settings.update(payload["meeting_settings"])
+        if isinstance(payload.get("asr_settings"), dict):
+            restored_settings["asr_settings"] = payload["asr_settings"]
+        if "volume_threshold_percent" in payload:
+            restored_settings["volume_threshold_percent"] = payload["volume_threshold_percent"]
+        self.meeting_settings = normalize_meeting_settings(restored_settings, settings)
+        self.asr_settings = asr_settings_from_meeting(self.meeting_settings, settings)
         self.id = meeting_id or str(uuid.uuid4())
         self.title = title or str(payload.get("title", "未命名会议"))
         self.output_dir = store.meeting_dir(self.id)
@@ -107,12 +119,13 @@ class LiveMeetingSession:
         self.audio_samples_received = 0
         self.audio_level = 0.0
         try:
-            restored_threshold = float(payload.get("volume_threshold_percent", "nan"))
+            restored_threshold = float(self.meeting_settings["volume_threshold_percent"])
             self.volume_threshold_percent = rms_to_volume_threshold_percent(
                 volume_threshold_percent_to_rms(restored_threshold)
             )
         except (TypeError, ValueError):
             self.volume_threshold_percent = rms_to_volume_threshold_percent(settings.vad_minimum_rms)
+        self.meeting_settings["volume_threshold_percent"] = self.volume_threshold_percent
         self.volume_threshold_rms = volume_threshold_percent_to_rms(self.volume_threshold_percent)
         self._last_sequence: int | None = None
         self._lock = asyncio.Lock()
@@ -137,9 +150,7 @@ class LiveMeetingSession:
         self._refinement_progress_current = 0
         self._refinement_progress_total = 0
         self.speaker_clusterer = None
-        if getattr(runtime, "ready", False) and hasattr(runtime, "new_speaker_clusterer"):
-            with suppress(Exception):
-                self.speaker_clusterer = runtime.new_speaker_clusterer()
+        self._refresh_speaker_clusterer()
         self.summarizer_factory = summarizer_factory or MeetingSummarizer
         self.todo_factory = todo_factory or TodoGenerator
         self.postprocess_scheduler = postprocess_scheduler
@@ -197,6 +208,24 @@ class LiveMeetingSession:
                 self.audio_bytes_received = self.audio_samples_received * 2
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
+
+    def _refresh_speaker_clusterer(self) -> None:
+        self.speaker_clusterer = None
+        if not (
+            self.meeting_settings["diarization_required"]
+            and getattr(self.runtime, "ready", False)
+            and hasattr(self.runtime, "new_speaker_clusterer")
+        ):
+            return
+        with suppress(Exception):
+            try:
+                self.speaker_clusterer = self.runtime.new_speaker_clusterer(
+                    threshold=self.meeting_settings["speaker_cluster_threshold"]
+                )
+            except TypeError:
+                # Keep compatibility with small test/plugin runtimes that
+                # still expose the original no-argument factory.
+                self.speaker_clusterer = self.runtime.new_speaker_clusterer()
 
     def _persist_refinement_event(self, event: SegmentEvent) -> None:
         self.refinement_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +334,22 @@ class LiveMeetingSession:
         )
         return any(task is not None and not task.done() for task in tasks)
 
+    @property
+    def enable_refinement(self) -> bool:
+        return bool(self.meeting_settings["enable_refinement"])
+
+    @property
+    def enable_postprocess(self) -> bool:
+        return bool(self.meeting_settings["enable_postprocess"])
+
+    @property
+    def diarization_required(self) -> bool:
+        return bool(self.meeting_settings["diarization_required"])
+
+    @property
+    def keep_audio(self) -> bool:
+        return bool(self.meeting_settings["keep_audio"])
+
     async def add_client(self, websocket: WebSocket) -> None:
         if self.disconnect_stop_task and not self.disconnect_stop_task.done():
             self.disconnect_stop_task.cancel()
@@ -378,6 +423,7 @@ class LiveMeetingSession:
             "audio_samples_received": self.audio_samples_received,
             "volume_threshold_percent": self.volume_threshold_percent,
             "asr_settings": dict(self.asr_settings),
+            "meeting_settings": dict(self.meeting_settings),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -408,6 +454,7 @@ class LiveMeetingSession:
             "audio_level": self.audio_level,
             "volume_threshold_percent": self.volume_threshold_percent,
             "asr_settings": dict(self.asr_settings),
+            "meeting_settings": dict(self.meeting_settings),
             "refinement_queue_size": self.refinement_queue.qsize(),
             "refinement_dropped": self.refinement_dropped,
             "model_metadata": self.model_metadata,
@@ -431,17 +478,17 @@ class LiveMeetingSession:
         if self.recording_state == "created":
             self.started_at = utc_now_iso()
             self.created_monotonic = time.monotonic()
-        self.audio_writer = RotatingAudioWriter(self.output_dir / "audio", self.settings.audio_segment_minutes)
+        self.audio_writer = RotatingAudioWriter(self.output_dir / "audio", self.meeting_settings["audio_segment_minutes"])
         vad = self.runtime.new_vad() if hasattr(self.runtime, "new_vad") else None
         self.segmenter = StreamSegmenter(
-            pre_roll_ms=self.settings.audio_pre_roll_ms,
-            speech_start_ms=self.settings.speech_start_ms,
+            pre_roll_ms=self.meeting_settings["audio_pre_roll_ms"],
+            speech_start_ms=self.meeting_settings["speech_start_ms"],
             silence_ms=self.asr_settings["silence_ms"],
             minimum_rms=self.settings.vad_minimum_rms,
             minimum_speech_ms=self.asr_settings["vad_minimum_speech_ms"],
-            minimum_speech_ratio=self.settings.vad_minimum_speech_ratio,
-            partial_interval_ms=self.settings.partial_interval_ms,
-            max_utterance_ms=int(self.settings.max_utterance_seconds * 1000),
+            minimum_speech_ratio=self.meeting_settings["vad_minimum_speech_ratio"],
+            partial_interval_ms=self.meeting_settings["partial_interval_ms"],
+            max_utterance_ms=int(self.meeting_settings["max_utterance_seconds"] * 1000),
             vad=vad,
         )
         self.segmenter.minimum_rms = self.volume_threshold_rms
@@ -461,6 +508,7 @@ class LiveMeetingSession:
         normalized_percent = round(threshold_percent, 1)
         changed = normalized_percent != self.volume_threshold_percent
         self.volume_threshold_percent = normalized_percent
+        self.meeting_settings["volume_threshold_percent"] = normalized_percent
         self.volume_threshold_rms = threshold_rms
         if self.segmenter:
             self.segmenter.minimum_rms = threshold_rms
@@ -468,11 +516,25 @@ class LiveMeetingSession:
             self._write_state()
 
     def configure_asr_settings(self, values: Any) -> None:
+        self.configure_meeting_settings({"asr_settings": values})
+
+    def configure_meeting_settings(self, values: Any) -> None:
         if self.recording_state != "created":
             raise ValueError("识别设置只能在录音开始前调整")
-        normalized = normalize_asr_settings(values, self.settings)
-        if normalized != self.asr_settings:
-            self.asr_settings = normalized
+        merged = dict(self.meeting_settings)
+        if isinstance(values, dict):
+            merged.update(values)
+        normalized = normalize_meeting_settings(merged, self.settings)
+        normalized_asr = asr_settings_from_meeting(normalized, self.settings)
+        changed = normalized != self.meeting_settings or normalized_asr != self.asr_settings
+        self.meeting_settings = normalized
+        self.asr_settings = normalized_asr
+        self.volume_threshold_percent = normalized["volume_threshold_percent"]
+        self.volume_threshold_rms = volume_threshold_percent_to_rms(self.volume_threshold_percent)
+        self._refresh_speaker_clusterer()
+        if self.segmenter:
+            self.segmenter.minimum_rms = self.volume_threshold_rms
+        if changed:
             self._write_state()
 
     @staticmethod
@@ -486,6 +548,26 @@ class LiveMeetingSession:
         # stricter parent implementation.
         accepts_keyword = any(parameter.name == "decode_settings" for parameter in parameters)
         return {"decode_settings": settings} if accepts_keyword else {}
+
+    @staticmethod
+    def _runtime_optional_settings(
+        method: Callable[..., Any],
+        keyword: str,
+        settings: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        try:
+            parameters = inspect.signature(method).parameters.values()
+        except (TypeError, ValueError):
+            return {}
+        return {keyword: settings} if any(parameter.name == keyword for parameter in parameters) else {}
+
+    def _diarization_settings(self) -> dict[str, Any]:
+        return {
+            "cluster_threshold": self.meeting_settings["speaker_cluster_threshold"],
+            "min_speech_seconds": self.meeting_settings["speaker_min_speech_seconds"],
+            "max_silence_gap_seconds": self.meeting_settings["speaker_max_silence_gap_seconds"],
+            "overlap_include_threshold": self.meeting_settings["speaker_overlap_include_threshold"],
+        }
 
     def configure_audio(self, payload: dict[str, Any]) -> None:
         sample_rate = int(payload.get("sample_rate", 0) or 0)
@@ -577,7 +659,7 @@ class LiveMeetingSession:
             event,
             self._recent_asr_context(self.current_language),
             self.current_language,
-            **self._runtime_decode_settings(self.runtime.transcribe_partial, self.asr_settings),
+            **self._runtime_decode_settings(self.runtime.transcribe_partial, self.meeting_settings),
         )
         if result.text:
             await self.broadcast("draft", revision=event.revision, start=event.start, end=event.end, text=result.text, language=result.language, confidence=result.confidence)
@@ -591,7 +673,7 @@ class LiveMeetingSession:
             recent_text=self._recent_asr_context(self.current_language),
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
-            **self._runtime_decode_settings(self.runtime.transcribe_final, self.asr_settings),
+            **self._runtime_decode_settings(self.runtime.transcribe_final, self.meeting_settings),
         )
         self._segment_first_ids[event.revision] = items[0].id if items else self.next_utterance_id
         for item in items:
@@ -606,7 +688,7 @@ class LiveMeetingSession:
                 task = asyncio.create_task(self._translate_item(item), name=f"translate-{self.id}-{item.id}")
                 self.translation_tasks.add(task)
                 task.add_done_callback(self.translation_tasks.discard)
-        if self.settings.enable_refinement:
+        if self.enable_refinement:
             try:
                 await asyncio.to_thread(self._persist_refinement_event, event)
                 self._refinement_events[event.revision] = event
@@ -620,7 +702,16 @@ class LiveMeetingSession:
             latest = next((existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id), item)
             source_text = latest.text
             source_language = latest.language
-            result = await asyncio.to_thread(self.runtime.translate_text, source_text, source_language)
+            result = await asyncio.to_thread(
+                self.runtime.translate_text,
+                source_text,
+                source_language,
+                **self._runtime_optional_settings(
+                    self.runtime.translate_text,
+                    "translation_settings",
+                    self.meeting_settings,
+                ),
+            )
             latest = next(
                 (existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id),
                 None,
@@ -662,7 +753,7 @@ class LiveMeetingSession:
                     recent_text=self._recent_asr_context(self.current_language),
                     speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
-                    **self._runtime_decode_settings(self.runtime.transcribe_final, self.asr_settings),
+                    **self._runtime_decode_settings(self.runtime.transcribe_final, self.meeting_settings),
                 )
                 await self._commit_refined_items(refined_items)
             except Exception as exc:
@@ -754,14 +845,14 @@ class LiveMeetingSession:
         await self.broadcast("postprocess_update", meeting=self.snapshot())
 
     def _set_postprocess_queue(self, has_items: bool) -> None:
-        enabled = has_items and self.settings.enable_postprocess
+        enabled = has_items and self.enable_postprocess
         self.postprocess = PostprocessTracker({
-            "state": "queued" if enabled else "partial",
+            "state": "queued" if enabled else "ready_for_summary",
             "current_stage": "asr_refine" if enabled else None,
             "stages": {
-                "asr_refine": {"state": "queued" if enabled and self.settings.enable_refinement else "complete"},
-                "diarization": {"state": "queued" if enabled else "complete"},
-                "translation": {"state": "queued" if has_items else "complete"},
+                "asr_refine": {"state": "queued" if enabled and self.enable_refinement else "complete"},
+                "diarization": {"state": "queued" if enabled and self.diarization_required else "complete"},
+                "translation": {"state": "queued" if enabled and has_items else "complete"},
                 "summary": {"state": "idle" if has_items else "error"},
                 "todo": {"state": "idle"},
             },
@@ -792,7 +883,7 @@ class LiveMeetingSession:
         )
 
     def _delete_audio_if_unretained(self) -> None:
-        if self.settings.keep_audio:
+        if self.keep_audio:
             return
         audio_dir = (self.output_dir / "audio").resolve()
         audio_dir.relative_to(self.output_dir.resolve())
@@ -818,9 +909,30 @@ class LiveMeetingSession:
         failures: list[str] = []
         for language, group in groups.items():
             if hasattr(self.runtime, "translate_text_batch"):
-                results = await asyncio.to_thread(self.runtime.translate_text_batch, [item.text for item in group], language)
+                results = await asyncio.to_thread(
+                    self.runtime.translate_text_batch,
+                    [item.text for item in group],
+                    language,
+                    **self._runtime_optional_settings(
+                        self.runtime.translate_text_batch,
+                        "translation_settings",
+                        self.meeting_settings,
+                    ),
+                )
             else:
-                results = [await asyncio.to_thread(self.runtime.translate_text, item.text, language) for item in group]
+                results = [
+                    await asyncio.to_thread(
+                        self.runtime.translate_text,
+                        item.text,
+                        language,
+                        **self._runtime_optional_settings(
+                            self.runtime.translate_text,
+                            "translation_settings",
+                            self.meeting_settings,
+                        ),
+                    )
+                    for item in group
+                ]
             for item, result in zip(group, results):
                 item.translation_zh = result.text if result.status in {"ready", "not_needed"} else ""
                 item.translation_status = result.status
@@ -849,6 +961,9 @@ class LiveMeetingSession:
         return True
 
     async def _run_diarization(self) -> None:
+        if not self.diarization_required:
+            await self._postprocess_update("diarization", "complete", current=0, total=0)
+            return
         if not hasattr(self.runtime, "diarize_audio"):
             await self._postprocess_update("diarization", "complete", current=0, total=0)
             return
@@ -865,9 +980,21 @@ class LiveMeetingSession:
         # ``LiveModelRuntime.diarize_audio`` owns the shared GPU lock.  Keeping
         # the lock at the runtime boundary also makes fake/test runtimes and
         # future schedulers safe from accidental double-acquisition.
-        segments = await asyncio.to_thread(self.runtime.diarize_audio, paths)
+        segments = await asyncio.to_thread(
+            self.runtime.diarize_audio,
+            paths,
+            **self._runtime_optional_settings(
+                self.runtime.diarize_audio,
+                "diarization_settings",
+                self._diarization_settings(),
+            ),
+        )
         write_segments(self.output_dir / "speaker_segments.json", segments)
-        items = align_speakers(load_utterances(self.transcript_path), segments)
+        items = align_speakers(
+            load_utterances(self.transcript_path),
+            segments,
+            float(self.meeting_settings["speaker_overlap_include_threshold"]),
+        )
         for item in items:
             append_utterance(self.transcript_path, item)
             for index, existing in enumerate(self.recent):
@@ -888,9 +1015,9 @@ class LiveMeetingSession:
                 await asyncio.to_thread(release_realtime)
             refine_stage = self.postprocess.stages.get("asr_refine", {})
             self._refinement_errors = []
-            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and not self._refinement_events:
+            if self.enable_refinement and refine_stage.get("state") != "complete" and not self._refinement_events:
                 await asyncio.to_thread(self._rebuild_refinement_events_from_audio)
-            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and self._refinement_events:
+            if self.enable_refinement and refine_stage.get("state") != "complete" and self._refinement_events:
                 events = sorted(self._refinement_events.values(), key=lambda item: item.revision)
                 self.refinement_queue = asyncio.Queue(
                     maxsize=max(self.settings.refinement_queue_size, len(events) + 1)
@@ -898,7 +1025,7 @@ class LiveMeetingSession:
                 for event in events:
                     self.refinement_queue.put_nowait(event)
             events_total = self.refinement_queue.qsize()
-            if self.settings.enable_refinement and refine_stage.get("state") != "complete" and events_total:
+            if self.enable_refinement and refine_stage.get("state") != "complete" and events_total:
                 self._refinement_progress_current = 0
                 self._refinement_progress_total = events_total
                 await self._postprocess_update("asr_refine", "running", current=0, total=events_total)
@@ -916,7 +1043,7 @@ class LiveMeetingSession:
                     return
                 await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
                 await asyncio.to_thread(self._clear_refinement_events)
-            elif refine_stage.get("state") != "complete" and not self.settings.enable_refinement:
+            elif refine_stage.get("state") != "complete" and not self.enable_refinement:
                 await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
             elif refine_stage.get("state") != "complete":
                 raise RuntimeError("ASR 精修输入无法从持久化片段或保留录音恢复")
@@ -1037,7 +1164,7 @@ class LiveMeetingSession:
         self._write_state()
         await self.status("录音已保存，正在后台处理")
         await self.broadcast("recording_complete", meeting=self.snapshot())
-        if items:
+        if items and self.enable_postprocess:
             self._schedule_postprocess()
         else:
             self._delete_audio_if_unretained()
