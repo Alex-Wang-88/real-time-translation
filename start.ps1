@@ -14,6 +14,9 @@ Set-Location -LiteralPath $projectRoot
 $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 $baseUrl = "http://127.0.0.1:$Port"
+$startupMutex = [System.Threading.Mutex]::new($false, "Local\RealTimeTranslation.MeetingV2.Startup")
+$ownsStartupMutex = $false
+$serverProcess = $null
 
 function Get-MeetingServiceState {
     param([string]$BaseUrl)
@@ -46,6 +49,32 @@ function Test-PortListening {
 }
 
 try {
+    try {
+        $ownsStartupMutex = $startupMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $ownsStartupMutex = $true
+    }
+
+    if (-not $ownsStartupMutex) {
+        Write-Host "Another Meeting v2 launcher is starting the service; waiting for it..."
+        for ($attempt = 0; $attempt -lt 240; $attempt++) {
+            $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
+            if ($existingService -and $existingService.status -eq "ready") {
+                Write-Host "Meeting v2 is already running and models are ready at $baseUrl"
+                if (-not $NoBrowser) { Start-Process $baseUrl | Out-Null }
+                return
+            }
+            if ($startupMutex.WaitOne(500)) {
+                $ownsStartupMutex = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ownsStartupMutex) {
+            throw "Another Meeting v2 launcher did not become ready within 120 seconds."
+        }
+    }
+
     $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
     if ($existingService) {
         if ($existingService.status -eq "ready") {
@@ -165,4 +194,8 @@ try {
     if ($serverProcess -and -not $serverProcess.HasExited) {
         Stop-Process -Id $serverProcess.Id -Force
     }
+    if ($ownsStartupMutex) {
+        $startupMutex.ReleaseMutex()
+    }
+    $startupMutex.Dispose()
 }

@@ -149,7 +149,17 @@ class LocalMeetingStore:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
-                if isinstance(payload, dict):
+                # Older releases stored a different schema in timestamped
+                # directories (``state`` instead of ``recording_state``).
+                # Loading those files with v2 defaults turns an old
+                # recording into a new active meeting after every restart.
+                # A v2 state must identify the directory it lives in and
+                # carry the v2 recording state explicitly.
+                if (
+                    isinstance(payload, dict)
+                    and str(payload.get("id", "")) == directory.name
+                    and "recording_state" in payload
+                ):
                     results.append(payload)
         return sorted(results, key=lambda item: str(item.get("started_at", "")), reverse=True)
 

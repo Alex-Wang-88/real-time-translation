@@ -53,6 +53,20 @@ def test_startup_purges_only_confirmed_expired_meetings(tmp_path) -> None:
         assert corrupt.exists()
 
 
+def test_store_ignores_legacy_state_schema(tmp_path) -> None:
+    settings = Settings(results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
+    store = LocalMeetingStore(settings.results_dir)
+    legacy = settings.results_dir / "20260808-003026-legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "session_state.json").write_text(json.dumps({
+        "id": "legacy-meeting",
+        "state": "recording",
+        "started_at": "2026-08-07T16:30:26+00:00",
+    }), encoding="utf-8")
+
+    assert store.list_states() == []
+
+
 def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> None:
     settings = Settings(
         host="0.0.0.0",
