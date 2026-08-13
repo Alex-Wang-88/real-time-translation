@@ -85,15 +85,35 @@ def test_whisper_receives_recent_context(settings) -> None:
             return iter(()), Info()
 
     model = Model()
-    runtime._whisper(b"\x00\x00" * 20, model, prompt=runtime._asr_prompt("previous decision"))
+    runtime._whisper_decode(
+        b"\x00\x00" * 20,
+        model,
+        prompt=runtime._asr_prompt("previous decision"),
+        language="de",
+    )
     assert model.kwargs["initial_prompt"] == "最近内容：previous decision"
     assert model.kwargs["beam_size"] == settings.asr_realtime_beam_size
     assert model.kwargs["best_of"] == settings.asr_best_of
+    assert model.kwargs["language"] == "de"
     assert model.kwargs["temperature"] == 0.0
     assert model.kwargs["log_prob_threshold"] == settings.asr_log_prob_threshold
     assert model.kwargs["no_speech_threshold"] == settings.asr_no_speech_threshold
     assert model.kwargs["compression_ratio_threshold"] == settings.asr_compression_ratio_threshold
     assert len(runtime._asr_prompt("x" * 1000) or "") <= 520
+
+
+def test_language_prior_is_normalized_and_unknown_language_is_omitted(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+
+    assert runtime._normalize_asr_language("zh-CN") == "zh"
+    assert runtime._normalize_asr_language("cmn") == "zh"
+    assert runtime._normalize_asr_language("fr") is None
 
 
 def test_whisper_filters_punctuation_only_segments(settings) -> None:

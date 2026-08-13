@@ -18,6 +18,9 @@ def settings(tmp_path: Path) -> Settings:
         audio_pre_roll_ms=40,
         speech_start_ms=40,
         silence_ms=160,
+        # Unit-test audio uses short synthetic utterances; production
+        # Settings defaults to 450 ms to reject click/noise bursts.
+        vad_minimum_speech_ms=300,
         partial_interval_ms=200,
         max_utterance_seconds=4,
         max_active_meetings=1,

@@ -433,9 +433,9 @@ class LiveModelRuntime:
         translation_autodownload: bool = False,
         vad_model: str = "fsmn-vad",
         diarization_required: bool = True,
-        asr_realtime_beam_size: int = 3,
+        asr_realtime_beam_size: int = 5,
         asr_refine_beam_size: int = 6,
-        asr_best_of: int = 3,
+        asr_best_of: int = 5,
         asr_retry_temperature: float = 0.2,
         asr_log_prob_threshold: float = -1.0,
         asr_no_speech_threshold: float = 0.6,
@@ -735,10 +735,21 @@ class LiveModelRuntime:
     @classmethod
     def _asr_prompt(cls, recent_text: str = "") -> str | None:
         """Build a bounded Whisper prompt from recent context."""
+        # Keep a few recent clauses, but cap the prompt so a long meeting does
+        # not make a short live segment compete with an ever-growing history.
         context = " ".join(str(recent_text or "").split())[-500:]
         if cls._has_repetitive_loop(context):
             return None
         return f"最近内容：{context}" if context else None
+
+    @staticmethod
+    def _normalize_asr_language(language: str | None) -> str | None:
+        """Return a Whisper language code only for the product's supported languages."""
+        normalized = str(language or "").strip().casefold().replace("_", "-")
+        normalized = normalized.split("-", 1)[0]
+        aliases = {"cmn": "zh", "yue": "zh"}
+        normalized = aliases.get(normalized, normalized)
+        return normalized if normalized in {"zh", "en", "de"} else None
 
     def _whisper(
         self,
@@ -768,6 +779,7 @@ class LiveModelRuntime:
         *,
         refine: bool = False,
         prompt: str | None = None,
+        language: str | None = None,
         beam_size: int | None = None,
         best_of: int | None = None,
         temperature: float = 0.0,
@@ -775,18 +787,24 @@ class LiveModelRuntime:
         if model is None:
             return _WhisperDecode("", None, 0.0)
         selected_beam_size = beam_size or (self.asr_refine_beam_size if refine else self.asr_realtime_beam_size)
-        segments, info = model.transcribe(
-            self._audio(pcm),
-            beam_size=selected_beam_size,
-            best_of=best_of or self.asr_best_of,
-            temperature=temperature,
-            compression_ratio_threshold=self.asr_compression_ratio_threshold,
-            log_prob_threshold=self.asr_log_prob_threshold,
-            no_speech_threshold=self.asr_no_speech_threshold,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            initial_prompt=prompt or None,
-        )
+        options = {
+            "beam_size": selected_beam_size,
+            "best_of": best_of or self.asr_best_of,
+            "temperature": temperature,
+            "compression_ratio_threshold": self.asr_compression_ratio_threshold,
+            "log_prob_threshold": self.asr_log_prob_threshold,
+            "no_speech_threshold": self.asr_no_speech_threshold,
+            "vad_filter": False,
+            "condition_on_previous_text": False,
+            "initial_prompt": prompt or None,
+        }
+        normalized_language = self._normalize_asr_language(language)
+        if normalized_language:
+            # Supplying a reliable language prior is especially helpful for
+            # short live chunks.  It is omitted when unknown so Whisper can
+            # still perform multilingual detection.
+            options["language"] = normalized_language
+        segments, info = model.transcribe(self._audio(pcm), **options)
         materialized = [
             segment
             for segment in segments
@@ -864,6 +882,12 @@ class LiveModelRuntime:
             and result.avg_logprob < self.asr_log_prob_threshold
         ):
             return "repetitive_hallucination"
+        normalized = re.sub(r"[\s\W_]+", "", result.text.casefold(), flags=re.UNICODE)
+        if normalized and normalized in {
+            "嗯", "啊", "呃", "哦", "额", "唔", "诶", "嗯啊", "啊啊",
+            "uh", "um", "erm", "eh", "hmm", "hm", "ah", "oh", "uhm",
+        }:
+            return "filler_only"
         return None
 
     def _decode_quality(self, result: _WhisperDecode) -> float:
@@ -893,6 +917,7 @@ class LiveModelRuntime:
         *,
         refine: bool = False,
         recent_text: str = "",
+        previous_language: str | None = None,
     ) -> tuple[str, LanguageGuess, float, str, str]:
         self.last_asr_error = None
         self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
@@ -902,6 +927,7 @@ class LiveModelRuntime:
             return "", LanguageGuess("zh", 0.0), 0.0, "none", "detector"
         try:
             prompt = self._asr_prompt(recent_text)
+            language_hint = self._normalize_asr_language(previous_language)
             initial_beam_size = self.asr_refine_beam_size if refine else self.asr_realtime_beam_size
 
             def decode(
@@ -909,12 +935,14 @@ class LiveModelRuntime:
                 beam_size: int,
                 best_of: int,
                 decode_prompt: str | None,
+                decode_language: str | None,
             ) -> _WhisperDecode:
                 result = self._whisper_decode(
                     pcm,
                     model,
                     refine=refine,
                     prompt=decode_prompt,
+                    language=decode_language,
                     beam_size=beam_size,
                     best_of=best_of,
                     temperature=temperature,
@@ -923,7 +951,7 @@ class LiveModelRuntime:
                 return result
 
             def decode_with_retry() -> _WhisperDecode:
-                result = decode(0.0, initial_beam_size, self.asr_best_of, prompt)
+                result = decode(0.0, initial_beam_size, self.asr_best_of, prompt, language_hint)
                 if self._decode_needs_retry(result):
                     self.metrics["asr_decode_retries"] = int(self.metrics.get("asr_decode_retries", 0)) + 1
                     self._event(
@@ -939,6 +967,9 @@ class LiveModelRuntime:
                         self.asr_retry_temperature,
                         max(initial_beam_size, 5),
                         max(self.asr_best_of, 5),
+                        None,
+                        # If the prior caused a bad decode, let Whisper
+                        # reconsider the language on the retry as well.
                         None,
                     )
                     result = self._select_decode_result(result, retry)
@@ -997,9 +1028,16 @@ class LiveModelRuntime:
                 self.refine = None
             return self.refine
 
-    def transcribe_partial(self, event: SegmentEvent, recent_text: str = "") -> PartialResult:
+    def transcribe_partial(
+        self,
+        event: SegmentEvent,
+        recent_text: str = "",
+        previous_language: str | None = None,
+    ) -> PartialResult:
         text, guess, confidence, model, language_source = self._recognize(
-            event.pcm, recent_text=recent_text
+            event.pcm,
+            recent_text=recent_text,
+            previous_language=previous_language,
         )
         return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
 
@@ -1017,7 +1055,10 @@ class LiveModelRuntime:
         refined: bool = True,
     ) -> list[Utterance]:
         text, whisper_guess, confidence, model, language_source = self._recognize(
-            event.pcm, refine=refined, recent_text=recent_text
+            event.pcm,
+            refine=refined,
+            recent_text=recent_text,
+            previous_language=previous_language,
         )
         if not text:
             if refined and self.last_asr_error:

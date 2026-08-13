@@ -28,7 +28,7 @@ class FakeRuntime:
     def new_speaker_clusterer(self):
         return None
 
-    def transcribe_partial(self, event, recent_text=""):
+    def transcribe_partial(self, event, recent_text="", previous_language=None):
         from realtime_meeting.runtime import PartialResult
 
         return PartialResult(event.revision, event.start, event.end, "hello", "en", 0.9, "fake")

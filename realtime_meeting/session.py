@@ -412,6 +412,15 @@ class LiveMeetingSession:
     def load_transcript(self) -> list[Utterance]:
         return sorted(load_utterances(self.transcript_path), key=lambda item: (item.start, item.end, item.id))
 
+    def _recent_asr_context(self, language: str | None = None) -> str:
+        """Return a small rolling prompt without leaking the whole transcript."""
+        items = [item for item in self.recent if item.text and item.text.strip()]
+        if language:
+            same_language = [item for item in items if item.language == language]
+            if same_language:
+                items = same_language
+        return " ".join(item.text.strip() for item in items[-3:])[-500:]
+
     async def start(self) -> None:
         if self.recording_state not in {"created", "starting", "recording"}:
             return
@@ -539,7 +548,12 @@ class LiveMeetingSession:
                 self.queue.task_done()
 
     async def _handle_partial(self, event: SegmentEvent) -> None:
-        result: PartialResult = await asyncio.to_thread(self.runtime.transcribe_partial, event, "")
+        result: PartialResult = await asyncio.to_thread(
+            self.runtime.transcribe_partial,
+            event,
+            self._recent_asr_context(self.current_language),
+            self.current_language,
+        )
         if result.text:
             await self.broadcast("draft", revision=event.revision, start=event.start, end=event.end, text=result.text, language=result.language, confidence=result.confidence)
 
@@ -549,7 +563,7 @@ class LiveMeetingSession:
             event,
             next_id=self.next_utterance_id,
             previous_language=self.current_language,
-            recent_text=self.recent[-1].text if self.recent else "",
+            recent_text=self._recent_asr_context(self.current_language),
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
         )
@@ -619,7 +633,7 @@ class LiveMeetingSession:
                     event,
                     next_id=first_id,
                     previous_language=self.current_language,
-                    recent_text=self.recent[-1].text if self.recent else "",
+                    recent_text=self._recent_asr_context(self.current_language),
                     speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
                 )

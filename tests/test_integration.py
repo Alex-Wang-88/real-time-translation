@@ -43,7 +43,7 @@ class FakeRuntime:
     def new_speaker_clusterer(self):
         return None
 
-    def transcribe_partial(self, event, recent_text=""):
+    def transcribe_partial(self, event, recent_text="", previous_language=None):
         return PartialResult(event.revision, event.start, event.end, "partial draft", "en", 0.7)
 
     def transcribe_final(self, event, *, next_id, previous_language=None, recent_text="", speaker_clusterer=None, refined=False):

@@ -42,9 +42,11 @@ class Settings:
     asr_primary: str = "large-v3-turbo"
     asr_fallback: str = "large-v3-turbo"
     asr_refine: str = "large-v3"
-    asr_realtime_beam_size: int = 3
+    # Match the quality-oriented live decode used by the reference pipeline.
+    # The retry path still escalates to at least beam 5 when a result looks bad.
+    asr_realtime_beam_size: int = 5
     asr_refine_beam_size: int = 6
-    asr_best_of: int = 3
+    asr_best_of: int = 5
     asr_retry_temperature: float = 0.2
     asr_log_prob_threshold: float = -1.0
     asr_no_speech_threshold: float = 0.6
@@ -61,9 +63,12 @@ class Settings:
     max_utterance_seconds: float = 8.0
     audio_pre_roll_ms: int = 240
     speech_start_ms: int = 80
-    silence_ms: int = 350
+    # Keep sentence-final pauses in the same segment so Whisper sees more
+    # complete phrases.  This is deliberately configurable for low-latency
+    # deployments.
+    silence_ms: int = 700
     vad_minimum_rms: float = 240.0
-    vad_minimum_speech_ms: int = 300
+    vad_minimum_speech_ms: int = 450
     vad_minimum_speech_ratio: float = 0.12
     partial_interval_ms: int = 900
     max_audio_packet_bytes: int = 262_144
@@ -133,9 +138,9 @@ def load_settings() -> Settings:
         max_utterance_seconds=min(12.0, max(2.0, _float("MEETING_MAX_UTTERANCE_SECONDS", 8.0, 2.0))),
         audio_pre_roll_ms=min(1000, max(80, _int("MEETING_AUDIO_PRE_ROLL_MS", 240, 80))),
         speech_start_ms=min(1000, max(40, _int("MEETING_SPEECH_START_MS", 80, 40))),
-        silence_ms=min(2000, max(160, _int("MEETING_SILENCE_MS", 350, 160))),
+        silence_ms=min(2000, max(160, _int("MEETING_SILENCE_MS", 700, 160))),
         vad_minimum_rms=min(5000.0, _float("MEETING_VAD_MINIMUM_RMS", 240.0, 0.0)),
-        vad_minimum_speech_ms=min(2000, _int("MEETING_VAD_MINIMUM_SPEECH_MS", 300, 0)),
+        vad_minimum_speech_ms=min(2000, _int("MEETING_VAD_MINIMUM_SPEECH_MS", 450, 0)),
         vad_minimum_speech_ratio=min(1.0, _float("MEETING_VAD_MINIMUM_SPEECH_RATIO", 0.12, 0.0)),
         partial_interval_ms=min(5000, max(400, _int("MEETING_PARTIAL_INTERVAL_MS", 900, 400))),
         max_audio_packet_bytes=_int("MEETING_MAX_AUDIO_PACKET_BYTES", 262_144, 1024),
