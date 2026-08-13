@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light" />
     <meta name="description" content="实时中文、英文、德文会议记录、翻译、会议纪要和行动项" />
     <title>会记 v2 · 实时会议记录</title>
-    <link rel="stylesheet" href="/static/styles.css?v=8" />
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
     <link rel="stylesheet" href="/static/styles-fixes.css?v=2" />
   </head>
   <body>
@@ -59,9 +59,7 @@
           <div class="welcome-form">
             <label for="meetingTitle">会议名称</label>
             <input id="meetingTitle" type="text" maxlength="200" placeholder="例如：产品周会 / Q3 规划" />
-            <label for="hotwords">专业词、姓名或产品名 <span>可选</span></label>
-            <input id="hotwords" type="text" maxlength="2000" placeholder="用逗号分隔，帮助识别专有名词" />
-            <button id="startMeeting" class="primary-button" type="button" disabled>开始会议 <span>→</span></button>
+            <button id="startMeeting" class="primary-button" type="button" disabled>创建会议 <span>→</span></button>
           </div>
         </section>
 
@@ -72,6 +70,7 @@
               <p id="recordingHint" class="muted">请允许浏览器访问麦克风。</p>
             </div>
             <div class="recording-center">
+              <button id="startRecordingButton" class="primary-button start-recording-button" type="button" hidden>开始录音 <span>→</span></button>
               <button id="recordButton" class="record-button" type="button" aria-label="停止会议"><span></span></button>
               <div class="level-meter"><span id="levelBar"></span></div>
               <span id="levelText">麦克风等待中</span>
@@ -79,6 +78,16 @@
             <div class="recording-controls">
               <label for="inputDevice">输入设备</label>
               <div class="device-row"><select id="inputDevice"><option value="">系统默认设备</option></select><button id="refreshDevices" class="icon-button" type="button" title="刷新设备" aria-label="刷新设备">↻</button></div>
+              <label class="threshold-label" for="volumeThreshold">背景声过滤 <output id="volumeThresholdValue" for="volumeThreshold">2.2%</output></label>
+              <div class="threshold-meter" id="thresholdMeter">
+                <div class="threshold-meter-track" aria-hidden="true">
+                  <span id="microphoneLevelFill" class="microphone-level-fill"></span>
+                  <span id="microphoneLevelMarker" class="microphone-level-marker"></span>
+                </div>
+                <input id="volumeThreshold" class="threshold-slider" type="range" min="0" max="30" step="0.1" value="2.2" aria-describedby="volumeThresholdHint microphoneLevelStatus" />
+              </div>
+              <div class="threshold-feedback"><output id="microphoneLevelValue">当前音量 --</output><span id="microphoneLevelStatus">等待麦克风</span></div>
+              <span id="volumeThresholdHint" class="threshold-hint">彩色音量超过滑块位置时，当前声音才会被保留</span>
               <span id="languageIndicator" class="language-indicator">等待语音</span>
             </div>
           </div>
@@ -132,12 +141,11 @@
     <dialog id="newMeetingDialog" class="new-dialog">
       <form method="dialog" id="newMeetingForm">
         <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
-        <h3>开始新的记录</h3><p class="muted">当前会议仍在进行时不能新建另一场会议。</p>
+        <h3>新建会议</h3><p class="muted">创建后可以先调整输入设备和背景声过滤，再手动开始录音。</p>
         <label for="dialogTitle">会议名称</label><input id="dialogTitle" type="text" maxlength="200" placeholder="例如：客户方案评审" />
-        <label for="dialogHotwords">专业词、姓名或产品名 <span>可选</span></label><input id="dialogHotwords" type="text" maxlength="2000" placeholder="用逗号分隔" />
-        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="dialogStart" class="primary-button" value="default" type="submit">开始会议 →</button></div>
+        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="dialogStart" class="primary-button" value="default" type="submit">创建会议 →</button></div>
       </form>
     </dialog>
-    <script type="module" src="/static/app.js?v=8"></script>
+    <script type="module" src="/static/app.js?v=12"></script>
   </body>
 </html>

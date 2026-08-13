@@ -19,6 +19,19 @@ def test_audio_worklet_keeps_resampling_phase_across_callbacks() -> None:
     assert "Math.floor(mono.length / ratio)" not in source
 
 
+def test_threshold_slider_overlays_live_microphone_level() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="microphoneLevelFill"' in html
+    assert 'id="microphoneLevelMarker"' in html
+    assert "function renderMicrophoneLevel" in source
+    assert "level / meterMax * 100" in source
+    assert '"低于阈值，将被过滤"' in source
+    assert "state.audioStreamingEnabled && state.ws?.readyState" in source
+    assert "await startMicrophonePreview()" in source
+
+
 def test_web_client_supports_cookie_auth_and_full_transcript_pages() -> None:
     source = APP_JS.read_text(encoding="utf-8")
     assert 'credentials: "same-origin"' in source
@@ -27,6 +40,17 @@ def test_web_client_supports_cookie_auth_and_full_transcript_pages() -> None:
     assert "/transcript?offset=${offset}&limit=${limit}" in source
     assert "state.transcript = transcript" in source
     assert "snapshot.snapshot_revision || 0) > previousRevision" in source
+
+
+def test_create_requires_manual_start_backend_contract() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    create_section = source.split("async function createMeeting(title)", 1)[1].split("async function startRecording()", 1)[0]
+
+    assert 'health.meeting_start_mode !== "manual"' in create_section
+    assert 'snapshot.recording_state !== "created"' in create_section
+    assert "prepareMicrophone" not in create_section
+    assert "connectStream" not in create_section
+    assert '/start`, { method: "POST" }' in source
 
 
 def test_summary_button_waits_for_automatic_refinement() -> None:

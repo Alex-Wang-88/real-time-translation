@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 from realtime_meeting.runtime import MODEL_REVISIONS, LiveModelRuntime, OPUS_MT_TARGET_TAGS, opus_mt_repository
 
@@ -62,7 +63,7 @@ def test_opus_mt_repository_and_target_tags_are_explicit() -> None:
     assert all(len(revision) == 40 for revision in MODEL_REVISIONS.values())
 
 
-def test_whisper_receives_bounded_hotwords_and_recent_context(settings) -> None:
+def test_whisper_receives_recent_context(settings) -> None:
     runtime = LiveModelRuntime(
         settings.asr_primary,
         settings.asr_fallback,
@@ -84,6 +85,69 @@ def test_whisper_receives_bounded_hotwords_and_recent_context(settings) -> None:
             return iter(()), Info()
 
     model = Model()
-    runtime._whisper(b"\x00\x00" * 20, model, prompt=runtime._asr_prompt("previous decision", "Codex, Luna"))
-    assert model.kwargs["initial_prompt"] == "专业词和姓名：Codex, Luna\n最近内容：previous decision"
-    assert len(runtime._asr_prompt("x" * 1000, "y" * 2000) or "") <= 1520
+    runtime._whisper(b"\x00\x00" * 20, model, prompt=runtime._asr_prompt("previous decision"))
+    assert model.kwargs["initial_prompt"] == "最近内容：previous decision"
+    assert model.kwargs["beam_size"] == settings.asr_realtime_beam_size
+    assert model.kwargs["best_of"] == settings.asr_best_of
+    assert model.kwargs["temperature"] == 0.0
+    assert model.kwargs["log_prob_threshold"] == settings.asr_log_prob_threshold
+    assert model.kwargs["no_speech_threshold"] == settings.asr_no_speech_threshold
+    assert model.kwargs["compression_ratio_threshold"] == settings.asr_compression_ratio_threshold
+    assert len(runtime._asr_prompt("x" * 1000) or "") <= 520
+
+
+def test_whisper_filters_punctuation_only_segments(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+
+    class Info:
+        language = "en"
+        language_probability = 0.9
+
+    class Model:
+        def transcribe(self, _audio, **_kwargs):
+            return iter([SimpleNamespace(text="...", avg_logprob=-0.2, no_speech_prob=0.1, compression_ratio=1.0)]), Info()
+
+    result = runtime._whisper_decode(b"\x00\x00" * 20, Model())
+    assert result.text == ""
+    assert runtime._discard_decode_result(result) == "empty"
+
+
+def test_low_quality_decode_retries_with_stronger_settings(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+    runtime.primary = object()
+    calls = []
+
+    class Info:
+        language = "en"
+        language_probability = 0.9
+
+    class Model:
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                segment = SimpleNamespace(text="repeated repeated", avg_logprob=-1.4, no_speech_prob=0.1, compression_ratio=3.2, temperature=0.0)
+            else:
+                segment = SimpleNamespace(text="clear speech", avg_logprob=-0.2, no_speech_prob=0.05, compression_ratio=1.1, temperature=0.2)
+            return iter([segment]), Info()
+
+    runtime.primary = Model()
+    text, _guess, _confidence, _model, _source = runtime._recognize(b"\x00\x00" * 20)
+    assert text == "clear speech"
+    assert len(calls) == 2
+    assert calls[0]["beam_size"] == settings.asr_realtime_beam_size
+    assert calls[1]["beam_size"] == 5
+    assert calls[1]["best_of"] == 5
+    assert calls[1]["temperature"] == settings.asr_retry_temperature
+    assert runtime.metrics["asr_decode_retries"] == 1

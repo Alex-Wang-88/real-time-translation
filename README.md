@@ -83,6 +83,7 @@ GET    /api/v2/metrics
 POST   /api/v2/auth/session
 GET    /api/v2/meetings
 POST   /api/v2/meetings
+POST   /api/v2/meetings/{id}/start
 GET    /api/v2/meetings/{id}
 GET    /api/v2/meetings/{id}/transcript?offset=0&limit=500
 DELETE /api/v2/meetings/{id}

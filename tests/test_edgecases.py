@@ -197,6 +197,7 @@ def test_delete_active_meeting_returns_409() -> None:
         created = client.post("/api/v2/meetings", json={"title": "进行中"})
         assert created.status_code == 201
         meeting_id = created.json()["id"]
+        assert client.post(f"/api/v2/meetings/{meeting_id}/start").status_code == 202
         deleted = client.delete(f"/api/v2/meetings/{meeting_id}")
         assert deleted.status_code == 409, "进行中的会议不能被删除"
 

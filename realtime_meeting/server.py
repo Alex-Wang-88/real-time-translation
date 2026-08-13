@@ -24,7 +24,6 @@ from .storage import LocalMeetingStore
 
 class MeetingCreate(BaseModel):
     title: str = Field(default="未命名会议", max_length=200)
-    hotwords: str | None = Field(default=None, max_length=2000)
 
 
 class DeviceSwitch(BaseModel):
@@ -54,6 +53,13 @@ def create_app(
             requested,
             asr_autodownload=config.asr_autodownload,
             refinement_enabled=config.enable_refinement,
+            asr_realtime_beam_size=config.asr_realtime_beam_size,
+            asr_refine_beam_size=config.asr_refine_beam_size,
+            asr_best_of=config.asr_best_of,
+            asr_retry_temperature=config.asr_retry_temperature,
+            asr_log_prob_threshold=config.asr_log_prob_threshold,
+            asr_no_speech_threshold=config.asr_no_speech_threshold,
+            asr_compression_ratio_threshold=config.asr_compression_ratio_threshold,
             translation_model_root=config.translation_model_root,
             translation_autodownload=config.translation_autodownload,
             vad_model=config.vad_model,
@@ -259,6 +265,7 @@ def create_app(
             "device": getattr(runtime, "device", "unknown"),
             "languages": list(SUPPORTED_LANGUAGES),
             "translation_target": "zh-CN",
+            "meeting_start_mode": "manual",
             "jimo_configured": config.jimo_configured,
             "todo_configured": config.todo_configured,
             "asr_primary": config.asr_primary,
@@ -303,9 +310,22 @@ def create_app(
         if not getattr(app.state.runtime, "ready", False) or not getattr(app.state.runtime, "capabilities_ready", True):
             raise HTTPException(status_code=503, detail=app.state.model_error or "模型尚未就绪")
         try:
-            meeting = await manager.create(body.title.strip() or "未命名会议", body.hotwords.strip() if body.hotwords else None)
+            meeting = await manager.create(body.title.strip() or "未命名会议")
         except CapacityLimitError as exc:
             raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "30"}) from exc
+        return meeting.snapshot()
+
+    @app.post("/api/v2/meetings/{meeting_id}/start", status_code=status.HTTP_202_ACCEPTED)
+    async def start_meeting(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, Any]:
+        meeting = require_meeting(meeting_id)
+        if not getattr(app.state.runtime, "ready", False) or not getattr(app.state.runtime, "capabilities_ready", True):
+            raise HTTPException(status_code=503, detail=app.state.model_error or "models_not_ready")
+        try:
+            meeting = await manager.start(meeting_id)
+        except CapacityLimitError as exc:
+            raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "30"}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return meeting.snapshot()
 
     @app.get("/api/v2/meetings/{meeting_id}")
@@ -343,12 +363,16 @@ def create_app(
 
     @app.post("/api/v2/meetings/{meeting_id}/stream-ticket", status_code=status.HTTP_201_CREATED)
     async def stream_ticket(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, str | float]:
-        require_meeting(meeting_id)
+        meeting = require_meeting(meeting_id)
+        if meeting.recording_state == "created":
+            raise HTTPException(status_code=409, detail="会议尚未开始录音")
         return issue_ticket(meeting_id)
 
     @app.post("/api/v2/meetings/{meeting_id}/stop", status_code=status.HTTP_202_ACCEPTED)
     async def stop_meeting(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, str]:
         meeting = require_meeting(meeting_id)
+        if meeting.recording_state == "created":
+            raise HTTPException(status_code=409, detail="会议尚未开始录音")
         await meeting.request_stop("user")
         return {"status": "accepted", "meeting_id": meeting_id}
 
@@ -462,6 +486,13 @@ def create_app(
                         break
                     framed_audio = bool(payload.get("sequence_header", False))
                     await websocket.send_json({"type": "audio_config_ack", "sample_rate": 16000, "channels": 1, "encoding": "pcm_s16le", "sequence_header": framed_audio})
+                elif message_type == "audio_threshold":
+                    try:
+                        meeting.configure_volume_threshold(payload.get("percent"))
+                    except ValueError as exc:
+                        await websocket.send_json({"type": "audio_threshold_error", "message": str(exc)})
+                        continue
+                    await websocket.send_json({"type": "audio_threshold_ack", "percent": meeting.volume_threshold_percent})
         except WebSocketDisconnect:
             pass
         finally:

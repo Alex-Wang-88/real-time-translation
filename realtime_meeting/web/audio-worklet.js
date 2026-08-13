@@ -9,7 +9,19 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     this.resampleInput = [];
     this.resamplePosition = 0;
     this.sequence = 0;
+    this.thresholdPercent = Number(opts.thresholdPercent) || 0;
+    this.thresholdRms = 0;
+    this.setThreshold(this.thresholdPercent);
+    this.port.onmessage = (event) => {
+      if (event.data?.type === "volume_threshold") this.setThreshold(event.data.percent);
+    };
     this.port.postMessage({ type: "ready", inputRate: this.inputRate, targetRate: this.targetRate });
+  }
+
+  setThreshold(percent) {
+    const value = Math.max(0, Math.min(30, Number(percent) || 0));
+    this.thresholdPercent = value;
+    this.thresholdRms = value / 100 / 3;
   }
 
   process(inputs) {
@@ -42,6 +54,12 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     }
     while (this.output.length >= this.packetSamples) {
       const packet = this.output.splice(0, this.packetSamples);
+      if (this.thresholdRms > 0) {
+        let packetSum = 0;
+        for (const value of packet) packetSum += value * value;
+        const packetRms = Math.sqrt(packetSum / Math.max(1, packet.length));
+        if (packetRms < this.thresholdRms) packet.fill(0);
+      }
       const pcm = new ArrayBuffer(4 + packet.length * 2);
       const view = new DataView(pcm);
       view.setUint32(0, this.sequence, true);

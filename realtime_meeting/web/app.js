@@ -15,6 +15,11 @@ const state = {
   transcript: new Map(),
   transcriptNearBottom: true,
   timer: null,
+  volumeThresholdPercent: 2.2,
+  microphoneLevelPercent: 0,
+  pendingMicrophoneLevel: 0,
+  microphoneLevelFrame: null,
+  audioStreamingEnabled: false,
 };
 
 const dom = {
@@ -29,7 +34,6 @@ const dom = {
   connectionBadge: $("#connectionBadge"),
   deleteMeeting: $("#deleteMeeting"),
   meetingTitle: $("#meetingTitle"),
-  hotwords: $("#hotwords"),
   transcriptList: $("#transcriptList"),
   transcriptEmpty: $("#transcriptEmpty"),
   utteranceCount: $("#utteranceCount"),
@@ -38,6 +42,7 @@ const dom = {
   recordingState: $("#recordingState"),
   recordingHint: $("#recordingHint"),
   timer: $("#timer"),
+  startRecordingButton: $("#startRecordingButton"),
   recordButton: $("#recordButton"),
   levelBar: $("#levelBar"),
   levelText: $("#levelText"),
@@ -67,10 +72,17 @@ const dom = {
   dialog: $("#newMeetingDialog"),
   dialogForm: $("#newMeetingForm"),
   dialogTitle: $("#dialogTitle"),
-  dialogHotwords: $("#dialogHotwords"),
+  volumeThreshold: $("#volumeThreshold"),
+  volumeThresholdValue: $("#volumeThresholdValue"),
+  thresholdMeter: $("#thresholdMeter"),
+  microphoneLevelFill: $("#microphoneLevelFill"),
+  microphoneLevelMarker: $("#microphoneLevelMarker"),
+  microphoneLevelValue: $("#microphoneLevelValue"),
+  microphoneLevelStatus: $("#microphoneLevelStatus"),
 };
 
 const recordingLabels = {
+  created: "待开始",
   starting: "准备录音",
   recording: "正在录音",
   finalizing: "正在保存",
@@ -213,6 +225,48 @@ function setSystemStatus(message, good = false) {
 function setConnection(message, kind = "neutral") {
   dom.connectionBadge.textContent = message;
   dom.connectionBadge.className = `badge ${kind}`;
+}
+
+function setVolumeThreshold(value, propagate = true) {
+  const threshold = Math.max(0, Math.min(30, Number(value) || 0));
+  state.volumeThresholdPercent = Math.round(threshold * 10) / 10;
+  if (dom.volumeThreshold) dom.volumeThreshold.value = String(state.volumeThresholdPercent);
+  if (dom.volumeThresholdValue) dom.volumeThresholdValue.textContent = `${state.volumeThresholdPercent.toFixed(1)}%`;
+  renderMicrophoneLevel(state.microphoneLevelPercent, Boolean(state.stream));
+  if (!propagate) return;
+  state.audioNode?.port.postMessage({ type: "volume_threshold", percent: state.volumeThresholdPercent });
+  if (state.meeting) state.meeting.volume_threshold_percent = state.volumeThresholdPercent;
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "audio_threshold", percent: state.volumeThresholdPercent }));
+  }
+}
+
+function renderMicrophoneLevel(levelPercent, live = true) {
+  const level = Math.max(0, Math.min(100, Number(levelPercent) || 0));
+  const meterMax = Number(dom.volumeThreshold?.max) || 30;
+  const position = Math.min(100, level / meterMax * 100);
+  state.microphoneLevelPercent = level;
+  dom.microphoneLevelFill.style.width = `${position}%`;
+  dom.microphoneLevelMarker.style.left = `${position}%`;
+  dom.thresholdMeter.classList.toggle("live", live);
+  dom.microphoneLevelValue.textContent = live ? `当前音量 ${level.toFixed(1)}%` : "当前音量 --";
+  const passing = live && level >= state.volumeThresholdPercent;
+  dom.thresholdMeter.classList.toggle("filtered", live && !passing);
+  dom.microphoneLevelStatus.className = passing ? "passing" : live ? "filtered" : "";
+  dom.microphoneLevelStatus.textContent = !live ? "等待麦克风" : passing ? "声音会被保留" : "低于阈值，将被过滤";
+}
+
+function queueMicrophoneLevel(level) {
+  state.pendingMicrophoneLevel = Math.max(0, Math.min(1, Number(level) || 0));
+  if (state.microphoneLevelFrame != null) return;
+  state.microphoneLevelFrame = window.requestAnimationFrame(() => {
+    state.microphoneLevelFrame = null;
+    const value = state.pendingMicrophoneLevel;
+    renderMicrophoneLevel(value * 100, true);
+    dom.levelBar.style.width = `${Math.round(value * 100)}%`;
+    dom.levelText.textContent = value > 0.03 ? "正在采集声音" : "等待说话";
+    if (state.meeting) state.meeting.audio_level = value;
+  });
 }
 
 function formatDate(value) {
@@ -401,6 +455,11 @@ function applySnapshot(snapshot, replace = false) {
   if (state.meeting?.id === snapshot.id && Number(snapshot.snapshot_revision || 0) < Number(state.meeting.snapshot_revision || 0)) return;
   const changed = state.meeting?.id !== snapshot.id;
   state.meeting = { ...(state.meeting || {}), ...snapshot };
+  if (changed && snapshot.volume_threshold_percent != null) setVolumeThreshold(snapshot.volume_threshold_percent, false);
+  const isCreated = state.meeting.recording_state === "created";
+  const canAdjustAudio = ["created", "starting", "recording"].includes(state.meeting.recording_state);
+  const canStop = ["starting", "recording"].includes(state.meeting.recording_state);
+  dom.volumeThreshold.disabled = !canAdjustAudio;
   const meetingIndex = state.meetings.findIndex((meeting) => meeting.id === snapshot.id);
   if (meetingIndex >= 0) state.meetings[meetingIndex] = { ...state.meetings[meetingIndex], ...snapshot };
   else state.meetings.unshift(snapshot);
@@ -409,14 +468,24 @@ function applySnapshot(snapshot, replace = false) {
   }
   for (const item of snapshot.recent_utterances || []) upsertUtterance(item);
   dom.pageTitle.textContent = state.meeting.title || "未命名会议";
-  dom.pageSubtitle.textContent = state.meeting.recording_state === "recording" ? "实时保留原文；英文和德文句子会异步补充中文翻译。" : "这场会议的录音、原文、纪要和行动项已保存到本机。";
+  dom.pageSubtitle.textContent = state.meeting.recording_state === "recording"
+    ? "实时保留原文；英文和德文句子会异步补充中文翻译。"
+    : isCreated ? "会议已创建，可以先调整输入设备和背景声过滤，再手动开始录音。" : "这场会议的录音、原文、纪要和行动项已保存到本机。";
   dom.welcome.hidden = true;
   dom.meetingPanel.hidden = false;
   dom.deleteMeeting.hidden = false;
   dom.recordingState.textContent = recordingLabels[state.meeting.recording_state] || stateText(state.meeting.recording_state);
   dom.recordingIndicator.classList.toggle("active", state.meeting.recording_state === "recording");
-  dom.recordButton.disabled = !["recording", "starting"].includes(state.meeting.recording_state);
-  dom.recordingHint.textContent = state.meeting.error || (state.meeting.recording_state === "recording" ? "正在接收麦克风音频。结束后会自动精修，精修完成后可生成纪要和 To-do-list。" : "录音已经结束，可以查看或重试后处理任务。");
+  dom.startRecordingButton.hidden = !isCreated;
+  dom.startRecordingButton.disabled = !isCreated;
+  dom.recordButton.hidden = !canStop;
+  dom.recordButton.disabled = !canStop;
+  dom.recordButton.setAttribute("aria-label", "停止会议");
+  dom.recordingHint.textContent = state.meeting.error || (
+    isCreated ? "请先确认输入设备和背景声过滤设置，再点击“开始录音”。"
+      : state.meeting.recording_state === "recording" ? "正在接收麦克风音频。结束后会自动精修，精修完成后可生成纪要和 To-do-list。"
+        : "录音已经结束，可以查看或重试后处理任务。"
+  );
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
   dom.languageIndicator.textContent = state.meeting.current_language ? `最近语言：${String(state.meeting.current_language).toUpperCase()}` : "等待语音";
   renderTranscript();
@@ -488,7 +557,10 @@ async function selectMeeting(id) {
   try {
     const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(id)}`);
     const oldId = state.meeting?.id;
-    if (oldId !== id) closeStream(false);
+    if (oldId !== id) {
+      if (state.meeting?.recording_state === "created") stopAudioCapture();
+      closeStream(false);
+    }
     state.meeting = null;
     applySnapshot(snapshot, true);
     await loadFullTranscript(snapshot.id);
@@ -497,8 +569,13 @@ async function selectMeeting(id) {
     // polling instead of keeping an unnecessary websocket alive.
     if (["recording", "starting", "finalizing"].includes(snapshot.recording_state)) {
       await connectStream(snapshot.id);
+    } else if (snapshot.recording_state === "created") {
+      await startMicrophonePreview();
     }
-    setConnection(snapshot.recording_state === "recording" ? "等待连接" : "本地已保存", snapshot.recording_state === "recording" ? "warning" : "neutral");
+    setConnection(
+      snapshot.recording_state === "created" ? "等待开始" : snapshot.recording_state === "recording" ? "等待连接" : "本地已保存",
+      snapshot.recording_state === "recording" ? "warning" : "neutral",
+    );
   } catch (error) { setNotice(error.message, "error"); }
 }
 
@@ -534,6 +611,7 @@ async function refreshDevices() {
 }
 
 async function prepareMicrophone() {
+  if (state.stream) return;
   if (!navigator.mediaDevices?.getUserMedia) throw new Error("当前浏览器不支持麦克风采集，请使用 Chrome 或 Edge。");
   const selected = dom.inputDevice.value;
   const request = navigator.mediaDevices.getUserMedia({ audio: selected ? { deviceId: { exact: selected }, channelCount: 1 } : { channelCount: 1 } });
@@ -573,16 +651,14 @@ async function prepareMicrophone() {
 async function startAudioCapture() {
   if (!state.stream || state.audioContext) return;
   state.audioContext = new AudioContext();
-  await state.audioContext.audioWorklet.addModule("/static/audio-worklet.js?v=2");
+  await state.audioContext.audioWorklet.addModule("/static/audio-worklet.js?v=4");
   state.audioSource = state.audioContext.createMediaStreamSource(state.stream);
-  state.audioNode = new AudioWorkletNode(state.audioContext, "meeting-capture-processor", { processorOptions: { targetRate: 16000, packetSamples: 640 } });
+  state.audioNode = new AudioWorkletNode(state.audioContext, "meeting-capture-processor", { processorOptions: { targetRate: 16000, packetSamples: 640, thresholdPercent: state.volumeThresholdPercent } });
   state.audioNode.port.onmessage = (event) => {
     if (event.data?.type === "level") {
       const level = Math.min(1, Number(event.data.value) || 0);
-      dom.levelBar.style.width = `${Math.round(level * 100)}%`;
-      dom.levelText.textContent = level > 0.03 ? "正在采集声音" : "等待说话";
-      if (state.meeting) state.meeting.audio_level = level;
-    } else if (event.data?.type === "audio" && state.ws?.readyState === WebSocket.OPEN) {
+      queueMicrophoneLevel(level);
+    } else if (event.data?.type === "audio" && state.audioStreamingEnabled && state.ws?.readyState === WebSocket.OPEN) {
       state.ws.send(event.data.buffer);
     }
   };
@@ -597,6 +673,7 @@ async function startAudioCapture() {
 
 function stopAudioCapture() {
   state.audioReady = false;
+  state.audioStreamingEnabled = false;
   try { state.audioNode?.disconnect(); } catch {}
   try { state.audioSource?.disconnect(); } catch {}
   state.audioNode = null;
@@ -605,8 +682,25 @@ function stopAudioCapture() {
   state.audioContext = null;
   if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
   state.stream = null;
+  if (state.microphoneLevelFrame != null) window.cancelAnimationFrame(state.microphoneLevelFrame);
+  state.microphoneLevelFrame = null;
+  renderMicrophoneLevel(0, false);
   dom.levelBar.style.width = "0%";
   dom.levelText.textContent = "麦克风已停止";
+}
+
+async function startMicrophonePreview() {
+  if (state.meeting?.recording_state !== "created") return;
+  state.audioStreamingEnabled = false;
+  await prepareMicrophone();
+  await startAudioCapture();
+  dom.levelText.textContent = "麦克风预览中";
+}
+
+async function restartMicrophonePreview() {
+  if (state.meeting?.recording_state !== "created") return;
+  stopAudioCapture();
+  await startMicrophonePreview();
 }
 
 function websocketUrl(id) {
@@ -659,13 +753,18 @@ async function handleEvent(payload) {
   const type = payload.type;
   if (type === "auth_ok") {
     if (["starting", "recording"].includes(state.meeting?.recording_state)) {
-      if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: "audio_config", sample_rate: 16000, channels: 1, encoding: "pcm_s16le", packet_ms: 40, sequence_header: true }));
+      if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: "audio_config", sample_rate: 16000, channels: 1, encoding: "pcm_s16le", packet_ms: 40, sequence_header: true, volume_threshold_percent: state.volumeThresholdPercent }));
       setConnection("实时连接", "success");
     } else {
       setConnection("处理任务连接", "success");
     }
   } else if (type === "audio_config_ack") {
+    state.audioStreamingEnabled = true;
     await startAudioCapture();
+  } else if (type === "audio_threshold_ack") {
+    setVolumeThreshold(payload.percent, false);
+  } else if (type === "audio_threshold_error") {
+    setNotice(payload.message || "音量阈值设置无效", "error");
   } else if (type === "snapshot") {
     applySnapshot(payload.meeting || payload, false);
     if (state.meeting?.recording_state === "recording") setConnection("实时连接", "success");
@@ -739,23 +838,55 @@ async function handleEvent(payload) {
   renderMeetings();
 }
 
-async function createMeeting(title, hotwords) {
-  if (state.meeting?.recording_state === "recording") {
-    setNotice("当前会议仍在录音，请先结束它。", "warning");
+async function createMeeting(title) {
+  if (["created", "starting", "recording"].includes(state.meeting?.recording_state)) {
+    setNotice("当前会议尚未结束，请先开始或结束它。", "warning");
     return;
   }
+  setNotice("正在创建会议…", "info");
+  try {
+    const health = await checkHealth();
+    if (health.meeting_start_mode !== "manual") {
+      throw new Error("服务版本尚未支持创建后手动开始，请重启会记服务后重试。");
+    }
+    const snapshot = await requestJson("/api/v2/meetings", { method: "POST", body: JSON.stringify({ title: title.trim() || "未命名会议" }) });
+    if (snapshot.recording_state !== "created") {
+      if (["starting", "recording"].includes(snapshot.recording_state)) {
+        await requestJson(`/api/v2/meetings/${encodeURIComponent(snapshot.id)}/stop`, { method: "POST" }).catch(() => {});
+      }
+      throw new Error("会议创建后意外进入录音状态，已停止录音；请重启会记服务后重试。");
+    }
+    state.meeting = null;
+    applySnapshot(snapshot, true);
+    setConnection("等待开始", "neutral");
+    setNotice("会议已创建，正在连接麦克风以预览实时音量…", "info");
+    try {
+      await startMicrophonePreview();
+      setNotice("麦克风仅在本地预览，确认设备和阈值后点击“开始录音”。", "info");
+    } catch (error) {
+      setNotice(`会议已创建，但麦克风预览不可用：${error.message}`, "warning");
+    }
+  } catch (error) {
+    setNotice(error.message || "无法创建会议", "error");
+  }
+}
+
+async function startRecording() {
+  if (!state.meeting || state.meeting.recording_state !== "created") return;
+  dom.startRecordingButton.disabled = true;
   setNotice("正在申请麦克风权限…", "info");
   try {
     await checkHealth();
     await prepareMicrophone();
-    const snapshot = await requestJson("/api/v2/meetings", { method: "POST", body: JSON.stringify({ title: title.trim() || "未命名会议", hotwords: hotwords.trim() || null }) });
-    state.meeting = null;
-    applySnapshot(snapshot, true);
+    state.audioStreamingEnabled = false;
+    const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/start`, { method: "POST" });
+    applySnapshot(snapshot, false);
     await connectStream(snapshot.id);
     setNotice("");
   } catch (error) {
     stopAudioCapture();
-    setNotice(error.message || "无法开始会议", "error");
+    dom.startRecordingButton.disabled = false;
+    setNotice(error.message || "无法开始录音", "error");
   }
 }
 
@@ -819,16 +950,17 @@ function downloadFile(name) {
 }
 
 function bindEvents() {
-  $("#startMeeting").addEventListener("click", () => createMeeting(dom.meetingTitle.value, dom.hotwords.value));
-  $("#newMeeting").addEventListener("click", () => { dom.dialogTitle.value = ""; dom.dialogHotwords.value = ""; dom.dialog.showModal(); });
+  $("#startMeeting").addEventListener("click", () => createMeeting(dom.meetingTitle.value));
+  $("#newMeeting").addEventListener("click", () => { dom.dialogTitle.value = ""; dom.dialog.showModal(); });
   dom.dialogForm.addEventListener("submit", (event) => {
     if (event.submitter?.value !== "default") return;
     event.preventDefault();
     dom.dialog.close();
-    createMeeting(dom.dialogTitle.value, dom.dialogHotwords.value);
+    createMeeting(dom.dialogTitle.value);
   });
   $("#refreshMeetings").addEventListener("click", () => loadMeetings().catch((error) => setNotice(error.message, "error")));
   dom.search.addEventListener("input", renderMeetings);
+  dom.startRecordingButton.addEventListener("click", startRecording);
   $("#recordButton").addEventListener("click", stopMeeting);
   dom.deleteMeeting.addEventListener("click", deleteMeeting);
   dom.retrySummary.addEventListener("click", retrySummary);
@@ -837,8 +969,18 @@ function bindEvents() {
   dom.downloadSummary.addEventListener("click", () => downloadFile("meeting_minutes.md"));
   dom.downloadTodo.addEventListener("click", () => downloadFile("todo_list.json"));
   $("#refreshDevices").addEventListener("click", () => refreshDevices().catch(() => {}));
-  dom.inputDevice.addEventListener("change", () => {
-    if (state.meeting?.recording_state === "recording") setNotice("设备选择会在下一场会议生效。", "info");
+  dom.volumeThreshold.addEventListener("input", () => setVolumeThreshold(dom.volumeThreshold.value));
+  dom.inputDevice.addEventListener("change", async () => {
+    if (state.meeting?.recording_state === "recording") {
+      setNotice("设备选择会在下一场会议生效。", "info");
+    } else if (state.meeting?.recording_state === "created") {
+      try {
+        await restartMicrophonePreview();
+        setNotice("已切换麦克风，可根据实时音量重新调整阈值。", "info");
+      } catch (error) {
+        setNotice(error.message || "无法预览所选麦克风", "error");
+      }
+    }
   });
   dom.transcriptList.addEventListener("scroll", () => {
     const distance = dom.transcriptList.scrollHeight - dom.transcriptList.scrollTop - dom.transcriptList.clientHeight;

@@ -13,7 +13,17 @@ from typing import Any, Callable
 
 from fastapi import WebSocket
 
-from .audio import SAMPLE_RATE, SAMPLE_WIDTH, RotatingAudioWriter, SegmentEvent, StreamSegmenter, decode_audio_pcm
+from .audio import (
+    SAMPLE_RATE,
+    SAMPLE_WIDTH,
+    RotatingAudioWriter,
+    SegmentEvent,
+    StreamSegmenter,
+    apply_volume_gate,
+    decode_audio_pcm,
+    rms_to_volume_threshold_percent,
+    volume_threshold_percent_to_rms,
+)
 from .config import Settings
 from .diarization import align_speakers, write_segments
 from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
@@ -47,7 +57,6 @@ class LiveMeetingSession:
         *,
         meeting_id: str | None = None,
         title: str = "",
-        hotwords: str | None = None,
         recovered_state: dict[str, Any] | None = None,
         summarizer_factory: Callable[[Settings], MeetingSummarizer] | None = None,
         todo_factory: Callable[[Settings], TodoGenerator] | None = None,
@@ -64,8 +73,7 @@ class LiveMeetingSession:
         self.started_at = str(payload.get("started_at") or utc_now_iso())
         self.ended_at = payload.get("ended_at")
         self.created_monotonic = time.monotonic()
-        self.hotwords = hotwords if hotwords is not None else payload.get("hotwords")
-        self.recording_state = str(payload.get("recording_state", "starting"))
+        self.recording_state = str(payload.get("recording_state", "created"))
         self.summary_state = str(payload.get("summary_state", "idle"))
         self.todo_state = str(payload.get("todo_state", "waiting_summary"))
         self.summary_revision = _safe_int(payload.get("summary_revision"))
@@ -96,6 +104,14 @@ class LiveMeetingSession:
         self.audio_packets_out_of_order = 0
         self.audio_samples_received = 0
         self.audio_level = 0.0
+        try:
+            restored_threshold = float(payload.get("volume_threshold_percent", "nan"))
+            self.volume_threshold_percent = rms_to_volume_threshold_percent(
+                volume_threshold_percent_to_rms(restored_threshold)
+            )
+        except (TypeError, ValueError):
+            self.volume_threshold_percent = rms_to_volume_threshold_percent(settings.vad_minimum_rms)
+        self.volume_threshold_rms = volume_threshold_percent_to_rms(self.volume_threshold_percent)
         self._last_sequence: int | None = None
         self._lock = asyncio.Lock()
         self.queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(maxsize=settings.inference_queue_size)
@@ -261,6 +277,8 @@ class LiveMeetingSession:
 
     @property
     def elapsed_seconds(self) -> float:
+        if self.recording_state == "created" and not self.ended_at:
+            return 0.0
         if self.ended_at and self.audio_samples_received:
             return self.audio_samples_received / self.audio_sample_rate
         return round(time.monotonic() - self.created_monotonic, 3)
@@ -346,7 +364,6 @@ class LiveMeetingSession:
             "summary_revision": self.summary_revision,
             "snapshot_revision": self.snapshot_revision,
             "postprocess": self.postprocess.to_dict(),
-            "hotwords": self.hotwords,
             "error": self.error,
             "summary_error": self.summary_error,
             "todo_error": self.todo_error,
@@ -355,6 +372,7 @@ class LiveMeetingSession:
             "audio_packets_dropped": self.audio_packets_dropped,
             "audio_packets_out_of_order": self.audio_packets_out_of_order,
             "audio_samples_received": self.audio_samples_received,
+            "volume_threshold_percent": self.volume_threshold_percent,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -383,6 +401,7 @@ class LiveMeetingSession:
             "audio_packets_out_of_order": self.audio_packets_out_of_order,
             "audio_samples_received": self.audio_samples_received,
             "audio_level": self.audio_level,
+            "volume_threshold_percent": self.volume_threshold_percent,
             "refinement_queue_size": self.refinement_queue.qsize(),
             "refinement_dropped": self.refinement_dropped,
             "model_metadata": self.model_metadata,
@@ -392,8 +411,11 @@ class LiveMeetingSession:
         return sorted(load_utterances(self.transcript_path), key=lambda item: (item.start, item.end, item.id))
 
     async def start(self) -> None:
-        if self.recording_state not in {"starting", "recording"}:
+        if self.recording_state not in {"created", "starting", "recording"}:
             return
+        if self.recording_state == "created":
+            self.started_at = utc_now_iso()
+            self.created_monotonic = time.monotonic()
         self.audio_writer = RotatingAudioWriter(self.output_dir / "audio", self.settings.audio_segment_minutes)
         vad = self.runtime.new_vad() if hasattr(self.runtime, "new_vad") else None
         self.segmenter = StreamSegmenter(
@@ -407,12 +429,28 @@ class LiveMeetingSession:
             max_utterance_ms=int(self.settings.max_utterance_seconds * 1000),
             vad=vad,
         )
+        self.segmenter.minimum_rms = self.volume_threshold_rms
         self.recording_state = "recording"
         self.error = None
         self._write_state()
         self.worker_task = asyncio.create_task(self._worker(), name=f"meeting-worker-{self.id}")
         self.refinement_worker_task = None
         await self.status("正在录音")
+
+    def configure_volume_threshold(self, value: Any) -> None:
+        try:
+            threshold_percent = float(value)
+            threshold_rms = volume_threshold_percent_to_rms(threshold_percent)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        normalized_percent = round(threshold_percent, 1)
+        changed = normalized_percent != self.volume_threshold_percent
+        self.volume_threshold_percent = normalized_percent
+        self.volume_threshold_rms = threshold_rms
+        if self.segmenter:
+            self.segmenter.minimum_rms = threshold_rms
+        if changed and self.recording_state in {"created", "starting", "recording"}:
+            self._write_state()
 
     def configure_audio(self, payload: dict[str, Any]) -> None:
         sample_rate = int(payload.get("sample_rate", 0) or 0)
@@ -423,6 +461,8 @@ class LiveMeetingSession:
         packet_ms = int(payload.get("packet_ms", 40) or 40)
         if not 1 <= packet_ms <= 1000:
             raise ValueError("音频包时长必须在 1 到 1000 毫秒之间")
+        if "volume_threshold_percent" in payload:
+            self.configure_volume_threshold(payload["volume_threshold_percent"])
         self.audio_packet_ms = packet_ms
         # Sequence numbers belong to one websocket transport. A browser reload
         # starts a new sequence at zero, while reconnecting the same worklet can
@@ -463,10 +503,11 @@ class LiveMeetingSession:
                 self.audio_level = min(1.0, float(np.sqrt(np.mean(samples * samples))) / 32768.0 * 3.0) if len(samples) else 0.0
             except Exception:
                 self.audio_level = 0.0
+            gated_pcm = apply_volume_gate(pcm, self.volume_threshold_rms)
             if self.audio_writer:
-                await asyncio.to_thread(self.audio_writer.write, pcm)
+                await asyncio.to_thread(self.audio_writer.write, gated_pcm)
             if self.segmenter:
-                for event in self.segmenter.feed(pcm):
+                for event in self.segmenter.feed(gated_pcm):
                     try:
                         self.queue.put_nowait(event)
                     except asyncio.QueueFull:
@@ -496,7 +537,7 @@ class LiveMeetingSession:
                 self.queue.task_done()
 
     async def _handle_partial(self, event: SegmentEvent) -> None:
-        result: PartialResult = await asyncio.to_thread(self.runtime.transcribe_partial, event, "", self.hotwords)
+        result: PartialResult = await asyncio.to_thread(self.runtime.transcribe_partial, event, "")
         if result.text:
             await self.broadcast("draft", revision=event.revision, start=event.start, end=event.end, text=result.text, language=result.language, confidence=result.confidence)
 
@@ -507,7 +548,6 @@ class LiveMeetingSession:
             next_id=self.next_utterance_id,
             previous_language=self.current_language,
             recent_text=self.recent[-1].text if self.recent else "",
-            hotwords=self.hotwords,
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
         )
@@ -577,7 +617,6 @@ class LiveMeetingSession:
                     next_id=first_id,
                     previous_language=self.current_language,
                     recent_text=self.recent[-1].text if self.recent else "",
-                    hotwords=self.hotwords,
                     speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
                 )
@@ -641,6 +680,8 @@ class LiveMeetingSession:
                 )
 
     async def request_stop(self, reason: str = "user") -> None:
+        if self.recording_state == "created":
+            return
         if self.stop_task is None or self.stop_task.done():
             self.stop_task = asyncio.create_task(self._finalize(reason), name=f"finalize-{self.id}")
         await asyncio.sleep(0)
@@ -1235,7 +1276,7 @@ class SessionManager:
     def list(self) -> list[dict[str, Any]]:
         return [session.snapshot() for session in sorted(self.sessions.values(), key=lambda item: item.started_at, reverse=True)]
 
-    async def create(self, title: str = "", hotwords: str | None = None) -> LiveMeetingSession:
+    async def create(self, title: str = "") -> LiveMeetingSession:
         async with self._create_lock:
             if self.active_count() >= self.settings.max_active_meetings:
                 raise CapacityLimitError("当前已达到实时会议并发上限")
@@ -1248,16 +1289,33 @@ class SessionManager:
                 self.runtime,
                 self.store,
                 title=title or "未命名会议",
-                hotwords=hotwords,
                 postprocess_scheduler=self._schedule_pending_postprocess,
             )
             self.sessions[session.id] = session
             try:
-                await session.start()
+                session._write_state()
             except Exception:
                 self.sessions.pop(session.id, None)
                 self.store.delete(session.id)
                 raise
+            return session
+
+    async def start(self, meeting_id: str) -> LiveMeetingSession:
+        async with self._create_lock:
+            session = self.sessions.get(meeting_id)
+            if session is None:
+                raise KeyError(meeting_id)
+            if session.recording_state in {"starting", "recording"}:
+                return session
+            if session.recording_state != "created":
+                raise ValueError("当前会议不可开始录音")
+            if self.active_count() >= self.settings.max_active_meetings:
+                raise CapacityLimitError("当前已达到实时会议并发上限")
+            if self._model_postprocess_running() or (
+                self.active_count() == 0 and self._pending_model_postprocess()
+            ):
+                raise CapacityLimitError("上一场会议的模型后处理尚未完成")
+            await session.start()
             return session
 
     def _model_postprocess_running(self) -> bool:

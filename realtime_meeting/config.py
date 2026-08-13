@@ -42,6 +42,13 @@ class Settings:
     asr_primary: str = "large-v3-turbo"
     asr_fallback: str = "large-v3-turbo"
     asr_refine: str = "large-v3"
+    asr_realtime_beam_size: int = 3
+    asr_refine_beam_size: int = 6
+    asr_best_of: int = 3
+    asr_retry_temperature: float = 0.2
+    asr_log_prob_threshold: float = -1.0
+    asr_no_speech_threshold: float = 0.6
+    asr_compression_ratio_threshold: float = 2.4
     asr_autodownload: bool = True
     enable_refinement: bool = True
     enable_postprocess: bool = True
@@ -107,6 +114,13 @@ def load_settings() -> Settings:
         asr_primary=os.getenv("MEETING_ASR_REALTIME", os.getenv("MEETING_ASR_PRIMARY", os.getenv("MEETING_ASR_MODEL", defaults.asr_primary))),
         asr_fallback=os.getenv("MEETING_ASR_FALLBACK", os.getenv("MEETING_ASR_FALLBACK_MODEL", defaults.asr_fallback)),
         asr_refine=os.getenv("MEETING_ASR_REFINE", os.getenv("MEETING_REFINE_ASR_MODEL", defaults.asr_refine)),
+        asr_realtime_beam_size=min(10, _int("MEETING_ASR_REALTIME_BEAM_SIZE", defaults.asr_realtime_beam_size, 1)),
+        asr_refine_beam_size=min(12, _int("MEETING_ASR_REFINE_BEAM_SIZE", defaults.asr_refine_beam_size, 1)),
+        asr_best_of=min(12, _int("MEETING_ASR_BEST_OF", defaults.asr_best_of, 1)),
+        asr_retry_temperature=min(1.0, _float("MEETING_ASR_RETRY_TEMPERATURE", defaults.asr_retry_temperature, 0.0)),
+        asr_log_prob_threshold=min(0.0, _float("MEETING_ASR_LOG_PROB_THRESHOLD", defaults.asr_log_prob_threshold)),
+        asr_no_speech_threshold=min(1.0, _float("MEETING_ASR_NO_SPEECH_THRESHOLD", defaults.asr_no_speech_threshold, 0.0)),
+        asr_compression_ratio_threshold=max(1.0, _float("MEETING_ASR_COMPRESSION_RATIO_THRESHOLD", defaults.asr_compression_ratio_threshold, 1.0)),
         asr_autodownload=_bool("MEETING_ASR_AUTODOWNLOAD", True),
         enable_refinement=_bool("MEETING_ENABLE_REFINEMENT", True),
         enable_postprocess=_bool("MEETING_ENABLE_POSTPROCESS", True),

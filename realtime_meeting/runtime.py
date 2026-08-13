@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import shutil
 import sys
@@ -396,6 +397,19 @@ class PartialResult:
     language_source: str = "detector"
 
 
+@dataclass(slots=True)
+class _WhisperDecode:
+    text: str
+    language: str | None
+    language_probability: float
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+    compression_ratio: float | None = None
+    temperature: float = 0.0
+    retry_used: bool = False
+    discarded: bool = False
+
+
 class LiveModelRuntime:
     """Model facade used by the session and compatible test runtimes.
 
@@ -418,6 +432,13 @@ class LiveModelRuntime:
         translation_autodownload: bool = False,
         vad_model: str = "fsmn-vad",
         diarization_required: bool = True,
+        asr_realtime_beam_size: int = 3,
+        asr_refine_beam_size: int = 6,
+        asr_best_of: int = 3,
+        asr_retry_temperature: float = 0.2,
+        asr_log_prob_threshold: float = -1.0,
+        asr_no_speech_threshold: float = 0.6,
+        asr_compression_ratio_threshold: float = 2.4,
     ) -> None:
         self.asr_primary_name = asr_primary or asr_fallback or "large-v3-turbo"
         self.asr_fallback_name = asr_fallback or self.asr_primary_name
@@ -429,6 +450,13 @@ class LiveModelRuntime:
         self.translation_autodownload = translation_autodownload
         self.vad_model_name = vad_model
         self.diarization_required = diarization_required
+        self.asr_realtime_beam_size = max(1, int(asr_realtime_beam_size))
+        self.asr_refine_beam_size = max(1, int(asr_refine_beam_size))
+        self.asr_best_of = max(1, int(asr_best_of))
+        self.asr_retry_temperature = min(1.0, max(0.0, float(asr_retry_temperature)))
+        self.asr_log_prob_threshold = float(asr_log_prob_threshold)
+        self.asr_no_speech_threshold = min(1.0, max(0.0, float(asr_no_speech_threshold)))
+        self.asr_compression_ratio_threshold = max(1.0, float(asr_compression_ratio_threshold))
         self.device = "cpu"
         self.compute_type = "int8"
         self.primary: Any | None = None
@@ -464,6 +492,8 @@ class LiveModelRuntime:
             "fallback_count": 0,
             "stage_failures": 0,
             "retry_count": 0,
+            "asr_decode_retries": 0,
+            "asr_discarded_results": 0,
             "queue_lengths": {},
         }
         self._refine_lock = threading.Lock()
@@ -687,16 +717,10 @@ class LiveModelRuntime:
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
     @staticmethod
-    def _asr_prompt(recent_text: str = "", hotwords: str | None = None) -> str | None:
-        """Build a bounded Whisper prompt from meeting vocabulary and recent context."""
-        vocabulary = " ".join(str(hotwords or "").split())[:1000]
+    def _asr_prompt(recent_text: str = "") -> str | None:
+        """Build a bounded Whisper prompt from recent context."""
         context = " ".join(str(recent_text or "").split())[-500:]
-        parts = []
-        if vocabulary:
-            parts.append(f"专业词和姓名：{vocabulary}")
-        if context:
-            parts.append(f"最近内容：{context}")
-        return "\n".join(parts) or None
+        return f"最近内容：{context}" if context else None
 
     def _whisper(
         self,
@@ -706,19 +730,140 @@ class LiveModelRuntime:
         refine: bool = False,
         prompt: str | None = None,
     ) -> tuple[str, str | None, float]:
+        result = self._whisper_decode(pcm, model, refine=refine, prompt=prompt)
+        return result.text, result.language, result.language_probability
+
+    @staticmethod
+    def _has_speech_text(text: str) -> bool:
+        """Return False for blank or punctuation-only ASR hallucinations."""
+        return any(character.isalnum() or "\u3400" <= character <= "\u9fff" for character in text)
+
+    @staticmethod
+    def _mean_metric(values: list[float]) -> float | None:
+        valid = [value for value in values if math.isfinite(value)]
+        return sum(valid) / len(valid) if valid else None
+
+    def _whisper_decode(
+        self,
+        pcm: bytes,
+        model: Any,
+        *,
+        refine: bool = False,
+        prompt: str | None = None,
+        beam_size: int | None = None,
+        best_of: int | None = None,
+        temperature: float = 0.0,
+    ) -> _WhisperDecode:
         if model is None:
-            return "", None, 0.0
+            return _WhisperDecode("", None, 0.0)
+        selected_beam_size = beam_size or (self.asr_refine_beam_size if refine else self.asr_realtime_beam_size)
         segments, info = model.transcribe(
             self._audio(pcm),
-            beam_size=5 if refine else 1,
+            beam_size=selected_beam_size,
+            best_of=best_of or self.asr_best_of,
+            temperature=temperature,
+            compression_ratio_threshold=self.asr_compression_ratio_threshold,
+            log_prob_threshold=self.asr_log_prob_threshold,
+            no_speech_threshold=self.asr_no_speech_threshold,
             vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt=prompt or None,
         )
-        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        materialized = [
+            segment
+            for segment in segments
+            if self._has_speech_text(str(getattr(segment, "text", "") or "").strip())
+        ]
+        text = " ".join(str(segment.text).strip() for segment in materialized).strip()
         language = getattr(info, "language", None)
         probability = float(getattr(info, "language_probability", 0.0) or 0.0)
-        return text, language, probability
+        avg_logprob = self._mean_metric([
+            float(value)
+            for value in (getattr(segment, "avg_logprob", float("nan")) for segment in materialized)
+            if value is not None
+        ])
+        no_speech_values = [
+            float(value)
+            for value in (getattr(segment, "no_speech_prob", float("nan")) for segment in materialized)
+            if value is not None and math.isfinite(float(value))
+        ]
+        compression_values = [
+            float(value)
+            for value in (getattr(segment, "compression_ratio", float("nan")) for segment in materialized)
+            if value is not None and math.isfinite(float(value))
+        ]
+        temperature_values = [
+            float(value)
+            for value in (getattr(segment, "temperature", temperature) for segment in materialized)
+            if value is not None and math.isfinite(float(value))
+        ]
+        return _WhisperDecode(
+            text=text,
+            language=language,
+            language_probability=probability,
+            avg_logprob=avg_logprob,
+            no_speech_prob=max(no_speech_values) if no_speech_values else None,
+            compression_ratio=max(compression_values) if compression_values else None,
+            temperature=max(temperature_values) if temperature_values else temperature,
+        )
+
+    def _decode_needs_retry(self, result: _WhisperDecode) -> bool:
+        if not result.text or not self._has_speech_text(result.text):
+            return False
+        if (
+            result.no_speech_prob is not None
+            and result.no_speech_prob > self.asr_no_speech_threshold
+            and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
+        ):
+            return False
+        return (
+            result.avg_logprob is not None
+            and result.avg_logprob < self.asr_log_prob_threshold
+        ) or (
+            result.compression_ratio is not None
+            and result.compression_ratio > self.asr_compression_ratio_threshold
+        )
+
+    def _discard_decode_result(self, result: _WhisperDecode) -> str | None:
+        if not result.text:
+            return "empty"
+        if not self._has_speech_text(result.text):
+            return "punctuation_only"
+        if (
+            result.no_speech_prob is not None
+            and result.no_speech_prob > self.asr_no_speech_threshold
+            and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
+        ):
+            return "no_speech"
+        if (
+            result.compression_ratio is not None
+            and result.compression_ratio > self.asr_compression_ratio_threshold
+            and result.avg_logprob is not None
+            and result.avg_logprob < self.asr_log_prob_threshold
+        ):
+            return "repetitive_hallucination"
+        return None
+
+    def _decode_quality(self, result: _WhisperDecode) -> float:
+        score = result.avg_logprob if result.avg_logprob is not None else -10.0
+        if result.compression_ratio is not None and result.compression_ratio > self.asr_compression_ratio_threshold:
+            score -= min(2.0, result.compression_ratio - self.asr_compression_ratio_threshold)
+        if result.no_speech_prob is not None and result.no_speech_prob > self.asr_no_speech_threshold:
+            score -= result.no_speech_prob - self.asr_no_speech_threshold
+        if not self._has_speech_text(result.text):
+            score -= 10.0
+        return score
+
+    def _select_decode_result(self, first: _WhisperDecode, retry: _WhisperDecode) -> _WhisperDecode:
+        first_discarded = self._discard_decode_result(first) is not None
+        retry_discarded = self._discard_decode_result(retry) is not None
+        if first_discarded != retry_discarded:
+            return retry if first_discarded else first
+        if not retry.text or not self._has_speech_text(retry.text):
+            return first
+        if not first.text or not self._has_speech_text(first.text):
+            return retry
+        return retry if self._decode_quality(retry) >= self._decode_quality(first) else first
 
     def _recognize(
         self,
@@ -726,7 +871,6 @@ class LiveModelRuntime:
         *,
         refine: bool = False,
         recent_text: str = "",
-        hotwords: str | None = None,
     ) -> tuple[str, LanguageGuess, float, str, str]:
         self.last_asr_error = None
         self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
@@ -735,18 +879,67 @@ class LiveModelRuntime:
         if model is None or not hasattr(model, "transcribe"):
             return "", LanguageGuess("zh", 0.0), 0.0, "none", "detector"
         try:
+            prompt = self._asr_prompt(recent_text)
+            initial_beam_size = self.asr_refine_beam_size if refine else self.asr_realtime_beam_size
+
+            def decode(temperature: float, beam_size: int, best_of: int) -> _WhisperDecode:
+                result = self._whisper_decode(
+                    pcm,
+                    model,
+                    refine=refine,
+                    prompt=prompt,
+                    beam_size=beam_size,
+                    best_of=best_of,
+                    temperature=temperature,
+                )
+                self.metrics["asr_calls"] = int(self.metrics.get("asr_calls", 0)) + 1
+                return result
+
+            def decode_with_retry() -> _WhisperDecode:
+                result = decode(0.0, initial_beam_size, self.asr_best_of)
+                if self._decode_needs_retry(result):
+                    self.metrics["asr_decode_retries"] = int(self.metrics.get("asr_decode_retries", 0)) + 1
+                    self._event(
+                        "asr_decode_retry",
+                        model=model_name,
+                        refine=refine,
+                        avg_logprob=result.avg_logprob,
+                        no_speech_prob=result.no_speech_prob,
+                        compression_ratio=result.compression_ratio,
+                    )
+                    retry = decode(
+                        self.asr_retry_temperature,
+                        max(initial_beam_size, 5),
+                        max(self.asr_best_of, 5),
+                    )
+                    result = self._select_decode_result(result, retry)
+                    result.retry_used = True
+                return result
+
             if self.device == "cuda":
                 with self.gpu_manager.acquire_sync("asr_refine" if refine else "asr_realtime"):
-                    text, language, confidence = self._whisper(
-                        pcm, model, refine=refine, prompt=self._asr_prompt(recent_text, hotwords)
-                    )
+                    result = decode_with_retry()
             else:
-                text, language, confidence = self._whisper(
-                    pcm, model, refine=refine, prompt=self._asr_prompt(recent_text, hotwords)
+                result = decode_with_retry()
+            discard_reason = self._discard_decode_result(result)
+            if discard_reason:
+                self.metrics["asr_discarded_results"] = int(self.metrics.get("asr_discarded_results", 0)) + 1
+                self._event(
+                    "asr_result_discarded",
+                    model=model_name,
+                    refine=refine,
+                    reason=discard_reason,
+                    avg_logprob=result.avg_logprob,
+                    no_speech_prob=result.no_speech_prob,
+                    compression_ratio=result.compression_ratio,
                 )
-            guess = self.detector.detect(text, whisper_language=language, whisper_confidence=confidence)
-            self.metrics["asr_calls"] = int(self.metrics.get("asr_calls", 0)) + 1
-            return text, guess, confidence, model_name, "asr" if language else "detector"
+                return "", LanguageGuess("zh", 0.0), 0.0, model_name, "detector"
+            guess = self.detector.detect(
+                result.text,
+                whisper_language=result.language,
+                whisper_confidence=result.language_probability,
+            )
+            return result.text, guess, result.language_probability, model_name, "asr" if result.language else "detector"
         except Exception as exc:
             self.metrics["stage_failures"] = int(self.metrics.get("stage_failures", 0)) + 1
             self._event("asr_error", model=model_name, refine=refine, error=str(exc))
@@ -775,14 +968,14 @@ class LiveModelRuntime:
                 self.refine = None
             return self.refine
 
-    def transcribe_partial(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
+    def transcribe_partial(self, event: SegmentEvent, recent_text: str = "") -> PartialResult:
         text, guess, confidence, model, language_source = self._recognize(
-            event.pcm, recent_text=recent_text, hotwords=hotwords
+            event.pcm, recent_text=recent_text
         )
         return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
 
-    def transcribe_draft(self, event: SegmentEvent, recent_text: str = "", hotwords: str | None = None) -> PartialResult:
-        return self.transcribe_partial(event, recent_text, hotwords)
+    def transcribe_draft(self, event: SegmentEvent, recent_text: str = "") -> PartialResult:
+        return self.transcribe_partial(event, recent_text)
 
     def transcribe_final(
         self,
@@ -791,12 +984,11 @@ class LiveModelRuntime:
         next_id: int,
         previous_language: str | None = None,
         recent_text: str = "",
-        hotwords: str | None = None,
         speaker_clusterer: OnlineSpeakerClusterer | None = None,
         refined: bool = True,
     ) -> list[Utterance]:
         text, whisper_guess, confidence, model, language_source = self._recognize(
-            event.pcm, refine=refined, recent_text=recent_text, hotwords=hotwords
+            event.pcm, refine=refined, recent_text=recent_text
         )
         if not text:
             if refined and self.last_asr_error:

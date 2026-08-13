@@ -82,10 +82,16 @@ def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> N
     with TestClient(app) as client:
         health = client.get("/api/v2/health", headers=headers)
         assert health.status_code == 200
+        assert health.json()["meeting_start_mode"] == "manual"
         assert "super-secret" not in health.text
         created = client.post("/api/v2/meetings", headers=headers, json={"title": "API 测试"})
         assert created.status_code == 201
         meeting_id = created.json()["id"]
+        assert created.json()["recording_state"] == "created"
+        assert client.post(f"/api/v2/meetings/{meeting_id}/stop", headers=headers).status_code == 409
+        started = client.post(f"/api/v2/meetings/{meeting_id}/start", headers=headers)
+        assert started.status_code == 202
+        assert started.json()["recording_state"] == "recording"
         ticket = client.post(f"/api/v2/meetings/{meeting_id}/stream-ticket", headers=headers)
         assert ticket.status_code == 201
         with client.websocket_connect(f"/api/v2/meetings/{meeting_id}/stream") as websocket:
@@ -94,6 +100,10 @@ def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> N
             assert websocket.receive_json()["type"] == "snapshot"
             websocket.send_json({"type": "audio_config", "sample_rate": 16000, "channels": 1, "encoding": "pcm_s16le", "packet_ms": 40, "sequence_header": True})
             assert websocket.receive_json()["type"] == "audio_config_ack"
+            websocket.send_json({"type": "audio_threshold", "percent": 8.0})
+            threshold_ack = websocket.receive_json()
+            assert threshold_ack == {"type": "audio_threshold_ack", "percent": 8.0}
+            assert app.state.manager.get(meeting_id).volume_threshold_percent == 8.0
         assert client.post(f"/api/v2/meetings/{meeting_id}/stop", headers=headers).status_code == 202
         with pytest.raises(WebSocketDisconnect) as disconnect:
             with client.websocket_connect(f"/api/v2/meetings/{meeting_id}/stream") as reused:
@@ -128,7 +138,9 @@ def test_browser_session_cookie_authenticates_api(tmp_path) -> None:
         assert client.get("/api/v2/health").status_code == 200
         created = client.post("/api/v2/meetings", json={"title": "浏览器鉴权"})
         assert created.status_code == 201
-        assert client.post(f"/api/v2/meetings/{created.json()['id']}/stop").status_code == 202
+        meeting_id = created.json()["id"]
+        assert client.post(f"/api/v2/meetings/{meeting_id}/start").status_code == 202
+        assert client.post(f"/api/v2/meetings/{meeting_id}/stop").status_code == 202
 
 
 def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
@@ -144,4 +156,5 @@ def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
         second = client.get(f"/api/v2/meetings/{meeting.id}/transcript?offset=500&limit=500").json()
         assert first["total"] == 501 and first["has_more"] is True and len(first["items"]) == 500
         assert second["has_more"] is False and [item["text"] for item in second["items"]] == ["发言500"]
+        assert client.post(f"/api/v2/meetings/{meeting.id}/start").status_code == 202
         assert client.post(f"/api/v2/meetings/{meeting.id}/stop").status_code == 202

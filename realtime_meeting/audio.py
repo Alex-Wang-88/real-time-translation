@@ -4,6 +4,7 @@ import shutil
 import subprocess  # nosec B404
 import sys
 import wave
+import math
 from collections import deque
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -17,6 +18,39 @@ SAMPLE_WIDTH = 2
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * SAMPLE_WIDTH
+AUDIO_LEVEL_SCALE = 3.0
+VOLUME_THRESHOLD_MIN_PERCENT = 0.0
+VOLUME_THRESHOLD_MAX_PERCENT = 30.0
+
+
+def volume_threshold_percent_to_rms(percent: float) -> float:
+    """Convert the UI meter percentage to a PCM16 RMS threshold."""
+    value = float(percent)
+    if not math.isfinite(value) or not VOLUME_THRESHOLD_MIN_PERCENT <= value <= VOLUME_THRESHOLD_MAX_PERCENT:
+        raise ValueError(
+            f"音量阈值必须在 {VOLUME_THRESHOLD_MIN_PERCENT:g}% 到 {VOLUME_THRESHOLD_MAX_PERCENT:g}% 之间"
+        )
+    return value / 100.0 / AUDIO_LEVEL_SCALE * 32768.0
+
+
+def rms_to_volume_threshold_percent(rms: float) -> float:
+    """Convert a PCM16 RMS threshold to the clamped UI meter percentage."""
+    value = float(rms)
+    if not math.isfinite(value):
+        value = 0.0
+    percent = value / 32768.0 * AUDIO_LEVEL_SCALE * 100.0
+    return round(min(VOLUME_THRESHOLD_MAX_PERCENT, max(VOLUME_THRESHOLD_MIN_PERCENT, percent)), 1)
+
+
+def apply_volume_gate(pcm: bytes, minimum_rms: float) -> bytes:
+    """Mute a packet whose RMS is below the configured threshold without dropping time."""
+    if not pcm or minimum_rms <= 0:
+        return pcm
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if not len(samples):
+        return pcm
+    rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+    return bytes(len(pcm)) if rms < minimum_rms else pcm
 
 
 @dataclass(slots=True)

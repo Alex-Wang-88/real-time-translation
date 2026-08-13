@@ -1,10 +1,35 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import wave
 
-from realtime_meeting.audio import FRAME_BYTES, SAMPLE_RATE, StreamSegmenter, decode_audio_pcm
+from realtime_meeting.audio import (
+    FRAME_BYTES,
+    SAMPLE_RATE,
+    StreamSegmenter,
+    apply_volume_gate,
+    decode_audio_pcm,
+    volume_threshold_percent_to_rms,
+)
+
+
+def test_volume_threshold_converts_to_rms_and_gates_packets() -> None:
+    threshold = volume_threshold_percent_to_rms(2.2)
+    quiet = np.full(FRAME_BYTES // 2, 100, dtype=np.int16).tobytes()
+    loud = np.full(FRAME_BYTES // 2, 1000, dtype=np.int16).tobytes()
+
+    assert 200 < threshold < 300
+    assert apply_volume_gate(quiet, threshold) == bytes(len(quiet))
+    assert apply_volume_gate(loud, threshold) == loud
+
+
+def test_volume_threshold_rejects_values_outside_ui_range() -> None:
+    with pytest.raises(ValueError):
+        volume_threshold_percent_to_rms(-0.1)
+    with pytest.raises(ValueError):
+        volume_threshold_percent_to_rms(30.1)
 
 
 def test_segmenter_handles_odd_packet_and_emits_final_segment() -> None:

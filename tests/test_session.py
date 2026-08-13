@@ -28,7 +28,7 @@ class FakeRuntime:
     def new_speaker_clusterer(self):
         return None
 
-    def transcribe_partial(self, event, recent_text="", hotwords=None):
+    def transcribe_partial(self, event, recent_text=""):
         from realtime_meeting.runtime import PartialResult
 
         return PartialResult(event.revision, event.start, event.end, "hello", "en", 0.9, "fake")
@@ -272,15 +272,31 @@ async def test_model_dependent_recovery_waits_for_runtime_readiness(settings) ->
 
 
 @pytest.mark.asyncio
-async def test_create_failure_releases_capacity_and_removes_directory(settings, monkeypatch) -> None:
+async def test_create_persists_draft_until_explicit_start(settings) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    session = await manager.create("待开始")
+    assert session.recording_state == "created"
+    assert session.snapshot()["duration_seconds"] == 0.0
+    assert session.output_dir.joinpath("session_state.json").is_file()
+    assert await manager.delete(session.id) is True
+
+    session = await manager.create("显式开始")
+    await manager.start(session.id)
+    assert session.recording_state == "recording"
+    await session.request_stop()
+    await session.stop_task
+
+
+@pytest.mark.asyncio
+async def test_create_state_write_failure_releases_directory(settings, monkeypatch) -> None:
     manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
 
-    async def fail_start(_session):
-        raise RuntimeError("VAD initialization failed")
+    def fail_write(_session):
+        raise RuntimeError("state write failed")
 
-    monkeypatch.setattr(LiveMeetingSession, "start", fail_start)
-    with pytest.raises(RuntimeError, match="VAD initialization failed"):
-        await manager.create("启动失败")
+    monkeypatch.setattr(LiveMeetingSession, "_write_state", fail_write)
+    with pytest.raises(RuntimeError, match="state write failed"):
+        await manager.create("保存失败")
     assert manager.sessions == {}
     assert list(settings.results_dir.iterdir()) == []
 
@@ -289,6 +305,7 @@ async def test_create_failure_releases_capacity_and_removes_directory(settings, 
 async def test_finalize_failure_marks_error_and_allows_delete(settings) -> None:
     manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
     session = await manager.create("保存失败")
+    await manager.start(session.id)
 
     class FailingWriter:
         def close(self):
@@ -307,6 +324,7 @@ async def test_finalize_failure_marks_error_and_allows_delete(settings) -> None:
 async def test_finalize_failure_before_queue_shutdown_cancels_worker(settings) -> None:
     manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
     session = await manager.create("分段收尾失败")
+    await manager.start(session.id)
 
     class FailingSegmenter:
         def flush(self):
@@ -631,6 +649,8 @@ async def test_manager_blocks_new_recording_during_model_postprocess(settings) -
 @pytest.mark.asyncio
 async def test_manager_serializes_concurrent_create_capacity_check(settings, monkeypatch) -> None:
     manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    first_session = await manager.create("第一场")
+    second_session = await manager.create("第二场")
     original_start = LiveMeetingSession.start
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -645,11 +665,11 @@ async def test_manager_serializes_concurrent_create_capacity_check(settings, mon
         await original_start(session)
 
     monkeypatch.setattr(LiveMeetingSession, "start", delayed_start)
-    first = asyncio.create_task(manager.create("第一场"))
+    first = asyncio.create_task(manager.start(first_session.id))
     await first_started.wait()
-    second = asyncio.create_task(manager.create("第二场"))
+    second = asyncio.create_task(manager.start(second_session.id))
     release_first.set()
-    first_session = await first
+    assert await first is first_session
     with pytest.raises(CapacityLimitError):
         await second
     assert manager.active_count() == 1
