@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from realtime_meeting.diarization import DiarizationEngine
-from realtime_meeting.runtime import OPUS_MT_REPOSITORIES, prepare_opus_mt_model
+from realtime_meeting.runtime import MODEL_REVISIONS, OPUS_MT_REPOSITORIES, prepare_opus_mt_model
 
 
 def _download(repo: str, target: Path) -> Path:
     from huggingface_hub import snapshot_download
 
     target.mkdir(parents=True, exist_ok=True)
-    path = Path(snapshot_download(repo_id=repo, local_dir=str(target)))
+    path = Path(snapshot_download(repo_id=repo, revision=MODEL_REVISIONS[repo], local_dir=str(target)))
     return path
 
 
@@ -54,6 +54,7 @@ def _check_vad(autodownload: bool) -> dict[str, Any]:
 
         snapshot = snapshot_download(
             repo_id="funasr/fsmn-vad",
+            revision=MODEL_REVISIONS["funasr/fsmn-vad"],
             local_files_only=not autodownload,
         )
         result["snapshot"] = str(snapshot)
@@ -83,7 +84,13 @@ def _check_asr(autodownload: bool) -> dict[str, Any]:
             ("realtime", result["realtime"], "mobiuslabsgmbh/faster-whisper-large-v3-turbo"),
             ("refine", result["refine"], "Systran/faster-whisper-large-v3"),
         ):
-            paths[key] = str(download_model(repository, local_files_only=not autodownload))
+            paths[key] = str(
+                download_model(
+                    repository,
+                    revision=MODEL_REVISIONS[repository],
+                    local_files_only=not autodownload,
+                )
+            )
         result["snapshots"] = paths
         result["ready"] = True
     except Exception as exc:

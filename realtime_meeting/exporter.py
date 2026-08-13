@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
 from .jimo import paired_text
 from .models import LANGUAGE_LABELS, TodoDocument, Utterance, language_label
 from .storage import TranscriptStore, atomic_write_json, atomic_write_text
-from .text_normalize import simplify_chinese
 
 
 def load_utterances(path: Path) -> list[Utterance]:
@@ -24,6 +24,11 @@ def delete_utterance(path: Path, item: Utterance) -> None:
 
 def _write(path: Path, content: str) -> None:
     atomic_write_text(path, content.rstrip() + "\n")
+
+
+def _language_filename(language: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "_", language.casefold()).strip("_-")
+    return slug[:32] or "unknown"
 
 
 def render_todo_markdown(todo: TodoDocument) -> str:
@@ -85,12 +90,15 @@ def export_live_result(
     for item in items:
         if item.language not in languages:
             languages.append(item.language)
+    language_files: list[str] = []
     for language in languages:
         selected = [
             f"[{item.start:.3f}-{item.end:.3f}] 演讲人{item.speaker_id}：{item.text}"
             for item in items if item.language == language
         ]
-        _write(output_dir / f"original_{language}.md", f"# {language_label(language)}原稿\n\n" + ("\n".join(selected) or "（未检测到该语言发言）"))
+        filename = f"original_{_language_filename(language)}.md"
+        language_files.append(filename)
+        _write(output_dir / filename, f"# {language_label(language)}原稿\n\n" + ("\n".join(selected) or "（未检测到该语言发言）"))
     manifest = {
         "meeting_id": meeting_id,
         "title": title,
@@ -115,15 +123,16 @@ def export_live_result(
     files = [
         "meeting_transcript.md", "translated_zh.md", "transcript.json", "transcript.jsonl",
         "audio_manifest.json", "manifest.json",
-    ] + [f"original_{language}.md" for language in languages]
+    ] + language_files
     if (output_dir / "transcript_events.jsonl").is_file():
         files.append("transcript_events.jsonl")
     if speaker_segments_path.is_file():
         files.append("speaker_segments.json")
     for segment in audio_segments:
         if isinstance(segment, dict) and segment.get("file"):
-            audio_name = str(segment["file"]).lstrip("/\\")
-            files.append(f"audio/{audio_name}")
+            audio_name = Path(str(segment["file"])).name
+            if audio_name:
+                files.append(f"audio/{audio_name}")
     for name in ("meeting_minutes.md", "todo_list.json", "todo_list.md"):
         if (output_dir / name).is_file():
             files.append(name)

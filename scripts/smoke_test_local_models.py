@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 from faster_whisper import WhisperModel
 from faster_whisper.utils import download_model
 
-from realtime_meeting.runtime import LiveChineseTranslator, choose_device
+from realtime_meeting.runtime import MODEL_REVISIONS, LiveChineseTranslator, choose_device
 
 
 def main() -> None:
@@ -29,7 +29,11 @@ def main() -> None:
         ("large-v3", "Systran/faster-whisper-large-v3"),
     ):
         started = time.perf_counter()
-        snapshot = download_model(repository, local_files_only=True)
+        snapshot = download_model(
+            repository,
+            revision=MODEL_REVISIONS[repository],
+            local_files_only=True,
+        )
         model = WhisperModel(snapshot, device=device, compute_type=compute_type)
         loaded = time.perf_counter()
         segments, info = model.transcribe(
@@ -58,13 +62,17 @@ def main() -> None:
             gc.collect()
             if device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(json.dumps({"cleanup_warning": str(exc)}, ensure_ascii=True))
 
     from funasr import AutoModel
 
     started = time.perf_counter()
-    vad_snapshot = snapshot_download("funasr/fsmn-vad", local_files_only=True)
+    vad_snapshot = snapshot_download(
+        "funasr/fsmn-vad",
+        revision=MODEL_REVISIONS["funasr/fsmn-vad"],
+        local_files_only=True,
+    )
     vad = AutoModel(
         model=vad_snapshot,
         hub="hf",

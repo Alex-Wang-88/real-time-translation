@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import types
 
-from realtime_meeting.runtime import LiveModelRuntime, OPUS_MT_TARGET_TAGS, opus_mt_repository
+from realtime_meeting.runtime import MODEL_REVISIONS, LiveModelRuntime, OPUS_MT_TARGET_TAGS, opus_mt_repository
 
 
 def test_runtime_load_uses_refinement_model_name(settings, monkeypatch) -> None:
@@ -59,6 +59,7 @@ def test_opus_mt_repository_and_target_tags_are_explicit() -> None:
     assert opus_mt_repository("en") == "Helsinki-NLP/opus-mt-en-zh"
     assert opus_mt_repository("de") == "Helsinki-NLP/opus-mt-de-ZH"
     assert OPUS_MT_TARGET_TAGS == {"en": ">>cmn_Hans<<", "de": ">>zh_cn<<"}
+    assert all(len(revision) == 40 for revision in MODEL_REVISIONS.values())
 
 
 def test_whisper_receives_bounded_hotwords_and_recent_context(settings) -> None:

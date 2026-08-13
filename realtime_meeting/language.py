@@ -66,7 +66,9 @@ class MultilingualDetector:
                 if code:
                     return LanguageGuess(code, 0.65)
             except Exception:
-                pass
+                # Optional detector failures fall through to explicit language
+                # hints and script-based heuristics below.
+                self._lingua = None
         if hint:
             return LanguageGuess(hint, 0.5)
         return LanguageGuess(normalize_language_code(previous) or "en", 0.25)

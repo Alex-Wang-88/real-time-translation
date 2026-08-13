@@ -8,13 +8,12 @@ import pytest
 
 from realtime_meeting.jimo import (
     JimoClient,
-    MeetingSummarizer,
     TodoGenerator,
     parse_sse_lines,
     parse_todo_document,
     transcript_chunks,
 )
-from realtime_meeting.models import TodoDocument, Utterance
+from realtime_meeting.models import Utterance
 
 
 def test_sse_parser_supports_multiline_data_and_end_event() -> None:

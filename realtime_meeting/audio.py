@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 import wave
 from collections import deque
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Literal
+from typing import BinaryIO, Callable, Literal
 
 import numpy as np
 
@@ -34,16 +35,17 @@ def decode_audio_pcm(path: Path) -> bytes:
         with wave.open(str(path), "rb") as source:
             if source.getnchannels() == 1 and source.getsampwidth() == SAMPLE_WIDTH and source.getframerate() == SAMPLE_RATE:
                 return source.readframes(source.getnframes())
-    if not shutil.which("ffmpeg"):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
         raise RuntimeError(f"恢复精修输入需要 FFmpeg: {path.name}")
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"],
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         creationflags=creationflags,
-    )
+    )  # nosec B603
     if result.returncode:
         raise RuntimeError(f"恢复精修音频失败 {path.name}: {result.stderr.decode('utf-8', errors='replace').strip()}")
     return result.stdout
@@ -219,7 +221,8 @@ class RotatingAudioWriter:
         self._sink: BinaryIO | None = None
         self._current_path: Path | None = None
         self._current_start = 0
-        self._format = "flac" if shutil.which("ffmpeg") else "wav"
+        self._ffmpeg = shutil.which("ffmpeg")
+        self._format = "flac" if self._ffmpeg else "wav"
 
     def _open(self) -> None:
         self.index += 1
@@ -228,8 +231,33 @@ class RotatingAudioWriter:
         suffix = ".flac" if self._format == "flac" else ".wav"
         self._current_path = self.output_dir / f"audio-{self.index:04d}{suffix}"
         if self._format == "flac":
+            if not self._ffmpeg:
+                raise RuntimeError("FFmpeg 不可用，无法创建 FLAC 录音")
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            self._process = subprocess.Popen(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0", "-c:a", "flac", str(self._current_path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creationflags)
+            self._process = subprocess.Popen(  # nosec B603
+                [
+                    self._ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    str(SAMPLE_RATE),
+                    "-ac",
+                    "1",
+                    "-i",
+                    "pipe:0",
+                    "-c:a",
+                    "flac",
+                    str(self._current_path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=creationflags,
+            )
             self._sink = self._process.stdin
         else:
             self._wave = wave.open(str(self._current_path), "wb")
@@ -264,16 +292,38 @@ class RotatingAudioWriter:
     def _close_current(self) -> None:
         if self._current_path is None:
             return
-        if self._format == "flac":
-            if self._sink:
-                self._sink.close()
-            if self._process:
-                stderr = self._process.stderr.read().decode("utf-8", errors="replace") if self._process.stderr else ""
-                code = self._process.wait(timeout=30)
-                if code:
-                    raise RuntimeError(f"FFmpeg FLAC 写入失败: {stderr.strip()}")
-        elif self._wave:
-            self._wave.close()
+        try:
+            if self._format == "flac":
+                if self._sink:
+                    self._sink.close()
+                if self._process:
+                    try:
+                        _stdout, stderr_bytes = self._process.communicate(timeout=30)
+                    except subprocess.TimeoutExpired as exc:
+                        self._process.kill()
+                        _stdout, stderr_bytes = self._process.communicate()
+                        raise RuntimeError("FFmpeg FLAC 写入超时") from exc
+                    stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+                    if self._process.returncode:
+                        raise RuntimeError(f"FFmpeg FLAC 写入失败: {stderr.strip()}")
+            elif self._wave:
+                self._wave.close()
+        except Exception:
+            # Never leave a failed encoder attached to the writer. Repeated
+            # close attempts would otherwise operate on a closed stdin while
+            # the child process or file handle remains live.
+            if self._process and self._process.poll() is None:
+                self._process.kill()
+                self._process.wait(timeout=5)
+            if self._wave:
+                with suppress(Exception):
+                    self._wave.close()
+            self._process = None
+            self._wave = None
+            self._sink = None
+            self._current_path = None
+            self.current_samples = 0
+            raise
         self.segments.append(AudioSegmentInfo(self._current_path.name, round(self._current_start / SAMPLE_RATE, 3), round((self._current_start + self.current_samples) / SAMPLE_RATE, 3), self.current_samples, self._format))
         self._process = None
         self._wave = None

@@ -244,8 +244,11 @@ class DiarizationEngine:
         for source in sources:
             try:
                 waveform, sample_rate = librosa.load(str(source), sr=SAMPLE_RATE, mono=True)
-            except Exception:
-                continue
+            except Exception as exc:
+                # Skipping a middle file shifts every subsequent timestamp and
+                # silently assigns speakers to the wrong utterances. Fail the
+                # retryable stage while the recording is still retained.
+                raise RuntimeError(f"无法读取说话人重排音频 {Path(source).name}: {exc}") from exc
             duration = len(waveform) / max(1, sample_rate)
             for interval_start, interval_end in self._speech_intervals(waveform, sample_rate):
                 cursor = interval_start

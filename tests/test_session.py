@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import wave
 from pathlib import Path
 
@@ -11,8 +12,7 @@ import pytest
 from realtime_meeting.diarization import SpeakerSegment
 from realtime_meeting.models import TodoDocument, TodoItem, Utterance
 from realtime_meeting.audio import SAMPLE_RATE, SegmentEvent
-from realtime_meeting.session import LiveMeetingSession
-from realtime_meeting.session import SessionManager
+from realtime_meeting.session import CapacityLimitError, LiveMeetingSession, SessionManager
 from realtime_meeting.storage import LocalMeetingStore
 
 
@@ -265,8 +265,10 @@ async def test_model_dependent_recovery_waits_for_runtime_readiness(settings) ->
     await manager.resume_pending(model_tasks_ready=False)
     assert recovered.postprocess_task is None
     await manager.resume_pending(model_tasks_ready=True)
-    assert recovered.postprocess_task is not None
-    await recovered.postprocess_task
+    # All model stages were already durable; recovery should normalize the
+    # stale queue marker without unloading/reloading the realtime model.
+    assert recovered.postprocess_task is None
+    assert recovered.postprocess.state == "ready_for_summary"
 
 
 @pytest.mark.asyncio
@@ -489,3 +491,167 @@ async def test_new_summary_cancels_old_todo_task(settings) -> None:
         session.todo_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await session.todo_task
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_inflight_audio_before_draining_worker(settings) -> None:
+    session = LiveMeetingSession(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    await session.start()
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingWriter:
+        def write(self, _pcm):
+            started.set()
+            assert release.wait(2)
+
+        def close(self):
+            return []
+
+    class OneEventSegmenter:
+        def feed(self, pcm):
+            return [SegmentEvent("final", pcm, 0.0, 0.02, 1)]
+
+        def flush(self):
+            return []
+
+    session.audio_writer = BlockingWriter()
+    session.segmenter = OneEventSegmenter()
+    feed_task = asyncio.create_task(session.feed_audio(np.full(320, 1000, dtype=np.int16).tobytes()))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    await session.request_stop()
+    assert session.stop_task is not None
+    await asyncio.sleep(0.02)
+    assert not session.stop_task.done()
+    release.set()
+    await feed_task
+    await session.stop_task
+
+    assert session.recording_state == "complete"
+    assert session.queue.empty()
+    assert session.worker_task is not None and session.worker_task.done()
+    assert len(session.load_transcript()) == 1
+    if session.postprocess_task:
+        await session.postprocess_task
+
+
+@pytest.mark.asyncio
+async def test_translation_merges_with_newer_speaker_revision(settings, monkeypatch) -> None:
+    from realtime_meeting.exporter import append_utterance
+
+    session = LiveMeetingSession(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    original = Utterance(
+        1,
+        0.0,
+        1.0,
+        1,
+        "en",
+        1.0,
+        "Ship the plan.",
+        segment_id="1:0",
+        revision=2,
+        recognition_stage="refined",
+    )
+    session.recent.append(original)
+    append_utterance(session.transcript_path, original)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_to_thread(function, *args, **kwargs):
+        started.set()
+        await release.wait()
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("realtime_meeting.session.asyncio.to_thread", delayed_to_thread)
+    task = asyncio.create_task(session._translate_item(original))
+    await started.wait()
+    diarized = Utterance.from_dict(original.to_dict())
+    diarized.speaker_id = 3
+    diarized.speaker_source = "diarization"
+    diarized.revision = 3
+    append_utterance(session.transcript_path, diarized)
+    session.recent[0] = diarized
+    release.set()
+    await task
+
+    saved = session.load_transcript()[0]
+    assert saved.speaker_id == 3
+    assert saved.speaker_source == "diarization"
+    assert saved.translation_status == "ready"
+    assert saved.translation_zh
+    assert saved.revision == 4
+
+
+def test_corrupt_recovered_meeting_does_not_block_valid_meetings(settings) -> None:
+    store = LocalMeetingStore(settings.results_dir)
+    bad_output = store.meeting_dir("bad-state")
+    bad_output.mkdir(parents=True)
+    (bad_output / "session_state.json").write_text(
+        json.dumps({"id": "bad-state", "recording_state": "complete", "summary_revision": {"bad": True}}),
+        encoding="utf-8",
+    )
+    good_output = store.meeting_dir("good-state")
+    good_output.mkdir(parents=True)
+    (good_output / "session_state.json").write_text(
+        json.dumps({"id": "good-state", "recording_state": "complete"}),
+        encoding="utf-8",
+    )
+
+    manager = SessionManager(settings, FakeRuntime(), store)
+
+    assert manager.get("good-state") is not None
+    # Recoverable scalar corruption falls back to a safe default.
+    assert manager.get("bad-state") is not None
+    assert manager.get("bad-state").summary_revision == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_blocks_new_recording_during_model_postprocess(settings) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    previous = LiveMeetingSession(
+        settings,
+        FakeRuntime(),
+        manager.store,
+        postprocess_scheduler=manager._schedule_pending_postprocess,
+    )
+    previous.recording_state = "complete"
+    previous.postprocess.state = "running"
+    previous.postprocess_task = asyncio.create_task(asyncio.sleep(60))
+    manager.sessions[previous.id] = previous
+    try:
+        with pytest.raises(CapacityLimitError, match="模型后处理"):
+            await manager.create("不应启动")
+    finally:
+        previous.postprocess_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await previous.postprocess_task
+
+
+@pytest.mark.asyncio
+async def test_manager_serializes_concurrent_create_capacity_check(settings, monkeypatch) -> None:
+    manager = SessionManager(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    original_start = LiveMeetingSession.start
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def delayed_start(session):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        await original_start(session)
+
+    monkeypatch.setattr(LiveMeetingSession, "start", delayed_start)
+    first = asyncio.create_task(manager.create("第一场"))
+    await first_started.wait()
+    second = asyncio.create_task(manager.create("第二场"))
+    release_first.set()
+    first_session = await first
+    with pytest.raises(CapacityLimitError):
+        await second
+    assert manager.active_count() == 1
+    await first_session.request_stop()
+    await first_session.stop_task

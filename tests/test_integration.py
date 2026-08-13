@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from realtime_meeting.audio import SAMPLE_RATE, SAMPLE_WIDTH, SegmentEvent
+from realtime_meeting.audio import SAMPLE_RATE
 from realtime_meeting.config import Settings
 from realtime_meeting.jimo import JimoClient, MeetingSummarizer, TodoGenerator
 from realtime_meeting.models import Utterance

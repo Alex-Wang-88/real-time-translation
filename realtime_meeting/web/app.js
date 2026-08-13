@@ -228,16 +228,16 @@ function clearTranscript() {
   dom.transcriptEmpty.hidden = false;
 }
 
-function upsertUtterance(utterance) {
+function upsertUtterance(utterance, transcript = state.transcript) {
   if (!utterance || !utterance.segment_id) return;
   if (utterance.deleted) {
-    const current = state.transcript.get(utterance.segment_id);
-    if (!current || Number(utterance.revision || 1) >= Number(current.revision || 1)) state.transcript.delete(utterance.segment_id);
+    const current = transcript.get(utterance.segment_id);
+    if (!current || Number(utterance.revision || 1) >= Number(current.revision || 1)) transcript.delete(utterance.segment_id);
     return;
   }
-  const previous = state.transcript.get(utterance.segment_id);
+  const previous = transcript.get(utterance.segment_id);
   if (!previous || Number(utterance.revision || 1) >= Number(previous.revision || 1)) {
-    state.transcript.set(utterance.segment_id, utterance);
+    transcript.set(utterance.segment_id, utterance);
   }
 }
 
@@ -359,6 +359,9 @@ function applySnapshot(snapshot, replace = false) {
   if (state.meeting?.id === snapshot.id && Number(snapshot.snapshot_revision || 0) < Number(state.meeting.snapshot_revision || 0)) return;
   const changed = state.meeting?.id !== snapshot.id;
   state.meeting = { ...(state.meeting || {}), ...snapshot };
+  const meetingIndex = state.meetings.findIndex((meeting) => meeting.id === snapshot.id);
+  if (meetingIndex >= 0) state.meetings[meetingIndex] = { ...state.meetings[meetingIndex], ...snapshot };
+  else state.meetings.unshift(snapshot);
   if (changed || replace) {
     clearTranscript();
   }
@@ -402,20 +405,36 @@ async function loadMeetings() {
 async function loadFullTranscript(id) {
   let offset = 0;
   const limit = 1000;
+  const transcript = new Map();
   while (state.meeting?.id === id) {
     const page = await requestJson(`/api/v2/meetings/${encodeURIComponent(id)}/transcript?offset=${offset}&limit=${limit}`);
-    for (const item of page.items || []) upsertUtterance(item);
+    for (const item of page.items || []) upsertUtterance(item, transcript);
     offset += (page.items || []).length;
     if (!page.has_more || !(page.items || []).length) break;
   }
-  if (state.meeting?.id === id) renderTranscript();
+  if (state.meeting?.id === id) {
+    state.transcript = transcript;
+    renderTranscript();
+  }
 }
 
 async function refreshCurrentMeeting() {
   if (!state.meeting || ["recording", "finalizing"].includes(state.meeting.recording_state)) return;
   try {
+    const previousRevision = Number(state.meeting.snapshot_revision || 0);
     const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}`);
-    if (state.meeting?.id === snapshot.id) applySnapshot(snapshot, false);
+    if (state.meeting?.id === snapshot.id) {
+      applySnapshot(snapshot, false);
+      if (
+        snapshot.recording_state === "complete"
+        && Number(snapshot.snapshot_revision || 0) > previousRevision
+      ) {
+        // Post-processing can replace or delete utterances. Replacing the map
+        // from the paginated projection removes stale rows that a recent-only
+        // snapshot cannot describe.
+        await loadFullTranscript(snapshot.id);
+      }
+    }
   } catch {}
 }
 

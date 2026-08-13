@@ -144,11 +144,27 @@ def create_app(
             )
 
     async def shutdown() -> None:
+        manager.begin_shutdown()
         task = app.state.model_task
         if task and not task.done():
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        # Finish active recordings before tearing down workers and models. The
+        # bounded wait preserves normal shutdown data while still allowing a
+        # stuck inference backend to terminate.
+        finalizers: list[asyncio.Task[Any]] = []
+        for meeting in manager.sessions.values():
+            if meeting.active:
+                await meeting.request_stop("server_shutdown")
+                if meeting.stop_task:
+                    finalizers.append(meeting.stop_task)
+        if finalizers:
+            _done, pending = await asyncio.wait(finalizers, timeout=30)
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         cancelled: list[asyncio.Task[Any]] = []
         for meeting in manager.sessions.values():
             for task in (

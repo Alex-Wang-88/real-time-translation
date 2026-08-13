@@ -33,7 +33,7 @@
 
 ```powershell
 uv venv --python 3.11 .venv
-uv pip install --python .venv\Scripts\python.exe -e ".[audio,dev]"
+uv sync --extra audio --extra dev
 Copy-Item .env.example .env
 & .venv\Scripts\python.exe -m uvicorn realtime_meeting.server:app --host 127.0.0.1 --port 8765
 ```

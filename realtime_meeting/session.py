@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import time
 import uuid
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import WebSocket
@@ -19,13 +19,23 @@ from .diarization import align_speakers, write_segments
 from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
 from .jimo import MeetingSummarizer, TodoGenerator
 from .models import TodoDocument, TodoItem, Utterance, utc_now_iso
-from .runtime import LiveModelRuntime, PartialResult
+from .runtime import PartialResult
 from .scheduler import PostprocessTracker
 from .storage import LocalMeetingStore, atomic_write_json, atomic_write_text
 
 
 class CapacityLimitError(RuntimeError):
     pass
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
 
 
 class LiveMeetingSession:
@@ -41,6 +51,7 @@ class LiveMeetingSession:
         recovered_state: dict[str, Any] | None = None,
         summarizer_factory: Callable[[Settings], MeetingSummarizer] | None = None,
         todo_factory: Callable[[Settings], TodoGenerator] | None = None,
+        postprocess_scheduler: Callable[[], None] | None = None,
     ) -> None:
         payload = recovered_state or {}
         self.settings = settings
@@ -57,8 +68,8 @@ class LiveMeetingSession:
         self.recording_state = str(payload.get("recording_state", "starting"))
         self.summary_state = str(payload.get("summary_state", "idle"))
         self.todo_state = str(payload.get("todo_state", "waiting_summary"))
-        self.summary_revision = int(payload.get("summary_revision", 0) or 0)
-        self.snapshot_revision = int(payload.get("snapshot_revision", 0) or 0)
+        self.summary_revision = _safe_int(payload.get("summary_revision"))
+        self.snapshot_revision = _safe_int(payload.get("snapshot_revision"))
         self.postprocess = PostprocessTracker(payload.get("postprocess") if isinstance(payload.get("postprocess"), dict) else None)
         self.summary = ""
         self.todo: TodoDocument | None = None
@@ -111,6 +122,7 @@ class LiveMeetingSession:
                 self.speaker_clusterer = runtime.new_speaker_clusterer()
         self.summarizer_factory = summarizer_factory or MeetingSummarizer
         self.todo_factory = todo_factory or TodoGenerator
+        self.postprocess_scheduler = postprocess_scheduler
         self._restore_files(payload)
         self._restore_refinement_events()
         if self.postprocess.state in {"running", "queued"} and self.recording_state == "complete":
@@ -299,14 +311,21 @@ class LiveMeetingSession:
 
     async def broadcast(self, event_type: str, **payload: Any) -> None:
         message = {"type": event_type, **payload}
-        stale: list[WebSocket] = []
-        for client in tuple(self.clients):
+        clients = tuple(self.clients)
+
+        async def send(client: WebSocket) -> WebSocket | None:
             try:
-                await client.send_json(message)
+                await asyncio.wait_for(client.send_json(message), timeout=2.0)
             except Exception:
-                stale.append(client)
+                return client
+            return None
+
+        if not clients:
+            return
+        stale = await asyncio.gather(*(send(client) for client in clients))
         for client in stale:
-            self.clients.discard(client)
+            if client is not None:
+                self.clients.discard(client)
 
     async def status(self, message: str, **payload: Any) -> None:
         await self.broadcast("meeting_state", meeting=self.snapshot(), message=message, **payload)
@@ -401,43 +420,64 @@ class LiveMeetingSession:
         encoding = str(payload.get("encoding", ""))
         if sample_rate != 16_000 or channels != 1 or encoding != "pcm_s16le":
             raise ValueError("音频必须是 16000 Hz、单声道 PCM16")
-        self.audio_packet_ms = int(payload.get("packet_ms", 40) or 40)
+        packet_ms = int(payload.get("packet_ms", 40) or 40)
+        if not 1 <= packet_ms <= 1000:
+            raise ValueError("音频包时长必须在 1 到 1000 毫秒之间")
+        self.audio_packet_ms = packet_ms
+        # Sequence numbers belong to one websocket transport. A browser reload
+        # starts a new sequence at zero, while reconnecting the same worklet can
+        # continue from an arbitrary value.
+        self._last_sequence = None
 
     async def feed_audio(self, pcm: bytes, sequence: int | None = None) -> None:
-        if self.recording_state != "recording":
-            raise ValueError("会议当前不在录音状态")
-        if not pcm or len(pcm) > self.settings.max_audio_packet_bytes:
-            raise ValueError("音频包为空或超过大小限制")
-        if len(pcm) % 2:
-            raise ValueError("PCM 音频包长度必须为偶数")
-        if sequence is not None and self._last_sequence is not None:
-            if sequence <= self._last_sequence:
-                self.audio_packets_out_of_order += 1
-            elif sequence > self._last_sequence + 1:
-                self.audio_packets_dropped += sequence - self._last_sequence - 1
-        if sequence is not None:
-            self._last_sequence = sequence
-        self.audio_packets_received += 1
-        self.audio_bytes_received += len(pcm)
-        self.audio_samples_received += len(pcm) // 2
-        try:
-            import numpy as np
+        warning: str | None = None
+        async with self._lock:
+            # Recheck the state after acquiring the ingest lock. This prevents
+            # an in-flight writer from enqueueing a segment after finalization
+            # has already drained and stopped the worker.
+            if self.recording_state != "recording":
+                raise ValueError("会议当前不在录音状态")
+            if not pcm or len(pcm) > self.settings.max_audio_packet_bytes:
+                raise ValueError("音频包为空或超过大小限制")
+            if len(pcm) % 2:
+                raise ValueError("PCM 音频包长度必须为偶数")
+            if sequence is not None:
+                sequence &= 0xFFFFFFFF
+                if self._last_sequence is None:
+                    self._last_sequence = sequence
+                else:
+                    delta = (sequence - self._last_sequence) & 0xFFFFFFFF
+                    if delta == 0 or delta > 0x7FFFFFFF:
+                        self.audio_packets_out_of_order += 1
+                    else:
+                        if delta > 1:
+                            self.audio_packets_dropped += delta - 1
+                        self._last_sequence = sequence
+            self.audio_packets_received += 1
+            self.audio_bytes_received += len(pcm)
+            self.audio_samples_received += len(pcm) // 2
+            try:
+                import numpy as np
 
-            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-            self.audio_level = min(1.0, float(np.sqrt(np.mean(samples * samples))) / 32768.0 * 3.0) if len(samples) else 0.0
-        except Exception:
-            self.audio_level = 0.0
-        if self.audio_writer:
-            await asyncio.to_thread(self.audio_writer.write, pcm)
-        if self.segmenter:
-            for event in self.segmenter.feed(pcm):
-                try:
-                    self.queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    self.error = "实时推理队列已满，已丢弃一个语音片段"
-                    await self.broadcast("warning", message=self.error)
-        if self.audio_packets_received % 10 == 0:
-            await self.broadcast("audio_input", packets_received=self.audio_packets_received, audio_level=self.audio_level)
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+                self.audio_level = min(1.0, float(np.sqrt(np.mean(samples * samples))) / 32768.0 * 3.0) if len(samples) else 0.0
+            except Exception:
+                self.audio_level = 0.0
+            if self.audio_writer:
+                await asyncio.to_thread(self.audio_writer.write, pcm)
+            if self.segmenter:
+                for event in self.segmenter.feed(pcm):
+                    try:
+                        self.queue.put_nowait(event)
+                    except asyncio.QueueFull:
+                        self.error = "实时推理队列已满，已丢弃一个语音片段"
+                        warning = self.error
+            packets_received = self.audio_packets_received
+            audio_level = self.audio_level
+        if warning:
+            await self.broadcast("warning", message=warning)
+        if packets_received % 10 == 0:
+            await self.broadcast("audio_input", packets_received=packets_received, audio_level=audio_level)
 
     async def _worker(self) -> None:
         while True:
@@ -496,11 +536,25 @@ class LiveMeetingSession:
     async def _translate_item(self, item: Utterance) -> None:
         try:
             latest = next((existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id), item)
-            result = await asyncio.to_thread(self.runtime.translate_text, latest.text, latest.language)
+            source_text = latest.text
+            source_language = latest.language
+            result = await asyncio.to_thread(self.runtime.translate_text, source_text, source_language)
+            latest = next(
+                (existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id),
+                None,
+            ) or next(
+                (existing for existing in load_utterances(self.transcript_path) if existing.segment_id == item.segment_id),
+                item,
+            )
+            # Refinement can replace the text while translation is in flight.
+            # Its replacement task will translate the new text; never attach a
+            # stale translation to a different source sentence.
+            if latest.text != source_text or latest.language != source_language:
+                return
             latest.translation_zh = result.text if result.status in {"ready", "not_needed"} else ""
             latest.translation_status = result.status
             latest.translation_model = getattr(result, "model", None)
-            latest.revision = max(latest.revision, 2)
+            latest.revision = max(2, latest.revision + 1)
             append_utterance(self.transcript_path, latest)
             for index, existing in enumerate(self.recent):
                 if existing.segment_id == latest.segment_id:
@@ -679,7 +733,7 @@ class LiveMeetingSession:
                 item.translation_model = getattr(result, "model", None)
                 if result.status in {"failed", "unsupported"}:
                     failures.append(f"{item.language}:{getattr(result, 'error', None) or result.status}")
-                item.revision = max(item.revision, 2)
+                item.revision = max(2, item.revision + 1)
                 append_utterance(self.transcript_path, item)
                 completed += 1
                 await self.broadcast(
@@ -770,6 +824,11 @@ class LiveMeetingSession:
                 await self._postprocess_update("asr_refine", "complete", current=events_total, total=events_total)
             elif refine_stage.get("state") != "complete":
                 raise RuntimeError("ASR 精修输入无法从持久化片段或保留录音恢复")
+            # Refinement schedules translations asynchronously. Join them before
+            # diarization so a late translation cannot overwrite newer speaker
+            # metadata with an older utterance revision.
+            if self.translation_tasks:
+                await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
             self._export_current_files()
             if self.postprocess.stages.get("diarization", {}).get("state") != "complete":
                 await self._run_diarization()
@@ -830,19 +889,27 @@ class LiveMeetingSession:
         metrics = getattr(self.runtime, "metrics", None)
         if isinstance(metrics, dict):
             metrics["retry_count"] = int(metrics.get("retry_count", 0)) + 1
-        self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"retry-postprocess-{self.id}")
+        self._schedule_postprocess()
         await self._postprocess_update()
         return True
 
-    async def _finalize_fast(self, reason: str) -> None:
-        if self.recording_state not in {"recording", "starting"}:
+    def _schedule_postprocess(self) -> None:
+        if self.postprocess_scheduler is not None:
+            self.postprocess_scheduler()
             return
-        self.recording_state = "finalizing"
-        self._write_state()
+        if self.postprocess_task is None or self.postprocess_task.done():
+            self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"postprocess-{self.id}")
+
+    async def _finalize_fast(self, reason: str) -> None:
+        async with self._lock:
+            if self.recording_state not in {"recording", "starting"}:
+                return
+            self.recording_state = "finalizing"
+            self._write_state()
+            flushed = list(self.segmenter.flush()) if self.segmenter else []
         await self.status("正在保存逐句稿", reason=reason)
-        if self.segmenter:
-            for event in self.segmenter.flush():
-                await self.queue.put(event)
+        for event in flushed:
+            await self.queue.put(event)
         await self.queue.join()
         if self.worker_task:
             await self.queue.put(None)
@@ -875,7 +942,7 @@ class LiveMeetingSession:
         await self.status("录音已保存，正在后台处理")
         await self.broadcast("recording_complete", meeting=self.snapshot())
         if items:
-            self.postprocess_task = asyncio.create_task(self.run_postprocess(), name=f"postprocess-{self.id}")
+            self._schedule_postprocess()
         else:
             self._delete_audio_if_unretained()
             self._export_current_files()
@@ -1067,69 +1134,97 @@ class SessionManager:
         self.runtime = runtime
         self.store = store or LocalMeetingStore(settings.results_dir)
         self.sessions: dict[str, LiveMeetingSession] = {}
+        self._create_lock = asyncio.Lock()
+        self._model_tasks_ready = bool(
+            getattr(runtime, "ready", False) and getattr(runtime, "capabilities_ready", True)
+        )
+        self._shutting_down = False
         self._load_recovered()
 
     def _load_recovered(self) -> None:
         for payload in self.store.list_states():
-            meeting_id = str(payload.get("id", ""))
-            if not meeting_id:
-                continue
-            state = str(payload.get("recording_state", "complete"))
-            transcript_path = self.store.meeting_dir(meeting_id) / "transcript.jsonl"
-            has_transcript = bool(load_utterances(transcript_path))
-            if state in {"starting", "recording", "finalizing"} and not has_transcript:
-                payload["recording_state"] = "error"
-                payload["error"] = "服务重启时会议尚未完成，已保留已保存内容"
-            if state in {"starting", "recording", "finalizing"} and has_transcript:
-                payload["recording_state"] = "complete"
+            try:
+                self._load_recovered_payload(payload)
+            except Exception as exc:  # noqa: BLE001 - isolate corrupt persisted meetings
+                # One damaged meeting must not prevent every other meeting (or
+                # the whole service) from recovering at startup.
+                LOGGER.warning("Skipping invalid recovered meeting state: %s", exc)
+
+    def _load_recovered_payload(self, payload: dict[str, Any]) -> None:
+        meeting_id = str(payload.get("id", ""))
+        if not meeting_id:
+            return
+        state = str(payload.get("recording_state", "complete"))
+        transcript_path = self.store.meeting_dir(meeting_id) / "transcript.jsonl"
+        has_transcript = bool(load_utterances(transcript_path))
+        if state in {"starting", "recording", "finalizing"} and not has_transcript:
+            payload["recording_state"] = "error"
+            payload["error"] = "服务重启时会议尚未完成，已保留已保存内容"
+        if state in {"starting", "recording", "finalizing"} and has_transcript:
+            payload["recording_state"] = "complete"
+            payload["summary_state"] = "idle"
+            payload["todo_state"] = "waiting_summary"
+            payload["ended_at"] = payload.get("ended_at") or utc_now_iso()
+            payload["error"] = None
+            payload["postprocess"] = PostprocessTracker({
+                "state": "queued",
+                "current_stage": "asr_refine",
+                "stages": {
+                    "asr_refine": {"state": "queued"},
+                    "diarization": {"state": "queued"},
+                    "translation": {"state": "queued"},
+                    "summary": {"state": "idle"},
+                    "todo": {"state": "idle"},
+                },
+            }).to_dict()
+        if payload.get("recording_state") == "complete":
+            summary_was_running = payload.get("summary_state") == "running"
+            if summary_was_running:
                 payload["summary_state"] = "idle"
                 payload["todo_state"] = "waiting_summary"
-                payload["ended_at"] = payload.get("ended_at") or utc_now_iso()
-                payload["error"] = None
-                payload["postprocess"] = PostprocessTracker({
-                    "state": "queued",
-                    "current_stage": "asr_refine",
-                    "stages": {
-                        "asr_refine": {"state": "queued"},
-                        "diarization": {"state": "queued"},
-                        "translation": {"state": "queued"},
-                        "summary": {"state": "idle"},
-                        "todo": {"state": "idle"},
-                    },
-                }).to_dict()
-            if payload.get("recording_state") == "complete":
-                summary_was_running = payload.get("summary_state") == "running"
-                if summary_was_running:
-                    payload["summary_state"] = "idle"
-                    payload["todo_state"] = "waiting_summary"
-                    postprocess = payload.get("postprocess")
-                    if not isinstance(postprocess, dict):
-                        postprocess = PostprocessTracker({
-                            "state": "ready_for_summary",
-                            "stages": {
-                                "asr_refine": {"state": "complete"},
-                                "diarization": {"state": "complete"},
-                                "translation": {"state": "complete"},
-                                "summary": {"state": "idle"},
-                                "todo": {"state": "idle"},
-                            },
-                        }).to_dict()
-                        payload["postprocess"] = postprocess
-                    postprocess["state"] = "ready_for_summary"
-                    postprocess["current_stage"] = None
-                    postprocess["error"] = None
-                    stages = postprocess.get("stages")
-                    if isinstance(stages, dict):
-                        for stage in ("summary", "todo"):
-                            if isinstance(stages.get(stage), dict):
-                                stages[stage]["state"] = "idle"
-                                stages[stage]["error"] = None
-                elif payload.get("todo_state") == "running":
-                    payload["todo_state"] = "queued" if payload.get("summary_state") == "complete" else "waiting_summary"
                 postprocess = payload.get("postprocess")
-                if isinstance(postprocess, dict) and postprocess.get("state") == "running" and not summary_was_running:
-                    postprocess["state"] = "queued"
-            self.sessions[meeting_id] = LiveMeetingSession(self.settings, self.runtime, self.store, meeting_id=meeting_id, recovered_state=payload)
+                if not isinstance(postprocess, dict):
+                    postprocess = PostprocessTracker({
+                        "state": "ready_for_summary",
+                        "stages": {
+                            "asr_refine": {"state": "complete"},
+                            "diarization": {"state": "complete"},
+                            "translation": {"state": "complete"},
+                            "summary": {"state": "idle"},
+                            "todo": {"state": "idle"},
+                        },
+                    }).to_dict()
+                    payload["postprocess"] = postprocess
+                postprocess["state"] = "ready_for_summary"
+                postprocess["current_stage"] = None
+                postprocess["error"] = None
+                stages = postprocess.get("stages")
+                if isinstance(stages, dict):
+                    for stage in ("summary", "todo"):
+                        if isinstance(stages.get(stage), dict):
+                            stages[stage]["state"] = "idle"
+                            stages[stage]["error"] = None
+            elif payload.get("todo_state") == "running":
+                payload["todo_state"] = "queued" if payload.get("summary_state") == "complete" else "waiting_summary"
+            postprocess = payload.get("postprocess")
+            if isinstance(postprocess, dict) and postprocess.get("state") in {"queued", "running"} and not summary_was_running:
+                stages = postprocess.get("stages")
+                model_stages = ("asr_refine", "diarization", "translation")
+                needs_model_work = not isinstance(stages, dict) or any(
+                    not isinstance(stages.get(stage), dict)
+                    or stages[stage].get("state") != "complete"
+                    for stage in model_stages
+                )
+                postprocess["state"] = "queued" if needs_model_work else "ready_for_summary"
+                postprocess["current_stage"] = "asr_refine" if needs_model_work else None
+        self.sessions[meeting_id] = LiveMeetingSession(
+            self.settings,
+            self.runtime,
+            self.store,
+            meeting_id=meeting_id,
+            recovered_state=payload,
+            postprocess_scheduler=self._schedule_pending_postprocess,
+        )
 
     def active_count(self) -> int:
         return sum(session.active for session in self.sessions.values())
@@ -1141,17 +1236,83 @@ class SessionManager:
         return [session.snapshot() for session in sorted(self.sessions.values(), key=lambda item: item.started_at, reverse=True)]
 
     async def create(self, title: str = "", hotwords: str | None = None) -> LiveMeetingSession:
-        if self.active_count() >= self.settings.max_active_meetings:
-            raise CapacityLimitError("当前已达到实时会议并发上限")
-        session = LiveMeetingSession(self.settings, self.runtime, self.store, title=title or "未命名会议", hotwords=hotwords)
-        self.sessions[session.id] = session
-        try:
-            await session.start()
-        except Exception:
-            self.sessions.pop(session.id, None)
-            self.store.delete(session.id)
-            raise
-        return session
+        async with self._create_lock:
+            if self.active_count() >= self.settings.max_active_meetings:
+                raise CapacityLimitError("当前已达到实时会议并发上限")
+            if self._model_postprocess_running() or (
+                self.active_count() == 0 and self._pending_model_postprocess()
+            ):
+                raise CapacityLimitError("上一场会议的模型后处理尚未完成")
+            session = LiveMeetingSession(
+                self.settings,
+                self.runtime,
+                self.store,
+                title=title or "未命名会议",
+                hotwords=hotwords,
+                postprocess_scheduler=self._schedule_pending_postprocess,
+            )
+            self.sessions[session.id] = session
+            try:
+                await session.start()
+            except Exception:
+                self.sessions.pop(session.id, None)
+                self.store.delete(session.id)
+                raise
+            return session
+
+    def _model_postprocess_running(self) -> bool:
+        return any(
+            session.postprocess_task is not None and not session.postprocess_task.done()
+            for session in self.sessions.values()
+        )
+
+    def _pending_model_postprocess(self) -> bool:
+        return any(
+            session.recording_state == "complete"
+            and session.postprocess.state in {"queued", "running"}
+            and any(
+                session.postprocess.stages.get(stage, {}).get("state") != "complete"
+                for stage in ("asr_refine", "diarization", "translation")
+            )
+            for session in self.sessions.values()
+        )
+
+    def _schedule_pending_postprocess(self) -> None:
+        if (
+            self._shutting_down
+            or not self._model_tasks_ready
+            or self.active_count() > 0
+            or self._model_postprocess_running()
+        ):
+            return
+        candidates = [
+            session for session in self.sessions.values()
+            if session.recording_state == "complete"
+            and session.postprocess.state in {"queued", "running"}
+            and any(
+                session.postprocess.stages.get(stage, {}).get("state") != "complete"
+                for stage in ("asr_refine", "diarization", "translation")
+            )
+            and (session.postprocess_task is None or session.postprocess_task.done())
+        ]
+        if not candidates:
+            return
+
+        def queue_order(item: LiveMeetingSession) -> tuple[float, str]:
+            try:
+                return (datetime.fromisoformat(item.started_at.replace("Z", "+00:00")).timestamp(), item.id)
+            except (TypeError, ValueError, OverflowError):
+                return (float("inf"), item.id)
+
+        session = min(candidates, key=queue_order)
+        session.postprocess_task = asyncio.create_task(
+            session.run_postprocess(),
+            name=f"postprocess-{session.id}",
+        )
+        session.postprocess_task.add_done_callback(lambda _task: self._schedule_pending_postprocess())
+
+    def begin_shutdown(self) -> None:
+        self._shutting_down = True
 
     async def delete(self, meeting_id: str) -> bool:
         session = self.sessions.get(meeting_id)
@@ -1164,6 +1325,7 @@ class SessionManager:
         return True
 
     async def resume_pending(self, *, model_tasks_ready: bool = True) -> None:
+        self._model_tasks_ready = model_tasks_ready
         for session in self.sessions.values():
             if (
                 session.todo_state == "queued"
@@ -1172,16 +1334,10 @@ class SessionManager:
                 and (session.todo_task is None or session.todo_task.done())
             ):
                 session.todo_task = asyncio.create_task(session.run_todo(), name=f"recover-todo-{session.id}")
-            elif (
-                model_tasks_ready
-                and session.postprocess.state in {"queued", "running"}
-                and session.recording_state == "complete"
-                and (session.postprocess_task is None or session.postprocess_task.done())
-            ):
-                session.postprocess_task = asyncio.create_task(session.run_postprocess(), name=f"recover-postprocess-{session.id}")
             elif session.summary_state == "queued" and session.recording_state == "complete":
                 # Older versions queued summaries automatically. Migration keeps
                 # the transcript ready but requires an explicit user action.
                 session.summary_state = "idle"
                 session.todo_state = "waiting_summary"
                 session._write_state()
+        self._schedule_pending_postprocess()

@@ -4,9 +4,8 @@ from pathlib import Path
 from typing import Iterable
 
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
@@ -516,7 +515,6 @@ def add_matrix_table(doc: Document, headers: list[str], rows: list[list[str]], w
         for index, (cell, value) in enumerate(zip(cells, row_data)):
             fill = WHITE if row_index % 2 == 0 else "FAFBFC"
             if status_column is not None and index == status_column:
-                lower = value.lower()
                 if "已确定" in value or "基线" in value or "本地" in value:
                     fill = LIGHT_TEAL
                 elif "压测" in value or "目标" in value or "建议" in value:

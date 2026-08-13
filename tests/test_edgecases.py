@@ -3,15 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
-
 from realtime_meeting.audio import SAMPLE_RATE, StreamSegmenter
 from realtime_meeting.config import Settings
-from realtime_meeting.exporter import append_utterance
 from realtime_meeting.jimo import (
     JimoClient,
     MeetingSummarizer,
-    TodoGenerator,
     _event_content,
     parse_sse_lines,
     parse_todo_document,

@@ -25,6 +25,8 @@ def test_web_client_supports_cookie_auth_and_full_transcript_pages() -> None:
     assert 'fetch("/api/v2/auth/session"' in source
     assert "async function loadFullTranscript(id)" in source
     assert "/transcript?offset=${offset}&limit=${limit}" in source
+    assert "state.transcript = transcript" in source
+    assert "snapshot.snapshot_revision || 0) > previousRevision" in source
 
 
 def test_summary_button_waits_for_automatic_refinement() -> None:

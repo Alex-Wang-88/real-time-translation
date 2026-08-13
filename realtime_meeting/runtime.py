@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .audio import SAMPLE_RATE, SegmentEvent
+from .audio import SegmentEvent
 from .diarization import DiarizationEngine
 from .language import LanguageGuess, MultilingualDetector, normalize_language_code
 from .models import Utterance
@@ -25,6 +25,17 @@ OPUS_MT_REPOSITORIES = {
     "en": "Helsinki-NLP/opus-mt-en-zh",
     # The official repository uses an uppercase ZH suffix.
     "de": "Helsinki-NLP/opus-mt-de-ZH",
+}
+
+# Model artifacts are executable inputs to native ML runtimes. Pin the exact
+# revisions used by the deployment bundle so upstream changes cannot silently
+# alter a future build.
+MODEL_REVISIONS = {
+    "funasr/fsmn-vad": "df20e6b30c653645fa4ff125cacfcabd1020a669",
+    "Helsinki-NLP/opus-mt-en-zh": "408d9bc410a388e1d9aef112a2daba955b945255",
+    "Helsinki-NLP/opus-mt-de-ZH": "cf77098253bb466b05d2beafd3a3c3dea92ed23b",
+    "mobiuslabsgmbh/faster-whisper-large-v3-turbo": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+    "Systran/faster-whisper-large-v3": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
 }
 
 OPUS_MT_TARGET_TAGS = {
@@ -59,7 +70,11 @@ def choose_device(requested: str) -> tuple[str, str]:
         if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "int8_float16"
     except Exception:
-        pass
+        # Missing/broken optional CUDA bindings are handled by the explicit CPU
+        # fallback below; a requested CUDA device still raises a hard error.
+        requested_cuda_unavailable = requested == "cuda"
+        if requested_cuda_unavailable:
+            raise RuntimeError("CUDA is not available") from None
     if requested == "cuda":
         raise RuntimeError("CUDA is not available")
     return "cpu", "int8"
@@ -94,6 +109,7 @@ def prepare_opus_mt_model(
     raw = Path(
         snapshot_download(
             repository,
+            revision=MODEL_REVISIONS[repository],
             allow_patterns=[
                 "config.json",
                 "generation_config.json",
@@ -478,7 +494,11 @@ class LiveModelRuntime:
             from faster_whisper.utils import download_model
 
             progress(f"Checking ASR model cache: {model_name}")
-            download_model(repo, local_files_only=not self.asr_autodownload)
+            download_model(
+                repo,
+                revision=MODEL_REVISIONS[repo],
+                local_files_only=not self.asr_autodownload,
+            )
             return True
         except Exception as exc:
             self._event("asr_preflight_error", model=model_name, error=str(exc))
@@ -501,6 +521,7 @@ class LiveModelRuntime:
 
             return str(snapshot_download(
                 repo_id="funasr/fsmn-vad",
+                revision=MODEL_REVISIONS["funasr/fsmn-vad"],
                 local_files_only=True,
             ))
         except Exception:

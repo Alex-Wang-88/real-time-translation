@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, AsyncIterator
 
@@ -19,7 +18,11 @@ class GpuResourceManager:
     async def acquire(self, stage: str) -> AsyncIterator[None]:
         if not self._thread_lock.acquire(blocking=False):
             self.metrics["waits"] = int(self.metrics.get("waits", 0)) + 1
-            await asyncio.to_thread(self._thread_lock.acquire)
+            # A cancelled ``to_thread(lock.acquire)`` keeps running and can
+            # acquire the lock after its coroutine has disappeared, leaking it
+            # forever. Polling non-blockingly keeps cancellation safe.
+            while not self._thread_lock.acquire(blocking=False):
+                await asyncio.sleep(0.01)
         started = time.perf_counter()
         try:
             yield
@@ -45,23 +48,40 @@ class PostprocessTracker:
     STAGES = ("asr_refine", "diarization", "translation", "summary", "todo")
 
     def __init__(self, payload: dict[str, Any] | None = None) -> None:
-        payload = payload or {}
+        payload = payload if isinstance(payload, dict) else {}
+
+        def safe_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def safe_float(value: Any) -> float:
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
         self.state = str(payload.get("state", "idle"))
         self.current_stage = payload.get("current_stage")
-        self.overall_percent = int(payload.get("overall_percent", 0) or 0)
+        self.overall_percent = safe_int(payload.get("overall_percent"))
         self.error = payload.get("error")
         self._stage_started: dict[str, float] = {}
+        durations = payload.get("stage_durations_ms")
+        durations = durations if isinstance(durations, dict) else {}
         self.stage_durations_ms: dict[str, float] = {
-            str(key): float(value) for key, value in (payload.get("stage_durations_ms") or {}).items()
+            str(key): safe_float(value) for key, value in durations.items()
         }
         self.stages: dict[str, dict[str, Any]] = {}
         source = payload.get("stages") if isinstance(payload.get("stages"), dict) else {}
         for stage in self.STAGES:
+            record = source.get(stage)
+            record = record if isinstance(record, dict) else {}
             self.stages[stage] = {
-                "state": "idle" if stage not in source else str(source[stage].get("state", "queued")),
-                "current": int(source.get(stage, {}).get("current", 0) or 0) if isinstance(source.get(stage), dict) else 0,
-                "total": int(source.get(stage, {}).get("total", 0) or 0) if isinstance(source.get(stage), dict) else 0,
-                "error": source.get(stage, {}).get("error") if isinstance(source.get(stage), dict) else None,
+                "state": str(record.get("state", "idle")),
+                "current": safe_int(record.get("current")),
+                "total": safe_int(record.get("total")),
+                "error": record.get("error"),
             }
 
     def to_dict(self) -> dict[str, Any]:
