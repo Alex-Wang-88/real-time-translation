@@ -92,42 +92,82 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function renderInlineMarkdown(value) {
+  return escapeHtml(value)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+}
+
 function markdownToHtml(markdown) {
   const lines = String(markdown || "").split(/\r?\n/);
   const result = [];
-  let inTable = false;
+  let tableRows = [];
+
+  const tableCells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim().replaceAll("\\|", "|"));
+  const flushTable = () => {
+    if (!tableRows.length) return;
+    const hasHeader = tableRows.length >= 2 && tableRows[1].every((cell) => /^:?-{3,}:?$/.test(cell));
+    const rows = hasHeader ? [tableRows[0], ...tableRows.slice(2)] : tableRows;
+    const head = hasHeader ? `<thead><tr>${rows[0].map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join("")}</tr></thead>` : "";
+    const bodyRows = hasHeader ? rows.slice(1) : rows;
+    const body = bodyRows.length
+      ? `<tbody>${bodyRows.map((row) => `<tr>${row.map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`).join("")}</tr>`).join("")}</tbody>`
+      : "";
+    result.push(`<table>${head}${body}</table>`);
+    tableRows = [];
+  };
+
+  const flushList = (items, tag) => {
+    if (!items.length) return;
+    result.push(`<${tag}>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</${tag}>`);
+    items.length = 0;
+  };
+
+  let unorderedItems = [];
+  let orderedItems = [];
   for (const rawLine of lines) {
     const line = rawLine.trimEnd();
     if (/^\|.*\|$/.test(line)) {
-      const cells = line.slice(1, -1).split("|").map((cell) => cell.trim());
-      if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) continue;
-      if (!inTable) {
-        result.push("<table><tbody>");
-        inTable = true;
-      }
-      result.push(`<tr>${cells.map((cell) => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`);
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+      tableRows.push(tableCells(line));
       continue;
     }
-    if (inTable) {
-      result.push("</tbody></table>");
-      inTable = false;
-    }
+    flushTable();
     if (!line.trim()) {
-      result.push("");
-    } else if (line.startsWith("### ")) {
-      result.push(`<h5>${escapeHtml(line.slice(4))}</h5>`);
-    } else if (line.startsWith("## ")) {
-      result.push(`<h4>${escapeHtml(line.slice(3))}</h4>`);
-    } else if (line.startsWith("# ")) {
-      result.push(`<h3>${escapeHtml(line.slice(2))}</h3>`);
-    } else if (/^[-*] /.test(line)) {
-      result.push(`<li>${escapeHtml(line.slice(2))}</li>`);
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+    } else if (/^#{1,6} /.test(line)) {
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+      const match = line.match(/^(#{1,6})\s+(.+)$/);
+      const level = Math.min(6, match[1].length + 2);
+      result.push(`<h${level}>${renderInlineMarkdown(match[2])}</h${level}>`);
+    } else if (/^[-*+] /.test(line)) {
+      flushList(orderedItems, "ol");
+      unorderedItems.push(line.slice(2));
+    } else if (/^\d+[.)] /.test(line)) {
+      flushList(unorderedItems, "ul");
+      orderedItems.push(line.replace(/^\d+[.)]\s+/, ""));
+    } else if (/^> ?/.test(line)) {
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+      result.push(`<blockquote>${renderInlineMarkdown(line.replace(/^> ?/, ""))}</blockquote>`);
+    } else if (/^(---+|\*\*\*+|___+)\s*$/.test(line)) {
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+      result.push("<hr>");
     } else {
-      result.push(`<p>${escapeHtml(line).replaceAll("**", "")}</p>`);
+      flushList(unorderedItems, "ul");
+      flushList(orderedItems, "ol");
+      result.push(`<p>${renderInlineMarkdown(line)}</p>`);
     }
   }
-  if (inTable) result.push("</tbody></table>");
-  return result.join("").replace(/(<li>.*?<\/li>)+/gs, (items) => `<ul>${items}</ul>`);
+  flushTable();
+  flushList(unorderedItems, "ul");
+  flushList(orderedItems, "ol");
+  return result.join("");
 }
 
 async function requestJson(path, options = {}) {
@@ -304,12 +344,14 @@ function renderTodo(todo, todoState) {
     for (const item of items) {
       const row = document.createElement("article");
       row.className = "todo-item";
-      row.innerHTML = `<div class="todo-check">✓</div><div class="todo-body"><strong></strong><div class="todo-meta"><span class="owner"></span><span class="due"></span><span class="priority"></span></div><small class="evidence"></small></div>`;
+      row.innerHTML = `<div class="todo-check" aria-hidden="true">✓</div><div class="todo-body"><strong></strong><div class="todo-meta"><span class="todo-chip owner"></span><span class="todo-chip due"></span><span class="todo-chip priority"></span></div><small class="todo-evidence"></small></div>`;
       row.querySelector("strong").textContent = item.task || "未命名任务";
       row.querySelector(".owner").textContent = item.owner || "负责人待确认";
       row.querySelector(".due").textContent = item.due_date || "截止时间待确认";
       row.querySelector(".priority").textContent = item.priority || "待确认";
-      row.querySelector(".evidence").textContent = item.evidence || "";
+      const evidence = row.querySelector(".todo-evidence");
+      evidence.textContent = item.evidence || "";
+      evidence.hidden = !item.evidence;
       list.append(row);
     }
     dom.todoText.append(list);
