@@ -464,6 +464,9 @@ async def test_refinement_queue_overflow_is_processed_after_stop(settings) -> No
     }
     assert refined_sources == {"1", "2"}
     assert session.postprocess.state == "ready_for_summary"
+    stage = session.postprocess.stages["asr_refine"]
+    assert stage["current"] == 2
+    assert stage["total"] == 2
 
 
 @pytest.mark.asyncio

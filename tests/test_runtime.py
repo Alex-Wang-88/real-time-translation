@@ -118,7 +118,7 @@ def test_whisper_filters_punctuation_only_segments(settings) -> None:
     assert runtime._discard_decode_result(result) == "empty"
 
 
-def test_low_quality_decode_retries_with_stronger_settings(settings) -> None:
+def test_low_quality_decode_retries_without_poisoned_context(settings) -> None:
     runtime = LiveModelRuntime(
         settings.asr_primary,
         settings.asr_fallback,
@@ -143,11 +143,36 @@ def test_low_quality_decode_retries_with_stronger_settings(settings) -> None:
             return iter([segment]), Info()
 
     runtime.primary = Model()
-    text, _guess, _confidence, _model, _source = runtime._recognize(b"\x00\x00" * 20)
+    text, _guess, _confidence, _model, _source = runtime._recognize(
+        b"\x00\x00" * 20,
+        recent_text="previous decision",
+    )
     assert text == "clear speech"
     assert len(calls) == 2
     assert calls[0]["beam_size"] == settings.asr_realtime_beam_size
     assert calls[1]["beam_size"] == 5
     assert calls[1]["best_of"] == 5
     assert calls[1]["temperature"] == settings.asr_retry_temperature
+    assert calls[0]["initial_prompt"] == "最近内容：previous decision"
+    assert calls[1]["initial_prompt"] is None
     assert runtime.metrics["asr_decode_retries"] == 1
+
+
+def test_high_confidence_repetitive_hallucination_is_discarded(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+    result = SimpleNamespace(
+        text="看着" * 100,
+        avg_logprob=-0.02,
+        no_speech_prob=0.01,
+        compression_ratio=31.57,
+    )
+
+    assert runtime._decode_needs_retry(result) is True
+    assert runtime._discard_decode_result(result) == "repetitive_hallucination"
+    assert runtime._asr_prompt(result.text) is None

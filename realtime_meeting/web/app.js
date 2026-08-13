@@ -13,6 +13,7 @@ const state = {
   reconnectAttempt: 0,
   intentionalClose: false,
   transcript: new Map(),
+  transcriptNodes: new Map(),
   transcriptNearBottom: true,
   timer: null,
   volumeThresholdPercent: 2.2,
@@ -317,50 +318,92 @@ function renderMeetings() {
 
 function clearTranscript() {
   state.transcript.clear();
+  state.transcriptNodes.clear();
   dom.transcriptList.replaceChildren();
   dom.transcriptList.append(dom.transcriptEmpty);
   dom.transcriptEmpty.hidden = false;
 }
 
 function upsertUtterance(utterance, transcript = state.transcript) {
-  if (!utterance || !utterance.segment_id) return;
+  if (!utterance || !utterance.segment_id) return false;
   if (utterance.deleted) {
     const current = transcript.get(utterance.segment_id);
-    if (!current || Number(utterance.revision || 1) >= Number(current.revision || 1)) transcript.delete(utterance.segment_id);
-    return;
+    if (!current || Number(utterance.revision || 1) >= Number(current.revision || 1)) {
+      transcript.delete(utterance.segment_id);
+      return Boolean(current);
+    }
+    return false;
   }
   const previous = transcript.get(utterance.segment_id);
   if (!previous || Number(utterance.revision || 1) >= Number(previous.revision || 1)) {
     transcript.set(utterance.segment_id, utterance);
+    return !previous || JSON.stringify(previous) !== JSON.stringify(utterance);
   }
+  return false;
+}
+
+function createTranscriptNode() {
+  const article = document.createElement("article");
+  article.className = "transcript-item";
+  article.innerHTML = `<div class="transcript-meta"><time></time><span class="speaker-tag"></span><span class="language-tag"></span></div><p class="original-line"></p><div class="translation-line" hidden><span>中译</span><b></b></div>`;
+  return article;
+}
+
+function updateTranscriptNode(article, item) {
+  const lang = item.language || "unknown";
+  article.dataset.segmentId = item.segment_id;
+  article.querySelector("time").textContent = `${formatTime(item.start).slice(3)} – ${formatTime(item.end).slice(3)}`;
+  article.querySelector(".speaker-tag").textContent = `演讲人 ${item.speaker_id ?? "?"}`;
+  article.querySelector(".language-tag").textContent = lang.toUpperCase();
+  article.querySelector(".original-line").textContent = item.text || "";
+  const translation = article.querySelector(".translation-line");
+  translation.hidden = !(item.translation_zh && lang !== "zh");
+  translation.querySelector("b").textContent = item.translation_zh || "";
+}
+
+function updateTranscriptViewport(autoScroll, itemCount = state.transcript.size) {
+  dom.transcriptEmpty.hidden = itemCount > 0;
+  dom.utteranceCount.textContent = `${itemCount} 条记录`;
+  const shouldScroll = autoScroll || state.transcriptNearBottom;
+  if (shouldScroll) requestAnimationFrame(() => { dom.transcriptList.scrollTop = dom.transcriptList.scrollHeight; });
+  dom.jumpLatest.hidden = shouldScroll || !itemCount;
+}
+
+function renderTranscriptItem(segmentId, autoScroll = false) {
+  const item = state.transcript.get(segmentId);
+  if (!item) return;
+  let article = state.transcriptNodes.get(segmentId);
+  if (!article) {
+    article = createTranscriptNode();
+    state.transcriptNodes.set(segmentId, article);
+    const following = [...state.transcript.values()]
+      .sort((a, b) => (a.start || 0) - (b.start || 0))
+      .find((candidate) => (candidate.start || 0) > (item.start || 0) && state.transcriptNodes.has(candidate.segment_id));
+    dom.transcriptList.insertBefore(article, following ? state.transcriptNodes.get(following.segment_id) : null);
+  }
+  updateTranscriptNode(article, item);
+  updateTranscriptViewport(autoScroll);
+}
+
+function removeTranscriptItem(segmentId) {
+  state.transcriptNodes.get(segmentId)?.remove();
+  state.transcriptNodes.delete(segmentId);
+  if (!state.transcript.size && !dom.transcriptEmpty.isConnected) dom.transcriptList.append(dom.transcriptEmpty);
+  updateTranscriptViewport(false);
 }
 
 function renderTranscript(autoScroll = false) {
   const items = [...state.transcript.values()].sort((a, b) => (a.start || 0) - (b.start || 0));
+  state.transcriptNodes.clear();
   dom.transcriptList.replaceChildren();
-  if (!items.length) {
-    dom.transcriptList.append(dom.transcriptEmpty);
-    dom.transcriptEmpty.hidden = false;
-  } else {
-    dom.transcriptEmpty.hidden = true;
-    for (const item of items) {
-      const article = document.createElement("article");
-      article.className = "transcript-item";
-      const lang = item.language || "unknown";
-      const translation = item.translation_zh && lang !== "zh" ? `<div class="translation-line"><span>中译</span><b></b></div>` : "";
-      article.innerHTML = `<div class="transcript-meta"><time></time><span class="speaker-tag"></span><span class="language-tag"></span></div><p class="original-line"></p>${translation}`;
-      article.querySelector("time").textContent = `${formatTime(item.start).slice(3)} – ${formatTime(item.end).slice(3)}`;
-      article.querySelector(".speaker-tag").textContent = `演讲人 ${item.speaker_id ?? "?"}`;
-      article.querySelector(".language-tag").textContent = lang.toUpperCase();
-      article.querySelector(".original-line").textContent = item.text || "";
-      if (translation) article.querySelector(".translation-line b").textContent = item.translation_zh;
-      dom.transcriptList.append(article);
-    }
+  if (!items.length) dom.transcriptList.append(dom.transcriptEmpty);
+  for (const item of items) {
+    const article = createTranscriptNode();
+    updateTranscriptNode(article, item);
+    state.transcriptNodes.set(item.segment_id, article);
+    dom.transcriptList.append(article);
   }
-  dom.utteranceCount.textContent = `${state.meeting?.utterance_count || items.length} 条记录`;
-  const shouldScroll = autoScroll || state.transcriptNearBottom;
-  if (shouldScroll) requestAnimationFrame(() => { dom.transcriptList.scrollTop = dom.transcriptList.scrollHeight; });
-  dom.jumpLatest.hidden = shouldScroll || !items.length;
+  updateTranscriptViewport(autoScroll, items.length);
 }
 
 function renderSummary(summary, summaryState) {
@@ -463,10 +506,11 @@ function applySnapshot(snapshot, replace = false) {
   const meetingIndex = state.meetings.findIndex((meeting) => meeting.id === snapshot.id);
   if (meetingIndex >= 0) state.meetings[meetingIndex] = { ...state.meetings[meetingIndex], ...snapshot };
   else state.meetings.unshift(snapshot);
-  if (changed || replace) {
+  let transcriptChanged = changed || replace;
+  if (transcriptChanged) {
     clearTranscript();
   }
-  for (const item of snapshot.recent_utterances || []) upsertUtterance(item);
+  for (const item of snapshot.recent_utterances || []) transcriptChanged = upsertUtterance(item) || transcriptChanged;
   dom.pageTitle.textContent = state.meeting.title || "未命名会议";
   dom.pageSubtitle.textContent = state.meeting.recording_state === "recording"
     ? "实时保留原文；英文和德文句子会异步补充中文翻译。"
@@ -488,7 +532,7 @@ function applySnapshot(snapshot, replace = false) {
   );
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
   dom.languageIndicator.textContent = state.meeting.current_language ? `最近语言：${String(state.meeting.current_language).toUpperCase()}` : "等待语音";
-  renderTranscript();
+  if (transcriptChanged) renderTranscript();
   renderSummary(state.meeting.summary, state.meeting.summary_state);
   renderTodo(state.meeting.todo, state.meeting.todo_state);
   renderPostprocess(state.meeting.postprocess);
@@ -772,19 +816,21 @@ async function handleEvent(payload) {
     if (payload.meeting) applySnapshot(payload.meeting, false);
     if (payload.message) dom.recordingHint.textContent = payload.message;
   } else if (type === "utterance") {
-    upsertUtterance(payload.utterance);
+    const changed = upsertUtterance(payload.utterance);
     if (state.meeting) state.meeting.utterance_count = Math.max(state.meeting.utterance_count || 0, state.transcript.size);
-    renderTranscript(true);
+    if (changed) renderTranscriptItem(payload.utterance.segment_id, true);
   } else if (type === "utterance_deleted") {
-    if (payload.segment_id) state.transcript.delete(payload.segment_id);
-    renderTranscript();
+    if (payload.segment_id) {
+      state.transcript.delete(payload.segment_id);
+      removeTranscriptItem(payload.segment_id);
+    }
   } else if (type === "translation_update") {
     const item = state.transcript.get(payload.segment_id);
     if (item && Number(payload.revision || 1) >= Number(item.revision || 1)) {
       item.translation_zh = payload.translation_zh || "";
       item.translation_status = payload.translation_status || "ready";
       item.revision = payload.revision || item.revision;
-      renderTranscript();
+      renderTranscriptItem(payload.segment_id);
     }
   } else if (type === "draft") {
     dom.recordingHint.textContent = payload.text ? `正在识别：${payload.text}` : "正在接收麦克风音频。";

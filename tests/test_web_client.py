@@ -64,3 +64,14 @@ def test_failed_summary_stream_restores_committed_summary() -> None:
     source = APP_JS.read_text(encoding="utf-8")
     assert "summary: payload.summary ?? state.meeting.summary" in source
     assert "summary_revision: payload.summary_revision ?? state.meeting.summary_revision" in source
+
+
+def test_live_transcript_updates_are_incremental() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    event_section = source.split("async function handleEvent(payload)", 1)[1]
+
+    assert "transcriptNodes: new Map()" in source
+    assert "function renderTranscriptItem(segmentId" in source
+    assert "if (changed) renderTranscriptItem(payload.utterance.segment_id, true);" in event_section
+    assert "removeTranscriptItem(payload.segment_id);" in event_section
+    assert "renderTranscriptItem(payload.segment_id);" in event_section

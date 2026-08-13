@@ -132,6 +132,8 @@ class LiveMeetingSession:
         self.model_metadata = getattr(runtime, "capability_snapshot", lambda: {})()
         self._postprocess_error: str | None = None
         self._refinement_errors: list[str] = []
+        self._refinement_progress_current = 0
+        self._refinement_progress_total = 0
         self.speaker_clusterer = None
         if getattr(runtime, "ready", False) and hasattr(runtime, "new_speaker_clusterer"):
             with suppress(Exception):
@@ -607,6 +609,7 @@ class LiveMeetingSession:
     async def _refinement_worker(self) -> None:
         while True:
             event = await self.refinement_queue.get()
+            processed = event is not None
             try:
                 if event is None:
                     return
@@ -626,6 +629,15 @@ class LiveMeetingSession:
                 await self.broadcast("warning", message=f"停止后精修失败，已保留实时结果：{exc}")
             finally:
                 self.refinement_queue.task_done()
+                if processed:
+                    self._refinement_progress_current += 1
+                    with suppress(Exception):
+                        await self._postprocess_update(
+                            "asr_refine",
+                            "running",
+                            current=self._refinement_progress_current,
+                            total=self._refinement_progress_total,
+                        )
 
     async def _commit_refined_items(self, items: list[Utterance]) -> None:
         if not items:
@@ -846,6 +858,8 @@ class LiveMeetingSession:
                     self.refinement_queue.put_nowait(event)
             events_total = self.refinement_queue.qsize()
             if self.settings.enable_refinement and refine_stage.get("state") != "complete" and events_total:
+                self._refinement_progress_current = 0
+                self._refinement_progress_total = events_total
                 await self._postprocess_update("asr_refine", "running", current=0, total=events_total)
                 self.refinement_worker_task = asyncio.create_task(self._refinement_worker(), name=f"refinement-{self.id}")
                 await self.refinement_queue.join()

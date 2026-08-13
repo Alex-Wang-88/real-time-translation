@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import threading
@@ -717,9 +718,26 @@ class LiveModelRuntime:
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
     @staticmethod
-    def _asr_prompt(recent_text: str = "") -> str | None:
+    def _has_repetitive_loop(text: str) -> bool:
+        """Detect a short phrase repeated enough to dominate an ASR result."""
+        normalized = re.sub(r"[^\w\u3400-\u9fff]+", "", str(text or "").casefold(), flags=re.UNICODE)
+        if len(normalized) < 12:
+            return False
+        for unit_size in range(1, min(12, len(normalized) // 6) + 1):
+            pattern = re.compile(rf"(.{{{unit_size}}})\1{{5,}}")
+            if any(
+                match.end() - match.start() >= max(12, int(len(normalized) * 0.55))
+                for match in pattern.finditer(normalized)
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _asr_prompt(cls, recent_text: str = "") -> str | None:
         """Build a bounded Whisper prompt from recent context."""
         context = " ".join(str(recent_text or "").split())[-500:]
+        if cls._has_repetitive_loop(context):
+            return None
         return f"最近内容：{context}" if context else None
 
     def _whisper(
@@ -816,7 +834,7 @@ class LiveModelRuntime:
             and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
         ):
             return False
-        return (
+        return self._has_repetitive_loop(result.text) or (
             result.avg_logprob is not None
             and result.avg_logprob < self.asr_log_prob_threshold
         ) or (
@@ -835,7 +853,11 @@ class LiveModelRuntime:
             and (result.avg_logprob is None or result.avg_logprob < self.asr_log_prob_threshold)
         ):
             return "no_speech"
-        if (
+        severe_compression = (
+            result.compression_ratio is not None
+            and result.compression_ratio > max(5.0, self.asr_compression_ratio_threshold * 2)
+        )
+        if self._has_repetitive_loop(result.text) or severe_compression or (
             result.compression_ratio is not None
             and result.compression_ratio > self.asr_compression_ratio_threshold
             and result.avg_logprob is not None
@@ -882,12 +904,17 @@ class LiveModelRuntime:
             prompt = self._asr_prompt(recent_text)
             initial_beam_size = self.asr_refine_beam_size if refine else self.asr_realtime_beam_size
 
-            def decode(temperature: float, beam_size: int, best_of: int) -> _WhisperDecode:
+            def decode(
+                temperature: float,
+                beam_size: int,
+                best_of: int,
+                decode_prompt: str | None,
+            ) -> _WhisperDecode:
                 result = self._whisper_decode(
                     pcm,
                     model,
                     refine=refine,
-                    prompt=prompt,
+                    prompt=decode_prompt,
                     beam_size=beam_size,
                     best_of=best_of,
                     temperature=temperature,
@@ -896,7 +923,7 @@ class LiveModelRuntime:
                 return result
 
             def decode_with_retry() -> _WhisperDecode:
-                result = decode(0.0, initial_beam_size, self.asr_best_of)
+                result = decode(0.0, initial_beam_size, self.asr_best_of, prompt)
                 if self._decode_needs_retry(result):
                     self.metrics["asr_decode_retries"] = int(self.metrics.get("asr_decode_retries", 0)) + 1
                     self._event(
@@ -906,11 +933,13 @@ class LiveModelRuntime:
                         avg_logprob=result.avg_logprob,
                         no_speech_prob=result.no_speech_prob,
                         compression_ratio=result.compression_ratio,
+                        prompt_cleared=True,
                     )
                     retry = decode(
                         self.asr_retry_temperature,
                         max(initial_beam_size, 5),
                         max(self.asr_best_of, 5),
+                        None,
                     )
                     result = self._select_decode_result(result, retry)
                     result.retry_used = True
