@@ -1,5 +1,25 @@
 const $ = (selector) => document.querySelector(selector);
 
+const RECOMMENDED_ASR_SETTINGS = Object.freeze({
+  realtime_beam_size: 5,
+  refine_beam_size: 6,
+  best_of: 5,
+  silence_ms: 700,
+  vad_minimum_speech_ms: 450,
+});
+
+const ASR_SETTING_FIELDS = [
+  { key: "realtime_beam_size", input: "asrRealtimeBeamSize", output: "asrRealtimeBeamValue", format: (value) => String(value) },
+  { key: "refine_beam_size", input: "asrRefineBeamSize", output: "asrRefineBeamValue", format: (value) => String(value) },
+  { key: "best_of", input: "asrBestOf", output: "asrBestOfValue", format: (value) => String(value) },
+  { key: "silence_ms", input: "asrSilenceMs", output: "asrSilenceValue", format: (value) => `${value} ms` },
+  { key: "vad_minimum_speech_ms", input: "asrMinimumSpeechMs", output: "asrMinimumSpeechValue", format: (value) => `${value} ms` },
+];
+
+// The live microphone level is normalized to 0-100%.  Keep this separate
+// from the 0-30% background-noise filter threshold range.
+const MICROPHONE_METER_MAX_PERCENT = 100;
+
 const state = {
   meetings: [],
   meeting: null,
@@ -17,6 +37,7 @@ const state = {
   transcriptNearBottom: true,
   timer: null,
   volumeThresholdPercent: 2.2,
+  asrSettings: { ...RECOMMENDED_ASR_SETTINGS },
   microphoneLevelPercent: 0,
   pendingMicrophoneLevel: 0,
   microphoneLevelFrame: null,
@@ -80,6 +101,15 @@ const dom = {
   microphoneLevelMarker: $("#microphoneLevelMarker"),
   microphoneLevelValue: $("#microphoneLevelValue"),
   microphoneLevelStatus: $("#microphoneLevelStatus"),
+  inputDeviceSummary: $("#inputDeviceSummary"),
+  volumeThresholdSummary: $("#volumeThresholdSummary"),
+  settingsAudioSection: $("#settingsAudioSection"),
+  openAsrSettings: $("#openAsrSettings"),
+  asrSettingsDialog: $("#asrSettingsDialog"),
+  asrSettingsForm: $("#asrSettingsForm"),
+  asrSettingsNotice: $("#asrSettingsNotice"),
+  resetAsrSettings: $("#resetAsrSettings"),
+  saveAsrSettings: $("#saveAsrSettings"),
 };
 
 const recordingLabels = {
@@ -233,6 +263,7 @@ function setVolumeThreshold(value, propagate = true) {
   state.volumeThresholdPercent = Math.round(threshold * 10) / 10;
   if (dom.volumeThreshold) dom.volumeThreshold.value = String(state.volumeThresholdPercent);
   if (dom.volumeThresholdValue) dom.volumeThresholdValue.textContent = `${state.volumeThresholdPercent.toFixed(1)}%`;
+  if (dom.volumeThresholdSummary) dom.volumeThresholdSummary.textContent = `${state.volumeThresholdPercent.toFixed(1)}%`;
   renderMicrophoneLevel(state.microphoneLevelPercent, Boolean(state.stream));
   if (!propagate) return;
   state.audioNode?.port.postMessage({ type: "volume_threshold", percent: state.volumeThresholdPercent });
@@ -242,9 +273,75 @@ function setVolumeThreshold(value, propagate = true) {
   }
 }
 
+function renderAsrSettings(settings = state.asrSettings) {
+  const values = { ...RECOMMENDED_ASR_SETTINGS, ...(settings || {}) };
+  for (const field of ASR_SETTING_FIELDS) {
+    const input = $(`#${field.input}`);
+    const output = $(`#${field.output}`);
+    if (!input || !output) continue;
+    const value = Number(values[field.key]);
+    input.value = String(Number.isFinite(value) ? value : RECOMMENDED_ASR_SETTINGS[field.key]);
+    output.textContent = field.format(input.value);
+  }
+  const editable = state.meeting?.recording_state === "created";
+  dom.openAsrSettings.disabled = !state.meeting;
+  dom.openAsrSettings.title = editable ? "调整识别设置" : "识别设置只能在录音开始前调整";
+  for (const field of ASR_SETTING_FIELDS) {
+    const input = $(`#${field.input}`);
+    if (input) input.disabled = !editable;
+  }
+  dom.resetAsrSettings.disabled = !editable;
+  dom.saveAsrSettings.disabled = !editable;
+}
+
+function moveAudioSettingsIntoDialog() {
+  if (!dom.settingsAudioSection) return;
+  const nodes = [
+    document.querySelector('label[for="inputDevice"]'),
+    document.querySelector(".device-row"),
+    document.querySelector('label[for="volumeThreshold"]'),
+    dom.thresholdMeter,
+    document.querySelector(".threshold-feedback"),
+    document.querySelector("#volumeThresholdHint"),
+  ];
+  for (const node of nodes) {
+    if (node) dom.settingsAudioSection.append(node);
+  }
+}
+
+function readAsrSettings() {
+  return Object.fromEntries(ASR_SETTING_FIELDS.map((field) => [field.key, Number($(`#${field.input}`).value)]));
+}
+
+function openAsrSettings() {
+  if (!state.meeting) return;
+  renderAsrSettings(state.asrSettings);
+  dom.asrSettingsNotice.textContent = state.meeting.recording_state === "created"
+    ? "推荐值适合中文会议和实时识别；音频输入调整会立即应用，识别参数需要点击“保存设置”。"
+    : "本次会议已经开始或结束，识别设置已锁定。请新建会议后再调整。";
+  dom.asrSettingsDialog.showModal();
+}
+
+async function saveAsrSettings() {
+  if (!state.meeting || state.meeting.recording_state !== "created") return;
+  dom.saveAsrSettings.disabled = true;
+  try {
+    const snapshot = await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/settings`, {
+      method: "PATCH",
+      body: JSON.stringify({ asr_settings: readAsrSettings() }),
+    });
+    applySnapshot(snapshot, false);
+    dom.asrSettingsDialog.close();
+    setNotice("识别设置已保存，开始录音后生效。", "info");
+  } catch (error) {
+    dom.asrSettingsNotice.textContent = error.message || "识别设置保存失败，请重试。";
+    dom.saveAsrSettings.disabled = false;
+  }
+}
+
 function renderMicrophoneLevel(levelPercent, live = true) {
   const level = Math.max(0, Math.min(100, Number(levelPercent) || 0));
-  const meterMax = Number(dom.volumeThreshold?.max) || 30;
+  const meterMax = MICROPHONE_METER_MAX_PERCENT;
   const position = Math.min(100, level / meterMax * 100);
   state.microphoneLevelPercent = level;
   dom.microphoneLevelFill.style.width = `${position}%`;
@@ -499,10 +596,14 @@ function applySnapshot(snapshot, replace = false) {
   const changed = state.meeting?.id !== snapshot.id;
   state.meeting = { ...(state.meeting || {}), ...snapshot };
   if (changed && snapshot.volume_threshold_percent != null) setVolumeThreshold(snapshot.volume_threshold_percent, false);
+  if (snapshot.asr_settings) {
+    state.asrSettings = { ...RECOMMENDED_ASR_SETTINGS, ...snapshot.asr_settings };
+  }
   const isCreated = state.meeting.recording_state === "created";
   const canAdjustAudio = ["created", "starting", "recording"].includes(state.meeting.recording_state);
   const canStop = ["starting", "recording"].includes(state.meeting.recording_state);
   dom.volumeThreshold.disabled = !canAdjustAudio;
+  if (!dom.asrSettingsDialog.open) renderAsrSettings(state.asrSettings);
   const meetingIndex = state.meetings.findIndex((meeting) => meeting.id === snapshot.id);
   if (meetingIndex >= 0) state.meetings[meetingIndex] = { ...state.meetings[meetingIndex], ...snapshot };
   else state.meetings.unshift(snapshot);
@@ -652,6 +753,7 @@ async function refreshDevices() {
   dom.inputDevice.replaceChildren(new Option("系统默认设备", ""));
   for (const device of microphones) dom.inputDevice.append(new Option(device.label || `麦克风 ${dom.inputDevice.length}`, device.deviceId));
   if ([...dom.inputDevice.options].some((option) => option.value === selected)) dom.inputDevice.value = selected;
+  if (dom.inputDeviceSummary) dom.inputDeviceSummary.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
 }
 
 async function prepareMicrophone() {
@@ -1014,9 +1116,22 @@ function bindEvents() {
   dom.retryPostprocess.addEventListener("click", retryPostprocess);
   dom.downloadSummary.addEventListener("click", () => downloadFile("meeting_minutes.md"));
   dom.downloadTodo.addEventListener("click", () => downloadFile("todo_list.json"));
+  dom.openAsrSettings.addEventListener("click", openAsrSettings);
+  dom.asrSettingsForm.addEventListener("submit", (event) => {
+    if (event.submitter?.value !== "default") return;
+    event.preventDefault();
+    saveAsrSettings();
+  });
+  dom.resetAsrSettings.addEventListener("click", () => renderAsrSettings(RECOMMENDED_ASR_SETTINGS));
+  for (const field of ASR_SETTING_FIELDS) {
+    $(`#${field.input}`).addEventListener("input", (event) => {
+      $(`#${field.output}`).textContent = field.format(event.target.value);
+    });
+  }
   $("#refreshDevices").addEventListener("click", () => refreshDevices().catch(() => {}));
   dom.volumeThreshold.addEventListener("input", () => setVolumeThreshold(dom.volumeThreshold.value));
   dom.inputDevice.addEventListener("change", async () => {
+    if (dom.inputDeviceSummary) dom.inputDeviceSummary.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
     if (state.meeting?.recording_state === "recording") {
       setNotice("设备选择会在下一场会议生效。", "info");
     } else if (state.meeting?.recording_state === "created") {
@@ -1037,6 +1152,7 @@ function bindEvents() {
 }
 
 async function init() {
+  moveAudioSettingsIntoDialog();
   bindEvents();
   state.timer = window.setInterval(updateTimer, 1000);
   window.setInterval(refreshCurrentMeeting, 3000);

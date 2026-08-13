@@ -178,6 +178,36 @@ def test_low_quality_decode_retries_without_poisoned_context(settings) -> None:
     assert runtime.metrics["asr_decode_retries"] == 1
 
 
+def test_decode_settings_override_live_beam_and_candidate_counts(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+    runtime.primary = object()
+    calls = []
+
+    class Info:
+        language = "zh"
+        language_probability = 0.9
+
+    class Model:
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            segment = SimpleNamespace(text="清晰语音", avg_logprob=-0.2, no_speech_prob=0.05, compression_ratio=1.1, temperature=0.0)
+            return iter([segment]), Info()
+
+    runtime.primary = Model()
+    runtime._recognize(
+        b"\x00\x00" * 20,
+        decode_settings={"realtime_beam_size": 2, "best_of": 3},
+    )
+    assert calls[0]["beam_size"] == 2
+    assert calls[0]["best_of"] == 3
+
+
 def test_high_confidence_repetitive_hallucination_is_discarded(settings) -> None:
     runtime = LiveModelRuntime(
         settings.asr_primary,

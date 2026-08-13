@@ -918,6 +918,7 @@ class LiveModelRuntime:
         refine: bool = False,
         recent_text: str = "",
         previous_language: str | None = None,
+        decode_settings: dict[str, Any] | None = None,
     ) -> tuple[str, LanguageGuess, float, str, str]:
         self.last_asr_error = None
         self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
@@ -928,7 +929,19 @@ class LiveModelRuntime:
         try:
             prompt = self._asr_prompt(recent_text)
             language_hint = self._normalize_asr_language(previous_language)
-            initial_beam_size = self.asr_refine_beam_size if refine else self.asr_realtime_beam_size
+            overrides = decode_settings or {}
+
+            def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+                try:
+                    value = int(float(overrides.get(name, default)))
+                except (TypeError, ValueError):
+                    value = default
+                return max(minimum, min(maximum, value))
+
+            realtime_beam_size = bounded_int("realtime_beam_size", self.asr_realtime_beam_size, 1, 10)
+            refine_beam_size = bounded_int("refine_beam_size", self.asr_refine_beam_size, 1, 12)
+            best_of = bounded_int("best_of", self.asr_best_of, 1, 12)
+            initial_beam_size = refine_beam_size if refine else realtime_beam_size
 
             def decode(
                 temperature: float,
@@ -951,7 +964,7 @@ class LiveModelRuntime:
                 return result
 
             def decode_with_retry() -> _WhisperDecode:
-                result = decode(0.0, initial_beam_size, self.asr_best_of, prompt, language_hint)
+                result = decode(0.0, initial_beam_size, best_of, prompt, language_hint)
                 if self._decode_needs_retry(result):
                     self.metrics["asr_decode_retries"] = int(self.metrics.get("asr_decode_retries", 0)) + 1
                     self._event(
@@ -966,7 +979,7 @@ class LiveModelRuntime:
                     retry = decode(
                         self.asr_retry_temperature,
                         max(initial_beam_size, 5),
-                        max(self.asr_best_of, 5),
+                        max(best_of, 5),
                         None,
                         # If the prior caused a bad decode, let Whisper
                         # reconsider the language on the retry as well.
@@ -1033,16 +1046,23 @@ class LiveModelRuntime:
         event: SegmentEvent,
         recent_text: str = "",
         previous_language: str | None = None,
+        decode_settings: dict[str, Any] | None = None,
     ) -> PartialResult:
         text, guess, confidence, model, language_source = self._recognize(
             event.pcm,
             recent_text=recent_text,
             previous_language=previous_language,
+            decode_settings=decode_settings,
         )
         return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
 
-    def transcribe_draft(self, event: SegmentEvent, recent_text: str = "") -> PartialResult:
-        return self.transcribe_partial(event, recent_text)
+    def transcribe_draft(
+        self,
+        event: SegmentEvent,
+        recent_text: str = "",
+        decode_settings: dict[str, Any] | None = None,
+    ) -> PartialResult:
+        return self.transcribe_partial(event, recent_text, decode_settings=decode_settings)
 
     def transcribe_final(
         self,
@@ -1053,12 +1073,14 @@ class LiveModelRuntime:
         recent_text: str = "",
         speaker_clusterer: OnlineSpeakerClusterer | None = None,
         refined: bool = True,
+        decode_settings: dict[str, Any] | None = None,
     ) -> list[Utterance]:
         text, whisper_guess, confidence, model, language_source = self._recognize(
             event.pcm,
             refine=refined,
             recent_text=recent_text,
             previous_language=previous_language,
+            decode_settings=decode_settings,
         )
         if not text:
             if refined and self.last_asr_error:

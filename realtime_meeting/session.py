@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import shutil
@@ -24,7 +25,7 @@ from .audio import (
     rms_to_volume_threshold_percent,
     volume_threshold_percent_to_rms,
 )
-from .config import Settings
+from .config import Settings, normalize_asr_settings
 from .diarization import align_speakers, write_segments
 from .exporter import append_utterance, delete_utterance, export_live_result, load_utterances, render_todo_markdown
 from .jimo import MeetingSummarizer, TodoGenerator
@@ -66,6 +67,7 @@ class LiveMeetingSession:
         self.settings = settings
         self.runtime = runtime
         self.store = store
+        self.asr_settings = normalize_asr_settings(payload.get("asr_settings"), settings)
         self.id = meeting_id or str(uuid.uuid4())
         self.title = title or str(payload.get("title", "未命名会议"))
         self.output_dir = store.meeting_dir(self.id)
@@ -375,6 +377,7 @@ class LiveMeetingSession:
             "audio_packets_out_of_order": self.audio_packets_out_of_order,
             "audio_samples_received": self.audio_samples_received,
             "volume_threshold_percent": self.volume_threshold_percent,
+            "asr_settings": dict(self.asr_settings),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -404,6 +407,7 @@ class LiveMeetingSession:
             "audio_samples_received": self.audio_samples_received,
             "audio_level": self.audio_level,
             "volume_threshold_percent": self.volume_threshold_percent,
+            "asr_settings": dict(self.asr_settings),
             "refinement_queue_size": self.refinement_queue.qsize(),
             "refinement_dropped": self.refinement_dropped,
             "model_metadata": self.model_metadata,
@@ -432,9 +436,9 @@ class LiveMeetingSession:
         self.segmenter = StreamSegmenter(
             pre_roll_ms=self.settings.audio_pre_roll_ms,
             speech_start_ms=self.settings.speech_start_ms,
-            silence_ms=self.settings.silence_ms,
+            silence_ms=self.asr_settings["silence_ms"],
             minimum_rms=self.settings.vad_minimum_rms,
-            minimum_speech_ms=self.settings.vad_minimum_speech_ms,
+            minimum_speech_ms=self.asr_settings["vad_minimum_speech_ms"],
             minimum_speech_ratio=self.settings.vad_minimum_speech_ratio,
             partial_interval_ms=self.settings.partial_interval_ms,
             max_utterance_ms=int(self.settings.max_utterance_seconds * 1000),
@@ -462,6 +466,26 @@ class LiveMeetingSession:
             self.segmenter.minimum_rms = threshold_rms
         if changed and self.recording_state in {"created", "starting", "recording"}:
             self._write_state()
+
+    def configure_asr_settings(self, values: Any) -> None:
+        if self.recording_state != "created":
+            raise ValueError("识别设置只能在录音开始前调整")
+        normalized = normalize_asr_settings(values, self.settings)
+        if normalized != self.asr_settings:
+            self.asr_settings = normalized
+            self._write_state()
+
+    @staticmethod
+    def _runtime_decode_settings(method: Callable[..., Any], settings: dict[str, int]) -> dict[str, dict[str, int]]:
+        try:
+            parameters = inspect.signature(method).parameters.values()
+        except (TypeError, ValueError):
+            return {"decode_settings": settings}
+        # Only pass the optional keyword when it is explicitly declared. A
+        # test or plugin runtime may expose **kwargs and forward them to a
+        # stricter parent implementation.
+        accepts_keyword = any(parameter.name == "decode_settings" for parameter in parameters)
+        return {"decode_settings": settings} if accepts_keyword else {}
 
     def configure_audio(self, payload: dict[str, Any]) -> None:
         sample_rate = int(payload.get("sample_rate", 0) or 0)
@@ -553,6 +577,7 @@ class LiveMeetingSession:
             event,
             self._recent_asr_context(self.current_language),
             self.current_language,
+            **self._runtime_decode_settings(self.runtime.transcribe_partial, self.asr_settings),
         )
         if result.text:
             await self.broadcast("draft", revision=event.revision, start=event.start, end=event.end, text=result.text, language=result.language, confidence=result.confidence)
@@ -566,6 +591,7 @@ class LiveMeetingSession:
             recent_text=self._recent_asr_context(self.current_language),
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
+            **self._runtime_decode_settings(self.runtime.transcribe_final, self.asr_settings),
         )
         self._segment_first_ids[event.revision] = items[0].id if items else self.next_utterance_id
         for item in items:
@@ -636,6 +662,7 @@ class LiveMeetingSession:
                     recent_text=self._recent_asr_context(self.current_language),
                     speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
+                    **self._runtime_decode_settings(self.runtime.transcribe_final, self.asr_settings),
                 )
                 await self._commit_refined_items(refined_items)
             except Exception as exc:

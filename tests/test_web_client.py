@@ -26,6 +26,8 @@ def test_threshold_slider_overlays_live_microphone_level() -> None:
     assert 'id="microphoneLevelFill"' in html
     assert 'id="microphoneLevelMarker"' in html
     assert "function renderMicrophoneLevel" in source
+    assert "const MICROPHONE_METER_MAX_PERCENT = 100;" in source
+    assert "const meterMax = MICROPHONE_METER_MAX_PERCENT;" in source
     assert "level / meterMax * 100" in source
     assert '"低于阈值，将被过滤"' in source
     assert "state.audioStreamingEnabled && state.ws?.readyState" in source
@@ -75,3 +77,34 @@ def test_live_transcript_updates_are_incremental() -> None:
     assert "if (changed) renderTranscriptItem(payload.utterance.segment_id, true);" in event_section
     assert "removeTranscriptItem(payload.segment_id);" in event_section
     assert "renderTranscriptItem(payload.segment_id);" in event_section
+
+
+def test_asr_settings_panel_uses_sliders_and_refresh_buttons_keep_hover_only() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    css = (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="openAsrSettings"' in html
+    assert 'id="asrSettingsDialog"' in html
+    assert 'id="settingsAudioSection"' in html
+    assert 'id="inputDeviceSummary"' in html
+    assert 'class="settings-slider threshold-slider"' in html
+    assert "/settings`, {" in source
+    assert "识别设置只能在录音开始前调整" in source
+    assert ".icon-button:hover { border-color" in css
+    assert ".icon-button:hover { transform" not in css
+    assert ".sidebar .icon-button:hover { color" in css
+    assert "transform: rotate" not in css
+
+
+def test_action_buttons_share_the_settings_button_visual_spec() -> None:
+    css = (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+
+    assert ".primary-button, .ghost-button, .text-button, .settings-button, .record-button" in css
+    assert "min-width: 96px; height: 38px; min-height: 38px;" in css
+    assert 'id="openAsrSettings" class="settings-button"' in html
+    assert 'id="deleteMeeting" class="ghost-button danger"' in html
+    assert 'id="saveAsrSettings" class="primary-button"' in html
+    assert ".dialog-close:hover:not(:disabled)" in css
+    assert "width: 38px; min-width: 38px; height: 38px; min-height: 38px;" in css

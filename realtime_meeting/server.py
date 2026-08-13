@@ -26,6 +26,10 @@ class MeetingCreate(BaseModel):
     title: str = Field(default="未命名会议", max_length=200)
 
 
+class MeetingSettingsUpdate(BaseModel):
+    asr_settings: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeviceSwitch(BaseModel):
     device: str = Field(default="auto", pattern="^(auto|cpu|cuda)$")
 
@@ -331,6 +335,19 @@ def create_app(
     @app.get("/api/v2/meetings/{meeting_id}")
     async def get_meeting(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, Any]:
         return require_meeting(meeting_id).snapshot()
+
+    @app.patch("/api/v2/meetings/{meeting_id}/settings")
+    async def update_meeting_settings(
+        meeting_id: str,
+        body: MeetingSettingsUpdate,
+        _principal: str = Depends(authenticate_request),
+    ) -> dict[str, Any]:
+        meeting = require_meeting(meeting_id)
+        try:
+            meeting.configure_asr_settings(body.asr_settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return meeting.snapshot()
 
     @app.get("/api/v2/meetings/{meeting_id}/transcript")
     async def get_transcript(

@@ -158,3 +158,52 @@ def test_transcript_endpoint_pages_complete_history(tmp_path) -> None:
         assert second["has_more"] is False and [item["text"] for item in second["items"]] == ["发言500"]
         assert client.post(f"/api/v2/meetings/{meeting.id}/start").status_code == 202
         assert client.post(f"/api/v2/meetings/{meeting.id}/stop").status_code == 202
+
+
+def test_asr_settings_are_persisted_clamped_and_locked_after_start(tmp_path) -> None:
+    settings = Settings(results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
+    with TestClient(app) as client:
+        created = client.post("/api/v2/meetings", json={"title": "识别设置"})
+        assert created.status_code == 201
+        meeting_id = created.json()["id"]
+        assert created.json()["asr_settings"] == {
+            "realtime_beam_size": 5,
+            "refine_beam_size": 6,
+            "best_of": 5,
+            "silence_ms": 700,
+            "vad_minimum_speech_ms": 450,
+        }
+
+        updated = client.patch(
+            f"/api/v2/meetings/{meeting_id}/settings",
+            json={
+                "asr_settings": {
+                    "realtime_beam_size": 99,
+                    "refine_beam_size": -1,
+                    "best_of": 7,
+                    "silence_ms": 9999,
+                    "vad_minimum_speech_ms": -20,
+                }
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["asr_settings"] == {
+            "realtime_beam_size": 10,
+            "refine_beam_size": 1,
+            "best_of": 7,
+            "silence_ms": 2000,
+            "vad_minimum_speech_ms": 0,
+        }
+
+        state_file = app.state.manager.get(meeting_id).output_dir / "session_state.json"
+        persisted = json.loads(state_file.read_text(encoding="utf-8"))
+        assert persisted["asr_settings"] == updated.json()["asr_settings"]
+
+        assert client.post(f"/api/v2/meetings/{meeting_id}/start").status_code == 202
+        locked = client.patch(
+            f"/api/v2/meetings/{meeting_id}/settings",
+            json={"asr_settings": {"best_of": 1}},
+        )
+        assert locked.status_code == 409
+        assert client.post(f"/api/v2/meetings/{meeting_id}/stop").status_code == 202

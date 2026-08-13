@@ -107,6 +107,38 @@ class Settings:
         self.translation_model_root.mkdir(parents=True, exist_ok=True)
 
 
+ASR_SETTING_LIMITS: dict[str, tuple[int, int]] = {
+    "realtime_beam_size": (1, 10),
+    "refine_beam_size": (1, 12),
+    "best_of": (1, 12),
+    "silence_ms": (160, 2000),
+    "vad_minimum_speech_ms": (0, 2000),
+}
+
+
+def default_asr_settings(settings: Settings) -> dict[str, int]:
+    return {
+        "realtime_beam_size": settings.asr_realtime_beam_size,
+        "refine_beam_size": settings.asr_refine_beam_size,
+        "best_of": settings.asr_best_of,
+        "silence_ms": settings.silence_ms,
+        "vad_minimum_speech_ms": settings.vad_minimum_speech_ms,
+    }
+
+
+def normalize_asr_settings(values: object, settings: Settings) -> dict[str, int]:
+    source = values if isinstance(values, dict) else {}
+    defaults = default_asr_settings(settings)
+    normalized: dict[str, int] = {}
+    for name, (minimum, maximum) in ASR_SETTING_LIMITS.items():
+        try:
+            value = int(float(source.get(name, defaults[name])))
+        except (TypeError, ValueError):
+            value = defaults[name]
+        normalized[name] = max(minimum, min(maximum, value))
+    return normalized
+
+
 def load_settings() -> Settings:
     if load_dotenv:
         load_dotenv()
