@@ -220,6 +220,8 @@ class RefinementAsrEngine:
 class LiveChineseTranslator:
     """Local OPUS-MT en/de -> zh translator with bounded model discovery."""
 
+    CACHE_LIMIT = 4096
+
     def __init__(self, model_root: Path | None, device: str, progress: Callable[[str], None] | None = None, autodownload: bool = False) -> None:
         self.model_root = model_root
         self.device = device
@@ -228,6 +230,7 @@ class LiveChineseTranslator:
         self.models: dict[str, tuple[Any, Any, Any, str, str]] = {}
         self.failed: dict[str, str] = {}
         self.cache: dict[tuple[str, str, int, int, float], TranslationResult] = {}
+        self._lock = threading.RLock()
 
     def _find(self, source: str) -> Path | None:
         if not self.model_root:
@@ -359,11 +362,16 @@ class LiveChineseTranslator:
                 results[index] = TranslationResult(simplify_chinese(value), "not_needed")
             elif source not in {"en", "de"}:
                 results[index] = TranslationResult("", "unsupported", error=f"unsupported source language: {source}")
-            elif (source, value, *cache_suffix) in self.cache:
-                results[index] = self.cache[(source, value, *cache_suffix)]
             else:
-                pending.append((index, value))
-        loaded = self._load(source) if pending else None
+                cache_key = (source, value, *cache_suffix)
+                with self._lock:
+                    cached = self.cache.get(cache_key)
+                if cached is not None:
+                    results[index] = cached
+                else:
+                    pending.append((index, value))
+        with self._lock:
+            loaded = self._load(source) if pending else None
         if loaded is None and pending:
             error = self.failed.get(source, "model unavailable")
             status = "unsupported" if error == "model not cached" else "failed"
@@ -377,12 +385,13 @@ class LiveChineseTranslator:
                 # omitting it causes long/repetitive outputs, especially for
                 # the multilingual German->Chinese model.
                 pieces = [[target_tag] + source_sp.encode(value, out_type=str) + ["</s>"] for _, value in pending]
-                generated = translator.translate_batch(
-                    pieces,
-                    beam_size=beam_size,
-                    max_decoding_length=max_decoding_length,
-                    repetition_penalty=repetition_penalty,
-                )
+                with self._lock:
+                    generated = translator.translate_batch(
+                        pieces,
+                        beam_size=beam_size,
+                        max_decoding_length=max_decoding_length,
+                        repetition_penalty=repetition_penalty,
+                    )
                 for (index, value), hypothesis in zip(pending, generated):
                     tokens = list(hypothesis.hypotheses[0])
                     translated = simplify_chinese(target_sp.decode(tokens).strip())
@@ -395,9 +404,12 @@ class LiveChineseTranslator:
                 for index, _value in pending:
                     results[index] = TranslationResult("", "failed", model_id, str(exc))
         final = [item or TranslationResult("", "failed", error="translator returned no result") for item in results]
-        for index, value in pending:
-            if final[index].status in {"ready", "failed"}:
-                self.cache[(source, value, *cache_suffix)] = final[index]
+        with self._lock:
+            for index, value in pending:
+                if final[index].status == "ready":
+                    self.cache[(source, value, *cache_suffix)] = final[index]
+            while len(self.cache) > self.CACHE_LIMIT:
+                self.cache.pop(next(iter(self.cache)))
         return final
 
 
@@ -975,10 +987,11 @@ class LiveModelRuntime:
             if isinstance(locked_languages, set) and locked_languages:
                 lock_set = {str(lang).strip().casefold() for lang in locked_languages}
                 lock_set &= {"zh", "en", "de"}
+            forced_language: str | None = None
             if len(lock_set) == 1:
                 # Single lock: force this language as the decode prior
-                forced = next(iter(lock_set))
-                language_hint = forced
+                forced_language = next(iter(lock_set))
+                language_hint = forced_language
             # For multi-lock, we apply filtering after detection below
 
             overrides = decode_settings or {}
@@ -1047,9 +1060,10 @@ class LiveModelRuntime:
                         max(initial_beam_size, 5),
                         max(best_of, 5),
                         None,
-                        # If the prior caused a bad decode, let Whisper
-                        # reconsider the language on the retry as well.
-                        None,
+                        # A single-language lock is an invariant, including
+                        # the quality-retry decode. With no lock, the retry
+                        # deliberately lets Whisper reconsider the language.
+                        forced_language,
                     )
                     result = self._select_decode_result(result, retry, thresholds)
                     result.retry_used = True
@@ -1075,10 +1089,12 @@ class LiveModelRuntime:
                 return "", LanguageGuess("zh", 0.0), 0.0, model_name, "detector"
             guess = self.detector.detect(
                 result.text,
-                previous=result.language if not lock_set else language_hint,
-                whisper_language=result.language,
+                previous=forced_language or (result.language if not lock_set else language_hint),
+                whisper_language=forced_language or result.language,
                 whisper_confidence=result.language_probability,
             )
+            if forced_language:
+                guess = LanguageGuess(forced_language, max(guess.confidence, result.language_probability))
             # Multi-lock whitelist filter: if detected language is outside the
             # allowed set, fall back to the first locked language (or the one
             # that best matches Whisper's raw output).
@@ -1088,7 +1104,7 @@ class LiveModelRuntime:
                     guess = LanguageGuess(raw_whisper, max(guess.confidence, result.language_probability))
                 else:
                     # Fallback to first locked language with reduced confidence
-                    fallback = next(iter(lock_set))
+                    fallback = next(language for language in ("zh", "en", "de") if language in lock_set)
                     guess = LanguageGuess(fallback, guess.confidence * 0.6)
             return result.text, guess, result.language_probability, model_name, "asr" if result.language else "detector"
         except Exception as exc:
@@ -1176,6 +1192,19 @@ class LiveModelRuntime:
             whisper_language=whisper_guess.code,
             whisper_confidence=confidence,
         )
+        lock_set = {
+            str(lang).strip().casefold()
+            for lang in (locked_languages or set())
+            if str(lang).strip().casefold() in {"zh", "en", "de"}
+        }
+        if len(lock_set) == 1:
+            forced_language = next(iter(lock_set))
+            guess = LanguageGuess(forced_language, max(guess.confidence, confidence))
+        elif len(lock_set) > 1 and guess.code not in lock_set:
+            fallback = whisper_guess.code if whisper_guess.code in lock_set else next(
+                language for language in ("zh", "en", "de") if language in lock_set
+            )
+            guess = LanguageGuess(fallback, guess.confidence * 0.6)
         speaker = speaker_clusterer.assign(event.pcm, event.end - event.start) if speaker_clusterer else 1
         pieces = self.detector.split_clauses(text)
         result: list[Utterance] = []

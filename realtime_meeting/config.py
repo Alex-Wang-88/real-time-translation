@@ -73,6 +73,8 @@ class Settings:
     vad_minimum_speech_ratio: float = 0.12
     partial_interval_ms: int = 900
     max_audio_packet_bytes: int = 262_144
+    max_recording_seconds: float = 4 * 60 * 60
+    audio_ingest_burst_seconds: float = 5.0
     inference_queue_size: int = 64
     refinement_queue_size: int = 16
     max_active_meetings: int = 1
@@ -85,6 +87,7 @@ class Settings:
     jimo_todo_api_url: str = "https://jimoai-bot-api.xiaohuodui.cn/v2/chat/completions/share?shareId=jSBaVou1SZDrd4bX"
     jimo_authorization: str = ""
     jimo_max_request_chars: int = 12_000
+    jimo_max_response_chars: int = 80_000
     jimo_transcript_chars: int = 5_000
     jimo_state_chars: int = 4_000
     jimo_timeout_seconds: float = 180.0
@@ -309,6 +312,8 @@ def load_settings() -> Settings:
         vad_minimum_speech_ratio=min(1.0, _float("MEETING_VAD_MINIMUM_SPEECH_RATIO", 0.12, 0.0)),
         partial_interval_ms=min(5000, max(400, _int("MEETING_PARTIAL_INTERVAL_MS", 900, 400))),
         max_audio_packet_bytes=_int("MEETING_MAX_AUDIO_PACKET_BYTES", 262_144, 1024),
+        max_recording_seconds=min(24 * 60 * 60, max(60.0, _float("MEETING_MAX_RECORDING_SECONDS", defaults.max_recording_seconds, 60.0))),
+        audio_ingest_burst_seconds=min(30.0, max(0.0, _float("MEETING_AUDIO_INGEST_BURST_SECONDS", defaults.audio_ingest_burst_seconds, 0.0))),
         inference_queue_size=_int("MEETING_INFERENCE_QUEUE_SIZE", 64, 1),
         refinement_queue_size=_int("MEETING_REFINEMENT_QUEUE_SIZE", 16, 1),
         max_active_meetings=_int("MEETING_MAX_ACTIVE_MEETINGS", 1, 1),
@@ -321,6 +326,7 @@ def load_settings() -> Settings:
         jimo_todo_api_url=os.getenv("JIMO_TODO_API_URL", defaults.jimo_todo_api_url),
         jimo_authorization=os.getenv("JIMO_AUTHORIZATION", ""),
         jimo_max_request_chars=_int("JIMO_MAX_REQUEST_CHARS", 12_000, 2000),
+        jimo_max_response_chars=_int("JIMO_MAX_RESPONSE_CHARS", 80_000, 2000),
         jimo_transcript_chars=_int("JIMO_TRANSCRIPT_CHARS", 5000, 1000),
         jimo_state_chars=_int("JIMO_STATE_CHARS", 4000, 1000),
         jimo_timeout_seconds=_float("JIMO_TIMEOUT_SECONDS", 180.0, 10.0),

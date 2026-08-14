@@ -1212,7 +1212,7 @@ async function connectStream(id) {
   socket.onmessage = async (event) => {
     let payload;
     try { payload = JSON.parse(event.data); } catch { return; }
-    await handleEvent(payload);
+    await handleEvent(payload, socket, id);
   };
   socket.onerror = () => setConnection("连接异常", "danger");
   socket.onclose = () => {
@@ -1237,7 +1237,8 @@ function closeStream(intentional = true) {
   if (intentional) stopAudioCapture();
 }
 
-async function handleEvent(payload) {
+async function handleEvent(payload, sourceSocket = null, meetingId = null) {
+  if (sourceSocket && (state.ws !== sourceSocket || state.meeting?.id !== meetingId)) return;
   const type = payload.type;
   if (type === "auth_ok") {
     if (["starting", "recording"].includes(state.meeting?.recording_state)) {
@@ -1247,6 +1248,7 @@ async function handleEvent(payload) {
       setConnection("处理任务连接", "success");
     }
   } else if (type === "audio_config_ack") {
+    if (sourceSocket && (state.ws !== sourceSocket || state.meeting?.id !== meetingId)) return;
     state.audioStreamingEnabled = true;
     await startAudioCapture();
   } else if (type === "audio_threshold_ack") {

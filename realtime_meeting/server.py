@@ -469,12 +469,16 @@ def create_app(
             await websocket.send_json({"type": "auth_ok", "ticket_authenticated": authenticated})
             await websocket.send_json({"type": "snapshot", "meeting": meeting.snapshot()})
             framed_audio = False
+            audio_configured = False
             while True:
                 message = await websocket.receive()
                 if message.get("type") == "websocket.disconnect":
                     break
                 raw_audio = message.get("bytes")
                 if raw_audio:
+                    if not audio_configured:
+                        await websocket.close(code=1003, reason="audio_config required before binary audio")
+                        break
                     sequence = None
                     if framed_audio:
                         if len(raw_audio) < 4:
@@ -507,6 +511,7 @@ def create_app(
                         await websocket.close(code=1003, reason=str(exc)[:120])
                         break
                     framed_audio = bool(payload.get("sequence_header", False))
+                    audio_configured = True
                     await websocket.send_json({"type": "audio_config_ack", "sample_rate": 16000, "channels": 1, "encoding": "pcm_s16le", "sequence_header": framed_audio})
                 elif message_type == "audio_threshold":
                     try:

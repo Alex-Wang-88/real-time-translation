@@ -178,6 +178,44 @@ def test_low_quality_decode_retries_without_poisoned_context(settings) -> None:
     assert runtime.metrics["asr_decode_retries"] == 1
 
 
+def test_single_language_lock_is_preserved_on_quality_retry(settings) -> None:
+    runtime = LiveModelRuntime(
+        settings.asr_primary,
+        settings.asr_fallback,
+        settings.asr_refine,
+        "cpu",
+        translation_model_root=settings.translation_model_root,
+    )
+    runtime.primary = object()
+    calls = []
+
+    class Info:
+        language = "en"
+        language_probability = 0.9
+
+    class Model:
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            segment = SimpleNamespace(
+                text="repeated repeated" if len(calls) == 1 else "clear speech",
+                avg_logprob=-1.4 if len(calls) == 1 else -0.2,
+                no_speech_prob=0.1,
+                compression_ratio=3.2 if len(calls) == 1 else 1.1,
+                temperature=0.0 if len(calls) == 1 else 0.2,
+            )
+            return iter([segment]), Info()
+
+    runtime.primary = Model()
+    text, guess, _confidence, _model, _source = runtime._recognize(
+        b"\x00\x00" * 20,
+        locked_languages={"de"},
+    )
+
+    assert text == "clear speech"
+    assert guess.code == "de"
+    assert [call["language"] for call in calls] == ["de", "de"]
+
+
 def test_decode_settings_override_live_beam_and_candidate_counts(settings) -> None:
     runtime = LiveModelRuntime(
         settings.asr_primary,

@@ -186,6 +186,7 @@ class JimoClient:
             follow_redirects=True,
         )
         chunks: list[str] = []
+        response_chars = 0
         ended = False
         try:
             async with client.stream("POST", self.endpoint, headers=headers, json=payload) as response:
@@ -193,6 +194,11 @@ class JimoClient:
                 async for event in parse_sse_async(response.aiter_lines()):
                     content, is_end = _event_content(event)
                     if content:
+                        response_chars += len(content)
+                        if response_chars > self.settings.jimo_max_response_chars:
+                            raise ValueError(
+                                f"Jimo response exceeds {self.settings.jimo_max_response_chars} characters"
+                            )
                         chunks.append(content)
                         if on_delta:
                             result = on_delta(content)
@@ -352,7 +358,7 @@ def _strip_markdown_fence(value: str) -> str:
 
 
 class _TodoItemPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", str_max_length=4000)
 
     task: str = Field(min_length=1)
     owner: str | None = None
@@ -366,10 +372,10 @@ class _TodoItemPayload(BaseModel):
 
 
 class _TodoPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", str_max_length=4000)
 
     schema_version: str = "1.0"
-    items: list[_TodoItemPayload] = Field(default_factory=list)
+    items: list[_TodoItemPayload] = Field(default_factory=list, max_length=100)
 
 
 def parse_todo_document(raw: str, meeting_id: str, summary_revision: int) -> TodoDocument:

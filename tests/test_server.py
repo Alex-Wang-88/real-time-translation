@@ -126,6 +126,28 @@ def test_health_does_not_expose_authorization_and_delete_recovers(tmp_path) -> N
         assert client.get(f"/api/v2/meetings/{meeting_id}", headers=headers).status_code == 404
 
 
+def test_stream_rejects_binary_audio_before_audio_config(tmp_path) -> None:
+    settings = Settings(
+        results_dir=tmp_path / "meetings",
+        translation_model_root=tmp_path / "models",
+    )
+    app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
+    with TestClient(app) as client:
+        created = client.post("/api/v2/meetings", json={"title": "音频协议测试"})
+        meeting_id = created.json()["id"]
+        assert client.post(f"/api/v2/meetings/{meeting_id}/start").status_code == 202
+        ticket = client.post(f"/api/v2/meetings/{meeting_id}/stream-ticket").json()["ticket"]
+        with pytest.raises(WebSocketDisconnect) as disconnect:
+            with client.websocket_connect(f"/api/v2/meetings/{meeting_id}/stream") as websocket:
+                websocket.send_json({"type": "auth", "ticket": ticket})
+                assert websocket.receive_json()["type"] == "auth_ok"
+                assert websocket.receive_json()["type"] == "snapshot"
+                websocket.send_bytes(b"\x00\x00")
+                websocket.receive_json()
+        assert disconnect.value.code == 1003
+        assert client.post(f"/api/v2/meetings/{meeting_id}/stop").status_code == 202
+
+
 def test_browser_session_cookie_authenticates_api(tmp_path) -> None:
     settings = Settings(host="0.0.0.0", api_token="browser-secret", results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
     app = create_app(settings, ReadyRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))

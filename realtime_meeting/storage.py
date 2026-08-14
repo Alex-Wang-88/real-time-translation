@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+from weakref import WeakValueDictionary
 
 from .models import Utterance
 from .text_normalize import simplify_chinese
@@ -23,7 +24,7 @@ class TranscriptStore:
     """Append-only transcript storage with a backwards-compatible projection."""
 
     schema_version = "1.0"
-    _locks: dict[str, threading.RLock] = {}
+    _locks: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Path) -> None:

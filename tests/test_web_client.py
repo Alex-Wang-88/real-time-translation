@@ -70,7 +70,7 @@ def test_failed_summary_stream_restores_committed_summary() -> None:
 
 def test_live_transcript_updates_are_incremental() -> None:
     source = APP_JS.read_text(encoding="utf-8")
-    event_section = source.split("async function handleEvent(payload)", 1)[1]
+    event_section = source.split("async function handleEvent(", 1)[1]
 
     assert "transcriptNodes: new Map()" in source
     assert "function renderTranscriptItem(segmentId" in source
@@ -102,7 +102,7 @@ def test_transcript_uses_ai_bubbles_and_a_single_streaming_draft() -> None:
 
 def test_summary_streaming_deltas_are_frame_coalesced_and_complete_clears_cursor() -> None:
     source = APP_JS.read_text(encoding="utf-8")
-    event_section = source.split("async function handleEvent(payload)", 1)[1]
+    event_section = source.split("async function handleEvent(", 1)[1]
 
     assert "summaryStreaming: false" in source
     assert "summaryRenderFrame: null" in source
@@ -114,6 +114,14 @@ def test_summary_streaming_deltas_are_frame_coalesced_and_complete_clears_cursor
     assert "state.summaryStreaming = false;" in event_section
     assert "cancelSummaryRender();" in event_section
     assert ".summary-cursor" in (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
+
+
+def test_old_websocket_events_cannot_mutate_the_current_meeting() -> None:
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert "await handleEvent(payload, socket, id);" in source
+    assert "async function handleEvent(payload, sourceSocket = null, meetingId = null)" in source
+    assert "state.ws !== sourceSocket || state.meeting?.id !== meetingId" in source
 
 
 def test_light_ai_workbench_visual_tokens_override_legacy_dark_sidebar() -> None:

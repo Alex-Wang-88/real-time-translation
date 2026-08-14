@@ -45,6 +45,18 @@ class CapacityLimitError(RuntimeError):
 
 LOGGER = logging.getLogger(__name__)
 
+SUPPORTED_LOCKED_LANGUAGES = frozenset({"zh", "en", "de"})
+
+
+def normalize_locked_languages(values: Any) -> set[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {
+        normalized
+        for value in values
+        if (normalized := str(value).strip().casefold()) in SUPPORTED_LOCKED_LANGUAGES
+    }
+
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -110,8 +122,7 @@ class LiveMeetingSession:
         self.current_language: str | None = None
         self.locked_languages: set[str] = set()
         restored_lock = payload.get("locked_languages")
-        if isinstance(restored_lock, list):
-            self.locked_languages = {str(lang).strip().casefold() for lang in restored_lock if str(lang).strip() in {"zh", "en", "de"}}
+        self.locked_languages = normalize_locked_languages(restored_lock)
         self.audio_sample_rate = 16_000
         self.audio_channels = 1
         self.audio_encoding = "pcm_s16le"
@@ -122,6 +133,7 @@ class LiveMeetingSession:
         self.audio_packets_out_of_order = 0
         self.audio_samples_received = 0
         self.audio_level = 0.0
+        self.recording_started_monotonic: float | None = None
         try:
             restored_threshold = float(self.meeting_settings["volume_threshold_percent"])
             self.volume_threshold_percent = rms_to_volume_threshold_percent(
@@ -499,6 +511,7 @@ class LiveMeetingSession:
         )
         self.segmenter.minimum_rms = self.volume_threshold_rms
         self.recording_state = "recording"
+        self.recording_started_monotonic = time.monotonic()
         self.error = None
         self._write_state()
         self.worker_task = asyncio.create_task(self._worker(), name=f"meeting-worker-{self.id}")
@@ -523,11 +536,7 @@ class LiveMeetingSession:
 
     def configure_language_lock(self, languages: Any) -> None:
         """Update the language lock set. Allowed at any time during a session."""
-        valid = {"zh", "en", "de"}
-        if isinstance(languages, (list, tuple)):
-            self.locked_languages = {str(lang).strip().casefold() for lang in languages if str(lang).strip() in valid}
-        else:
-            self.locked_languages = set()
+        self.locked_languages = normalize_locked_languages(languages)
         # When locking to exactly one language, immediately override current_language
         # so the next decode cycle uses it as the Whisper prior.
         if len(self.locked_languages) == 1:
@@ -572,13 +581,13 @@ class LiveMeetingSession:
     def _runtime_optional_settings(
         method: Callable[..., Any],
         keyword: str,
-        settings: dict[str, Any],
-    ) -> dict[str, dict[str, Any]]:
+        value: Any,
+    ) -> dict[str, Any]:
         try:
             parameters = inspect.signature(method).parameters.values()
         except (TypeError, ValueError):
             return {}
-        return {keyword: settings} if any(parameter.name == keyword for parameter in parameters) else {}
+        return {keyword: value} if any(parameter.name == keyword for parameter in parameters) else {}
 
     def _diarization_settings(self) -> dict[str, Any]:
         return {
@@ -617,6 +626,14 @@ class LiveMeetingSession:
                 raise ValueError("音频包为空或超过大小限制")
             if len(pcm) % 2:
                 raise ValueError("PCM 音频包长度必须为偶数")
+            packet_seconds = len(pcm) / (self.audio_sample_rate * SAMPLE_WIDTH)
+            next_audio_seconds = (self.audio_samples_received / self.audio_sample_rate) + packet_seconds
+            if next_audio_seconds > self.settings.max_recording_seconds:
+                raise ValueError("audio duration exceeds the meeting limit")
+            if self.recording_started_monotonic is not None:
+                elapsed = max(0.0, time.monotonic() - self.recording_started_monotonic)
+                if next_audio_seconds > elapsed + self.settings.audio_ingest_burst_seconds:
+                    raise ValueError("audio input is arriving faster than real time")
             if sequence is not None:
                 sequence &= 0xFFFFFFFF
                 if self._last_sequence is None:
@@ -678,7 +695,11 @@ class LiveMeetingSession:
             event,
             self._recent_asr_context(self.current_language),
             self.current_language,
-            locked_languages=self.locked_languages,
+            **self._runtime_optional_settings(
+                self.runtime.transcribe_partial,
+                "locked_languages",
+                set(self.locked_languages),
+            ),
             **self._runtime_decode_settings(self.runtime.transcribe_partial, self.meeting_settings),
         )
         if result.text:
@@ -693,7 +714,11 @@ class LiveMeetingSession:
             recent_text=self._recent_asr_context(self.current_language),
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
-            locked_languages=self.locked_languages,
+            **self._runtime_optional_settings(
+                self.runtime.transcribe_final,
+                "locked_languages",
+                set(self.locked_languages),
+            ),
             **self._runtime_decode_settings(self.runtime.transcribe_final, self.meeting_settings),
         )
         self._segment_first_ids[event.revision] = items[0].id if items else self.next_utterance_id
@@ -719,6 +744,8 @@ class LiveMeetingSession:
                 await self.broadcast("warning", message="精修队列已满，本片段已持久化并将在停止后处理")
 
     async def _translate_item(self, item: Utterance) -> None:
+        source_text = item.text
+        source_language = item.language
         try:
             latest = next((existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id), item)
             source_text = latest.text
@@ -756,6 +783,28 @@ class LiveMeetingSession:
                     break
             await self.broadcast("translation_update", segment_id=latest.segment_id, revision=latest.revision, translation_zh=latest.translation_zh, translation_status=latest.translation_status, translation_model=latest.translation_model)
         except Exception as exc:
+            latest = next(
+                (existing for existing in reversed(self.recent) if existing.segment_id == item.segment_id),
+                item,
+            )
+            if latest.text == source_text and latest.language == source_language and latest.language != "zh":
+                latest.translation_zh = ""
+                latest.translation_status = "failed"
+                latest.translation_model = None
+                latest.revision = max(2, latest.revision + 1)
+                append_utterance(self.transcript_path, latest)
+                for index, existing in enumerate(self.recent):
+                    if existing.segment_id == latest.segment_id:
+                        self.recent[index] = latest
+                        break
+                await self.broadcast(
+                    "translation_update",
+                    segment_id=latest.segment_id,
+                    revision=latest.revision,
+                    translation_zh="",
+                    translation_status="failed",
+                    translation_model=None,
+                )
             await self.broadcast("warning", message=f"翻译失败：{exc}")
 
     async def _refinement_worker(self) -> None:
@@ -774,6 +823,11 @@ class LiveMeetingSession:
                     recent_text=self._recent_asr_context(self.current_language),
                     speaker_clusterer=getattr(self, "speaker_clusterer", None),
                     refined=True,
+                    **self._runtime_optional_settings(
+                        self.runtime.transcribe_final,
+                        "locked_languages",
+                        set(self.locked_languages),
+                    ),
                     **self._runtime_decode_settings(self.runtime.transcribe_final, self.meeting_settings),
                 )
                 await self._commit_refined_items(refined_items)
@@ -954,12 +1008,17 @@ class LiveMeetingSession:
                     )
                     for item in group
                 ]
-            for item, result in zip(group, results):
-                item.translation_zh = result.text if result.status in {"ready", "not_needed"} else ""
-                item.translation_status = result.status
+            if len(results) != len(group):
+                failures.append(f"{language}:translator returned {len(results)} results for {len(group)} items")
+            for index, item in enumerate(group):
+                result = results[index] if index < len(results) else None
+                result_status = getattr(result, "status", "failed")
+                result_text = getattr(result, "text", "")
+                item.translation_zh = result_text if result_status in {"ready", "not_needed"} else ""
+                item.translation_status = result_status
                 item.translation_model = getattr(result, "model", None)
-                if result.status in {"failed", "unsupported"}:
-                    failures.append(f"{item.language}:{getattr(result, 'error', None) or result.status}")
+                if result_status in {"failed", "unsupported"}:
+                    failures.append(f"{item.language}:{getattr(result, 'error', None) or result_status}")
                 item.revision = max(2, item.revision + 1)
                 append_utterance(self.transcript_path, item)
                 completed += 1
@@ -1025,12 +1084,15 @@ class LiveMeetingSession:
             await self.broadcast("utterance", utterance=item.to_dict())
         await self._postprocess_update("diarization", "complete", current=len(paths), total=len(paths))
 
+    async def _wait_for_translation_tasks(self) -> None:
+        while self.translation_tasks:
+            await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
+
     async def run_postprocess(self) -> None:
         self.postprocess.start()
         await self._postprocess_update()
         try:
-            if self.translation_tasks:
-                await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
+            await self._wait_for_translation_tasks()
             release_realtime = getattr(self.runtime, "release_realtime_model", None)
             if release_realtime:
                 await asyncio.to_thread(release_realtime)
@@ -1071,8 +1133,7 @@ class LiveMeetingSession:
             # Refinement schedules translations asynchronously. Join them before
             # diarization so a late translation cannot overwrite newer speaker
             # metadata with an older utterance revision.
-            if self.translation_tasks:
-                await asyncio.gather(*tuple(self.translation_tasks), return_exceptions=True)
+            await self._wait_for_translation_tasks()
             self._export_current_files()
             if self.postprocess.stages.get("diarization", {}).get("state") != "complete":
                 await self._run_diarization()
@@ -1160,6 +1221,7 @@ class LiveMeetingSession:
             await self.worker_task
         if self.audio_writer:
             self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
+        await self._wait_for_translation_tasks()
         self.disconnect_stop_task = None
         self.ended_at = utc_now_iso()
         self.recording_state = "complete"

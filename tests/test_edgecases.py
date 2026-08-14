@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import weakref
 
 from realtime_meeting.audio import SAMPLE_RATE, StreamSegmenter
 from realtime_meeting.config import Settings
@@ -15,6 +17,7 @@ from realtime_meeting.jimo import (
 )
 from realtime_meeting.language import MultilingualDetector
 from realtime_meeting.models import Utterance
+from realtime_meeting.storage import TranscriptStore
 
 
 def test_event_content_plain_text() -> None:
@@ -107,6 +110,15 @@ def test_transcript_chunks_basic(tmp_path) -> None:
     assert chunks
     _, _, _, text = chunks[0]
     assert "a" in text
+
+
+def test_transcript_store_does_not_retain_unused_path_locks(tmp_path) -> None:
+    store = TranscriptStore(tmp_path / "transcript.jsonl")
+    lock_ref = weakref.ref(store._lock)
+    del store
+    gc.collect()
+
+    assert lock_ref() is None
 
 
 def test_summarizer_strips_markdown_fence(tmp_path) -> None:
