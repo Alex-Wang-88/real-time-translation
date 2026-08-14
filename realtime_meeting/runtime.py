@@ -954,6 +954,7 @@ class LiveModelRuntime:
         recent_text: str = "",
         previous_language: str | None = None,
         decode_settings: dict[str, Any] | None = None,
+        locked_languages: set[str] | None = None,
     ) -> tuple[str, LanguageGuess, float, str, str]:
         self.last_asr_error = None
         self.last_asr_error_model = self.asr_refine_name if refine else self.asr_primary_name
@@ -964,6 +965,22 @@ class LiveModelRuntime:
         try:
             prompt = self._asr_prompt(recent_text)
             language_hint = self._normalize_asr_language(previous_language)
+
+            # --- Language lock logic ---
+            # When the user has locked languages via the UI toggle group:
+            #   - Exactly 1 locked → force that language as Whisper prior (bypass auto-detect)
+            #   - 2+ locked       → allow detection but constrain result to the allowed set
+            #   - 0 locked       → fully auto-detect (original behavior)
+            lock_set: set[str] = set()
+            if isinstance(locked_languages, set) and locked_languages:
+                lock_set = {str(lang).strip().casefold() for lang in locked_languages}
+                lock_set &= {"zh", "en", "de"}
+            if len(lock_set) == 1:
+                # Single lock: force this language as the decode prior
+                forced = next(iter(lock_set))
+                language_hint = forced
+            # For multi-lock, we apply filtering after detection below
+
             overrides = decode_settings or {}
 
             def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1058,9 +1075,21 @@ class LiveModelRuntime:
                 return "", LanguageGuess("zh", 0.0), 0.0, model_name, "detector"
             guess = self.detector.detect(
                 result.text,
+                previous=result.language if not lock_set else language_hint,
                 whisper_language=result.language,
                 whisper_confidence=result.language_probability,
             )
+            # Multi-lock whitelist filter: if detected language is outside the
+            # allowed set, fall back to the first locked language (or the one
+            # that best matches Whisper's raw output).
+            if len(lock_set) > 1 and guess.code not in lock_set:
+                raw_whisper = self._normalize_asr_language(result.language)
+                if raw_whisper in lock_set:
+                    guess = LanguageGuess(raw_whisper, max(guess.confidence, result.language_probability))
+                else:
+                    # Fallback to first locked language with reduced confidence
+                    fallback = next(iter(lock_set))
+                    guess = LanguageGuess(fallback, guess.confidence * 0.6)
             return result.text, guess, result.language_probability, model_name, "asr" if result.language else "detector"
         except Exception as exc:
             self.metrics["stage_failures"] = int(self.metrics.get("stage_failures", 0)) + 1
@@ -1096,12 +1125,14 @@ class LiveModelRuntime:
         recent_text: str = "",
         previous_language: str | None = None,
         decode_settings: dict[str, Any] | None = None,
+        locked_languages: set[str] | None = None,
     ) -> PartialResult:
         text, guess, confidence, model, language_source = self._recognize(
             event.pcm,
             recent_text=recent_text,
             previous_language=previous_language,
             decode_settings=decode_settings,
+            locked_languages=locked_languages,
         )
         return PartialResult(event.revision, event.start, event.end, text, guess.code if text else None, confidence, model, language_source)
 
@@ -1123,6 +1154,7 @@ class LiveModelRuntime:
         speaker_clusterer: OnlineSpeakerClusterer | None = None,
         refined: bool = True,
         decode_settings: dict[str, Any] | None = None,
+        locked_languages: set[str] | None = None,
     ) -> list[Utterance]:
         text, whisper_guess, confidence, model, language_source = self._recognize(
             event.pcm,
@@ -1130,6 +1162,7 @@ class LiveModelRuntime:
             recent_text=recent_text,
             previous_language=previous_language,
             decode_settings=decode_settings,
+            locked_languages=locked_languages,
         )
         if not text:
             if refined and self.last_asr_error:

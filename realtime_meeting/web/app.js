@@ -165,6 +165,7 @@ const state = {
   pendingMicrophoneLevel: 0,
   microphoneLevelFrame: null,
   audioStreamingEnabled: false,
+  lockedLanguages: new Set(),
 };
 
 const dom = {
@@ -192,7 +193,7 @@ const dom = {
   levelBar: $("#levelBar"),
   levelText: $("#levelText"),
   inputDevice: $("#inputDevice"),
-  languageIndicator: $("#languageIndicator"),
+  languageLockGroup: $("#languageLockGroup"),
   notice: $("#notice"),
   postprocessPanel: $("#postprocessPanel"),
   postprocessMessage: $("#postprocessMessage"),
@@ -967,7 +968,8 @@ function applySnapshot(snapshot, replace = false) {
         : "录音已经结束，可以查看或重试后处理任务。"
   );
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
-  dom.languageIndicator.textContent = state.meeting.current_language ? `最近语言：${String(state.meeting.current_language).toUpperCase()}` : "等待语音";
+  if (state.meeting.locked_languages) syncLanguageLockUI(state.meeting.locked_languages);
+  renderLanguageLockStatus(state.meeting.current_language);
   if (transcriptChanged) renderTranscript();
   renderSummary(state.meeting.summary, state.meeting.summary_state);
   renderTodo(state.meeting.todo, state.meeting.todo_state);
@@ -1202,6 +1204,10 @@ async function connectStream(id) {
     state.reconnectAttempt = 0;
     socket.send(JSON.stringify({ type: "auth", ticket: ticket.ticket }));
     setConnection("会议连接中", "warning");
+    // Sync language lock state on reconnect
+    if (state.lockedLanguages.size > 0) {
+      socket.send(JSON.stringify({ type: "language_lock", languages: getLockedLanguages() }));
+    }
   };
   socket.onmessage = async (event) => {
     let payload;
@@ -1274,9 +1280,12 @@ async function handleEvent(payload) {
   } else if (type === "draft") {
     renderDraft(payload);
     dom.recordingHint.textContent = payload.text ? `正在识别：${payload.text}` : "正在接收麦克风音频。";
-    if (payload.language) dom.languageIndicator.textContent = `当前语言：${String(payload.language).toUpperCase()}`;
+    if (payload.language) renderLanguageLockStatus(payload.language);
   } else if (type === "audio_input") {
     if (state.meeting) Object.assign(state.meeting, payload);
+  } else if (type === "language_lock_ack") {
+    syncLanguageLockUI(payload.languages || []);
+    renderLanguageLockStatus(state.meeting?.current_language);
   } else if (type === "recording_complete") {
     clearDraft();
     stopAudioCapture();
@@ -1445,6 +1454,38 @@ function downloadFile(name) {
   link.remove();
 }
 
+function getLockedLanguages() {
+  return [...dom.languageLockGroup.querySelectorAll(".language-lock-btn.active")].map((el) => el.dataset.lang);
+}
+
+function syncLanguageLockUI(languages) {
+  const target = new Set(languages || []);
+  for (const btn of dom.languageLockGroup.querySelectorAll(".language-lock-btn")) {
+    btn.classList.toggle("active", target.has(btn.dataset.lang));
+  }
+  state.lockedLanguages = target;
+}
+
+function sendLanguageLock() {
+  const languages = getLockedLanguages();
+  state.lockedLanguages = new Set(languages);
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "language_lock", languages }));
+  }
+}
+
+function renderLanguageLockStatus(detectedLang) {
+  // Visual feedback: when locked, show detected language alongside locks
+  const count = state.lockedLanguages.size;
+  if (count === 0 && detectedLang) {
+    dom.languageLockGroup.title = `自动检测：${detectedLang.toUpperCase()}`;
+  } else if (count > 0 && detectedLang) {
+    dom.languageLockGroup.title = `锁定：${[...state.lockedLanguages].join(", ").toUpperCase()} | 当前识别：${detectedLang.toUpperCase()}`;
+  } else {
+    dom.languageLockGroup.title = count > 0 ? `已锁定：${[...state.lockedLanguages].join(", ").toUpperCase()}` : "自动检测语言（点击按钮锁定）";
+  }
+}
+
 function bindEvents() {
   $("#startMeeting").addEventListener("click", () => createMeeting(dom.meetingTitle.value));
   $("#newMeeting").addEventListener("click", () => { dom.dialogTitle.value = ""; dom.dialog.showModal(); });
@@ -1543,6 +1584,14 @@ function bindEvents() {
         setNotice(error.message || "无法预览所选麦克风", "error");
       }
     }
+  });
+  // Language lock buttons — toggle active state and send to backend
+  dom.languageLockGroup.addEventListener("click", (e) => {
+    const btn = e.target.closest(".language-lock-btn");
+    if (!btn) return;
+    btn.classList.toggle("active");
+    sendLanguageLock();
+    renderLanguageLockStatus(state.meeting?.current_language);
   });
   dom.transcriptList.addEventListener("scroll", () => {
     const distance = dom.transcriptList.scrollHeight - dom.transcriptList.scrollTop - dom.transcriptList.clientHeight;

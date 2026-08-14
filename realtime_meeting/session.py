@@ -108,6 +108,10 @@ class LiveMeetingSession:
         self.utterance_count = 0
         self.next_utterance_id = 1
         self.current_language: str | None = None
+        self.locked_languages: set[str] = set()
+        restored_lock = payload.get("locked_languages")
+        if isinstance(restored_lock, list):
+            self.locked_languages = {str(lang).strip().casefold() for lang in restored_lock if str(lang).strip() in {"zh", "en", "de"}}
         self.audio_sample_rate = 16_000
         self.audio_channels = 1
         self.audio_encoding = "pcm_s16le"
@@ -424,6 +428,7 @@ class LiveMeetingSession:
             "volume_threshold_percent": self.volume_threshold_percent,
             "asr_settings": dict(self.asr_settings),
             "meeting_settings": dict(self.meeting_settings),
+            "locked_languages": sorted(self.locked_languages),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -455,6 +460,7 @@ class LiveMeetingSession:
             "volume_threshold_percent": self.volume_threshold_percent,
             "asr_settings": dict(self.asr_settings),
             "meeting_settings": dict(self.meeting_settings),
+            "locked_languages": sorted(self.locked_languages),
             "refinement_queue_size": self.refinement_queue.qsize(),
             "refinement_dropped": self.refinement_dropped,
             "model_metadata": self.model_metadata,
@@ -514,6 +520,19 @@ class LiveMeetingSession:
             self.segmenter.minimum_rms = threshold_rms
         if changed and self.recording_state in {"created", "starting", "recording"}:
             self._write_state()
+
+    def configure_language_lock(self, languages: Any) -> None:
+        """Update the language lock set. Allowed at any time during a session."""
+        valid = {"zh", "en", "de"}
+        if isinstance(languages, (list, tuple)):
+            self.locked_languages = {str(lang).strip().casefold() for lang in languages if str(lang).strip() in valid}
+        else:
+            self.locked_languages = set()
+        # When locking to exactly one language, immediately override current_language
+        # so the next decode cycle uses it as the Whisper prior.
+        if len(self.locked_languages) == 1:
+            self.current_language = next(iter(self.locked_languages))
+        self._write_state()
 
     def configure_asr_settings(self, values: Any) -> None:
         self.configure_meeting_settings({"asr_settings": values})
@@ -659,6 +678,7 @@ class LiveMeetingSession:
             event,
             self._recent_asr_context(self.current_language),
             self.current_language,
+            locked_languages=self.locked_languages,
             **self._runtime_decode_settings(self.runtime.transcribe_partial, self.meeting_settings),
         )
         if result.text:
@@ -673,6 +693,7 @@ class LiveMeetingSession:
             recent_text=self._recent_asr_context(self.current_language),
             speaker_clusterer=getattr(self, "speaker_clusterer", None),
             refined=False,
+            locked_languages=self.locked_languages,
             **self._runtime_decode_settings(self.runtime.transcribe_final, self.meeting_settings),
         )
         self._segment_first_ids[event.revision] = items[0].id if items else self.next_utterance_id

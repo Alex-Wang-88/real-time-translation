@@ -515,6 +515,10 @@ def create_app(
                         await websocket.send_json({"type": "audio_threshold_error", "message": str(exc)})
                         continue
                     await websocket.send_json({"type": "audio_threshold_ack", "percent": meeting.volume_threshold_percent})
+                elif message_type == "language_lock":
+                    languages = payload.get("languages") or []
+                    meeting.configure_language_lock(languages)
+                    await websocket.send_json({"type": "language_lock_ack", "languages": list(meeting.locked_languages)})
         except WebSocketDisconnect:
             pass
         finally:

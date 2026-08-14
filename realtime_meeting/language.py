@@ -71,7 +71,8 @@ class MultilingualDetector:
                 self._lingua = None
         if hint:
             return LanguageGuess(hint, 0.5)
-        return LanguageGuess(normalize_language_code(previous) or "en", 0.25)
+        prev = normalize_language_code(previous)
+        return LanguageGuess(prev or "en", 0.25)
 
     def split_clauses(self, text: str) -> list[str]:
         pieces = [piece.strip() for piece in re.split(r"(?<=[。！？.!?])\s+|(?<=[。！？.!?])", text) if piece.strip()]

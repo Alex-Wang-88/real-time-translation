@@ -96,7 +96,11 @@
               </div>
               <div class="threshold-feedback"><output id="microphoneLevelValue">当前音量 --</output><span id="microphoneLevelStatus">等待麦克风</span></div>
               <span id="volumeThresholdHint" class="threshold-hint">彩色音量超过滑块位置时，当前声音才会被保留</span>
-              <span id="languageIndicator" class="language-indicator">等待语音</span>
+              <div id="languageLockGroup" class="language-lock-group" role="group" aria-label="语言锁定">
+                <button type="button" class="language-lock-btn active" data-lang="zh">中文</button>
+                <button type="button" class="language-lock-btn" data-lang="en">英文</button>
+                <button type="button" class="language-lock-btn" data-lang="de">德文</button>
+              </div>
             </div>
           </div>
 

@@ -342,6 +342,47 @@ button:disabled { cursor: not-allowed; opacity: .45; filter: saturate(.5); }
 .threshold-hint { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; line-height: 1.4; }
 .language-indicator { display: inline-block; margin-top: 10px; color: var(--accent); font-size: 9px; font-weight: 600; }
 
+/* ============ 语言锁定按钮组 ============ */
+.language-lock-group {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 6px;
+  margin-top: 10px;
+  align-items: center;
+}
+.language-lock-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  min-width: 52px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--muted, #86909c);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: border-color .18s ease, background .18s ease, color .18s ease, box-shadow .18s ease;
+}
+.language-lock-btn:hover {
+  border-color: var(--accent, #165dff);
+  color: var(--accent-deep, #1d2129);
+  background: var(--accent-soft, rgba(22,93,255,.06));
+}
+.language-lock-btn.active {
+  border-color: var(--accent, #165dff);
+  color: var(--accent, #165dff);
+  background: var(--accent-soft, rgba(22,93,255,.08));
+  font-weight: 600;
+}
+
 .notice {
   padding: 12px 15px; border: 1px solid #f0dfbd; border-radius: 12px;
   color: #82591a; background: #fdf4e0; font-size: 11px; line-height: 1.6;
