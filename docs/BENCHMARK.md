@@ -1,30 +1,21 @@
-# Model and pipeline benchmark
+# 模型与段落链路基准
 
-Create a JSON fixture with `samples`. Each sample can contain `audio`,
-`duration_seconds`, `language`, `text`, `hypothesis`, `translation`, and
-`translation_hypothesis`.
+基准 fixture 使用 `samples` 数组。每个样本可以包含 `audio`、
+`duration_seconds`、`language`、`speech_variant`、`text`、`hypothesis`、
+`translation` 和 `translation_hypothesis`。
 
-Run the dependency-free regression report with:
+运行无额外模型依赖的回归报告：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\benchmark.py tests\fixtures\benchmark.json --output result\benchmark.json
+uv run python scripts/benchmark.py tests/fixtures/benchmark.json --output result/benchmark.json
 ```
 
-The report records WER/CER-style error rate, chrF-style translation overlap,
-P50/P95 latency, and RTF. Real model runs can pass recognizer/translator
-callbacks from a Python harness. Diarization fixtures should add DER/JER and
-speaker-label stability measurements alongside this report so model choices
-are based on the same fixed corpus rather than a single recording. Reports
-should also record the fixed Resemblyzer parameters (16 kHz input,
-1.6-second embedding context, 0.8-second hop, cosine threshold 0.68), model
-weight size, and whether overlap metadata was produced. Resemblyzer is the only
-speaker-separation implementation; it does not provide a dedicated overlap
-model, so DER/JER fixtures must make that product boundary explicit.
+报告包含 WER/CER 风格错误率、翻译字符重叠率、P50/P95 延迟、RTF、段落数量以及语言/方言覆盖。真实模型压测应另外记录首个 partial 延迟、稳定前缀翻译延迟、峰值显存、队列深度和停止收尾耗时。
 
-The checked-in fixture verifies the metric pipeline only. For a real local
-model smoke run, provide an existing speech recording explicitly; the script
-never depends on a historical meeting ID:
+段落基准不评估人员身份或说话人分离。混合语言验收应覆盖普通话、英文、德文，以及 Qwen 官方 22 类中文方言（包括浙江、粤语香港/广东口音、四川、吴语和闽南语）和语言/方言切换；短暂 `unknown` 不应制造额外段落。
+
+本仓库 fixture 只验证指标管线。真实本地模型 smoke test 需要显式提供音频文件，脚本不依赖历史会议 ID：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\smoke_test_local_models.py .\samples\speech.wav --device auto
+uv run python scripts/smoke_test_local_models.py .\samples\speech.wav --device auto
 ```

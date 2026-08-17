@@ -3,7 +3,8 @@ param(
     [switch]$Reload,
     [switch]$NoBrowser,
     [switch]$SkipInstall,
-    [int]$Port = 8765
+    [int]$Port = 8765,
+    [int]$StartupTimeoutSeconds = 900
 )
 
 # Keep this launcher ASCII-only. Windows PowerShell 5.1 otherwise misreads a
@@ -17,6 +18,8 @@ $baseUrl = "http://127.0.0.1:$Port"
 $startupMutex = [System.Threading.Mutex]::new($false, "Local\RealTimeTranslation.MeetingV2.Startup")
 $ownsStartupMutex = $false
 $serverProcess = $null
+$pollIntervalMilliseconds = 500
+$maxWaitAttempts = [Math]::Ceiling(($StartupTimeoutSeconds * 1000) / $pollIntervalMilliseconds)
 
 function Get-MeetingServiceState {
     param([string]$BaseUrl)
@@ -57,21 +60,21 @@ try {
 
     if (-not $ownsStartupMutex) {
         Write-Host "Another Meeting v2 launcher is starting the service; waiting for it..."
-        for ($attempt = 0; $attempt -lt 240; $attempt++) {
+        for ($attempt = 0; $attempt -lt $maxWaitAttempts; $attempt++) {
             $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
             if ($existingService -and $existingService.status -eq "ready") {
                 Write-Host "Meeting v2 is already running and models are ready at $baseUrl"
                 if (-not $NoBrowser) { Start-Process $baseUrl | Out-Null }
                 return
             }
-            if ($startupMutex.WaitOne(500)) {
+            if ($startupMutex.WaitOne($pollIntervalMilliseconds)) {
                 $ownsStartupMutex = $true
                 break
             }
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds $pollIntervalMilliseconds
         }
         if (-not $ownsStartupMutex) {
-            throw "Another Meeting v2 launcher did not become ready within 120 seconds."
+            throw "Another Meeting v2 launcher did not become ready within $StartupTimeoutSeconds seconds."
         }
     }
 
@@ -84,8 +87,8 @@ try {
         }
 
         Write-Host "Meeting v2 is already running; waiting for models to finish loading..."
-        for ($attempt = 0; $attempt -lt 240; $attempt++) {
-            Start-Sleep -Milliseconds 500
+        for ($attempt = 0; $attempt -lt $maxWaitAttempts; $attempt++) {
+            Start-Sleep -Milliseconds $pollIntervalMilliseconds
             $existingService = Get-MeetingServiceState -BaseUrl $baseUrl
             if ($existingService -and $existingService.status -eq "ready") {
                 Write-Host "Meeting v2 models are ready at $baseUrl"
@@ -96,7 +99,7 @@ try {
         }
         if ($existingService) {
             $message = if ($existingService.message) { $existingService.message } else { $existingService.status }
-            throw "Meeting v2 did not become ready within 120 seconds: $message"
+            throw "Meeting v2 did not become ready within $StartupTimeoutSeconds seconds: $message"
         }
     }
 
@@ -156,8 +159,8 @@ try {
 
     $ready = $false
     $lastStatus = "waiting for service"
-    for ($attempt = 0; $attempt -lt 240; $attempt++) {
-        Start-Sleep -Milliseconds 500
+    for ($attempt = 0; $attempt -lt $maxWaitAttempts; $attempt++) {
+        Start-Sleep -Milliseconds $pollIntervalMilliseconds
         try {
             $response = Invoke-RestMethod -Uri "$baseUrl/api/v2/health" -TimeoutSec 2
             if ($response.status) { $lastStatus = [string]$response.message }
@@ -178,7 +181,7 @@ try {
             $details = (Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue).Trim()
             throw "The v2 server exited before its models became ready (code $($serverProcess.ExitCode)). $details"
         }
-        throw "The v2 models did not become ready within 120 seconds (last status: $lastStatus). See $stderrLog"
+        throw "The v2 models did not become ready within $StartupTimeoutSeconds seconds (last status: $lastStatus). See $stderrLog"
     }
 
     Write-Host "Meeting v2 is running and models are ready at $baseUrl"

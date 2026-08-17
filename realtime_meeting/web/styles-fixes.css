@@ -1,6 +1,93 @@
-.meeting-entry { width: 100%; margin-bottom: 6px; padding: 11px; border: 1px solid transparent; border-radius: 8px; color: #4e5969; background: transparent; text-align: left; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+.meeting-entry { display: flex; align-items: flex-start; width: 100%; min-width: 0; margin-bottom: 6px; padding: 0; border: 1px solid transparent; border-radius: 8px; color: #4e5969; background: transparent; text-align: left; transition: background .16s ease, border-color .16s ease, color .16s ease; }
 .meeting-entry:hover { border-color: #d5e0f5; color: #1d2129; background: #f7f9fd; }
 .meeting-entry.active { border-color: #c9ddff; color: #0e42c3; background: #e8f3ff; }
+.meeting-entry-select { display: block; min-width: 0; flex: 1 1 auto; padding: 11px 5px 11px 11px; border: 0; color: inherit; background: transparent; text-align: left; }
+.meeting-entry-select:focus-visible { border-radius: 7px; box-shadow: inset 0 0 0 2px rgba(22, 93, 255, .25); }
+.meeting-entry-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; padding: 8px 5px 0 0; }
+.meeting-action-button { display: grid; width: 24px; height: 24px; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 5px; color: #86909c; background: transparent; font-size: 14px; line-height: 1; opacity: .78; transition: border-color .16s ease, background .16s ease, color .16s ease, opacity .16s ease; }
+.meeting-action-icon { display: inline-block; transform: scaleX(-1); }
+.meeting-action-button:hover { opacity: 1; }
+.meeting-action-button.rename:hover { border-color: #b7c9f5; color: #165dff; background: #e8f3ff; }
+.meeting-action-button.delete:hover { border-color: #ffb8b0; color: #f53f3f; background: #ffece8; }
+.notice.success { color: #00a870; border-color: #b7ebc0; background: #e8ffea; }
 .meeting-entry-title { display: block; overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .meeting-entry-meta, .meeting-entry-state { display: block; margin-top: 5px; color: #86909c; font-size: 9px; }
 .meeting-entry-state.live { color: #165dff; }
+
+html[data-theme="dark"] .meeting-entry-select { color: inherit; }
+html[data-theme="dark"] .meeting-entry-select:focus-visible { box-shadow: inset 0 0 0 2px rgba(130, 170, 255, .35); }
+html[data-theme="dark"] .meeting-action-button { color: var(--sidebar-muted); }
+html[data-theme="dark"] .meeting-action-button.rename:hover { border-color: #4e6fae; color: #82aaff; background: #202e49; }
+html[data-theme="dark"] .meeting-action-button.delete:hover { border-color: #a65a64; color: #ffb2b5; background: #3c2428; }
+html[data-theme="dark"] .notice.success { color: #83e2b6; border-color: #2d604d; background: #1d3b31; }
+
+/* Shared modal surface. All app dialogs stay centered and use the active theme. */
+.app-dialog {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+}
+.app-dialog[open] { animation: app-dialog-pop .24s var(--ease) both; }
+@keyframes app-dialog-pop {
+  from { opacity: 0; transform: translate(-50%, -47%) scale(.97); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+.app-dialog::backdrop { background: rgba(29, 33, 41, .46); backdrop-filter: blur(6px); }
+.action-dialog {
+  width: min(440px, calc(100vw - 30px));
+  max-height: calc(100dvh - 30px);
+  padding: 0;
+  overflow: auto;
+  border-radius: var(--radius-lg);
+}
+.action-dialog form { position: relative; padding: 30px; }
+.action-dialog h3 { margin: 0 0 8px; color: var(--ink); font-size: 22px; font-weight: 800; letter-spacing: -.03em; }
+.dialog-eyebrow { margin: 0 0 9px; color: var(--accent); font: 700 9px/1 var(--mono); letter-spacing: .16em; }
+.dialog-description { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.75; }
+.action-dialog label { display: block; margin: 20px 0 7px; color: var(--ink-soft); font-size: 11px; font-weight: 700; }
+.action-dialog input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--paper);
+  outline: 0;
+  font-size: 13px;
+}
+.action-dialog input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.action-dialog .dialog-actions { margin-top: 24px; }
+.danger-button {
+  display: inline-flex;
+  min-width: 88px;
+  height: 34px;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  color: #fff;
+  background: var(--danger);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: border-color var(--t-fast), background var(--t-fast), box-shadow var(--t-fast);
+}
+.danger-button:hover:not(:disabled) { border-color: #ff6b72; background: #e83945; box-shadow: var(--shadow-md); }
+html[data-theme="dark"] .app-dialog { border-color: var(--line); background: var(--card); }
+html[data-theme="dark"] .app-dialog::backdrop { background: rgba(3, 7, 12, .7); }
+html[data-theme="dark"] .action-dialog input { border-color: var(--line-strong); background: #121922; }
+html[data-theme="dark"] .danger-button { border-color: #d86b72; color: #fff; background: #b94b55; }
+html[data-theme="dark"] .danger-button:hover:not(:disabled) { border-color: #ff9da2; background: #cc5a64; }
+
+@media (max-width: 520px) {
+  .action-dialog form { padding: 24px 20px; }
+}

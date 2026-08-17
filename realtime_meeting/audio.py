@@ -43,14 +43,8 @@ def rms_to_volume_threshold_percent(rms: float) -> float:
 
 
 def apply_volume_gate(pcm: bytes, minimum_rms: float) -> bytes:
-    """Mute a packet whose RMS is below the configured threshold without dropping time."""
-    if not pcm or minimum_rms <= 0:
-        return pcm
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    if not len(samples):
-        return pcm
-    rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-    return bytes(len(pcm)) if rms < minimum_rms else pcm
+    """Compatibility shim: packet-level gating is intentionally disabled."""
+    return pcm
 
 
 @dataclass(slots=True)
@@ -61,28 +55,12 @@ class SegmentEvent:
     end: float
     revision: int
     forced: bool = False
-
-
-def decode_audio_pcm(path: Path) -> bytes:
-    """Decode a saved audio segment to 16 kHz mono PCM16 for recovery."""
-    if path.suffix.casefold() == ".wav":
-        with wave.open(str(path), "rb") as source:
-            if source.getnchannels() == 1 and source.getsampwidth() == SAMPLE_WIDTH and source.getframerate() == SAMPLE_RATE:
-                return source.readframes(source.getnframes())
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError(f"恢复精修输入需要 FFmpeg: {path.name}")
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    result = subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=creationflags,
-    )  # nosec B603
-    if result.returncode:
-        raise RuntimeError(f"恢复精修音频失败 {path.name}: {result.stderr.decode('utf-8', errors='replace').strip()}")
-    return result.stdout
+    # Keep the legacy six-field positional constructor compatible while
+    # carrying whether a partial contains speech since the previous partial.
+    has_new_speech: bool = True
+    # Energy-gated signal evidence is separate from model VAD speech. This
+    # prevents a VAD-only noise segment from reaching a hallucinating ASR.
+    has_audio: bool = True
 
 
 class StreamSegmenter:
@@ -115,6 +93,8 @@ class StreamSegmenter:
         self._speech_run = self._silence_run = 0
         self._total_samples = self._frames_processed = self._speech_frames = 0
         self._revision = self._last_partial_frame_count = 0
+        self._speech_since_partial = False
+        self._audio_since_partial = False
 
     @property
     def elapsed_seconds(self) -> float:
@@ -131,12 +111,15 @@ class StreamSegmenter:
     def _is_speech(self, frame: bytes) -> bool:
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
-        threshold = max(self.minimum_rms, self.noise_floor * 3.0)
+        near_zero = max(8.0, self.noise_floor * 1.25)
+        energy_speech = rms >= max(self.minimum_rms, self.noise_floor * 3.0)
 
-        # The model VAD can interpret steady room noise as speech.  Keep an
-        # independent energy gate so low-level fans, keyboard noise and audio
-        # leakage never open an utterance merely because the model says so.
-        if rms < threshold:
+        # Near-zero input must never open a segment. When an actual VAD is
+        # available, its explicit speech/silence decision wins; otherwise the
+        # energy threshold is the fallback. Letting energy override an
+        # explicit VAD=false decision turns room noise into continuous speech
+        # and prevents the next paragraph from ever starting.
+        if rms < near_zero:
             if not self._active:
                 self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
             return False
@@ -147,7 +130,7 @@ class StreamSegmenter:
                 decision = None
             if decision is not None:
                 return bool(decision)
-        return True
+        return energy_speech
 
     def _admitted(self, frames: list[tuple[int, bytes]]) -> bool:
         if not frames:
@@ -177,6 +160,9 @@ class StreamSegmenter:
     def _feed_frame(self, frame: bytes) -> list[SegmentEvent]:
         start = self._total_samples
         self._total_samples += FRAME_SAMPLES
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
+        has_audio = rms >= max(self.minimum_rms, 8.0)
         speech = self._is_speech(frame)
         self._frames_processed += 1
         self._speech_frames += int(speech)
@@ -188,48 +174,94 @@ class StreamSegmenter:
                 self._active = list(self._pre_roll)
                 self._last_partial_frame_count = len(self._active)
                 self._silence_run = 0
+                self._speech_since_partial = True
+                self._audio_since_partial = has_audio
             return []
         self._active.append((start, frame))
         self._silence_run = 0 if speech else self._silence_run + 1
+        if speech:
+            self._speech_since_partial = True
+        if has_audio:
+            self._audio_since_partial = True
         events: list[SegmentEvent] = []
         count = len(self._active)
-        if count >= max(50, self.partial_interval_frames) and count - self._last_partial_frame_count >= self.partial_interval_frames:
+        if (
+            speech
+            and self._speech_since_partial
+            and count >= self.partial_interval_frames
+            and count - self._last_partial_frame_count >= self.partial_interval_frames
+        ):
             self._last_partial_frame_count = count
-            events.append(self._make_event("partial", self._active))
+            events.append(self._make_event("partial", self._active, has_new_speech=True, has_audio=self._audio_since_partial))
+            self._speech_since_partial = False
+            self._audio_since_partial = False
         if self._silence_run >= self.silence_frames:
             keep_tail = min(5, self._silence_run)
             useful = self._active[: count - self._silence_run + keep_tail]
             if self._admitted(useful):
-                events.append(self._make_event("final", useful))
+                events.append(self._make_event("final", useful, has_new_speech=self._speech_since_partial))
             self._reset(self._active[-self.pre_roll_frames:])
         elif count >= self.max_frames:
             if self._admitted(self._active):
-                events.append(self._make_event("final", self._active, True))
-            overlap = self._active[-self.pre_roll_frames:]
-            self._revision += 1
-            self._active = overlap
+                events.append(self._make_event("final", self._active, True, has_new_speech=self._speech_since_partial))
+            # A forced cut is a technical boundary, not an overlap window.
+            # The current event already contains the audio up to the cut; an
+            # overlap would duplicate words when a later language/paragraph
+            # boundary is committed. The next speech run will build its own
+            # pre-roll from frames received after this boundary.
+            self._active = []
             self._pre_roll.clear()
-            self._speech_run = self.speech_start_frames
+            self._speech_run = 0
             self._silence_run = 0
-            self._last_partial_frame_count = len(overlap)
+            self._last_partial_frame_count = 0
+            self._speech_since_partial = False
+            self._audio_since_partial = False
         return events
 
-    def _make_event(self, kind: Literal["partial", "final"], frames: list[tuple[int, bytes]], forced: bool = False) -> SegmentEvent:
+    def _make_event(
+        self,
+        kind: Literal["partial", "final"],
+        frames: list[tuple[int, bytes]],
+        forced: bool = False,
+        *,
+        has_new_speech: bool = True,
+        has_audio: bool | None = None,
+    ) -> SegmentEvent:
         start = frames[0][0]
         end = frames[-1][0] + FRAME_SAMPLES
-        return SegmentEvent(kind, b"".join(frame for _, frame in frames), start / SAMPLE_RATE, end / SAMPLE_RATE, self._revision, forced)
+        if has_audio is None:
+            has_audio = any(
+                float(np.sqrt(np.mean(np.frombuffer(frame, dtype=np.int16).astype(np.float32) ** 2))) >= max(self.minimum_rms, 8.0)
+                for _, frame in frames
+            )
+        return SegmentEvent(
+            kind,
+            b"".join(frame for _, frame in frames),
+            start / SAMPLE_RATE,
+            end / SAMPLE_RATE,
+            self._revision,
+            forced,
+            has_new_speech,
+            bool(has_audio),
+        )
 
     def _reset(self, pre_roll: list[tuple[int, bytes]] | None = None) -> None:
         self._active = []
         self._speech_run = self._silence_run = self._last_partial_frame_count = 0
+        self._speech_since_partial = False
+        self._audio_since_partial = False
         self._pre_roll.clear()
         if pre_roll:
             self._pre_roll.extend(pre_roll)
 
     def flush(self) -> list[SegmentEvent]:
+        flush_vad = getattr(self.vad, "flush", None)
+        if callable(flush_vad):
+            with suppress(Exception):
+                flush_vad()
         if not self._active:
             return []
-        event = self._make_event("final", self._active) if self._admitted(self._active) else None
+        event = self._make_event("final", self._active, has_new_speech=self._speech_since_partial) if self._admitted(self._active) else None
         self._reset()
         return [event] if event else []
 

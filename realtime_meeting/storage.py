@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from weakref import WeakValueDictionary
 
+from .language import is_mixed_source_text
 from .models import Utterance
 from .text_normalize import simplify_chinese
 
@@ -21,91 +22,170 @@ class MeetingStore(Protocol):
 
 
 class TranscriptStore:
-    """Append-only transcript storage with a backwards-compatible projection."""
+    """Schema 2 append-only paragraph event log and latest projection."""
 
-    schema_version = "1.0"
+    schema_version = "2.0"
     _locks: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
     _locks_guard = threading.Lock()
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.events_path = path.with_name("transcript_events.jsonl")
+        self.projection_path = path.with_suffix(".json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._latest: list[Utterance] | None = None
+        self._event_signature: tuple[int, int] | None = None
+        self._projection_pending = 0
         key = str(path.resolve())
         with self._locks_guard:
             self._lock = self._locks.setdefault(key, threading.RLock())
 
     @staticmethod
     def _normalize(item: Utterance) -> Utterance:
-        if not item.segment_id:
-            item.segment_id = f"legacy:{item.id}"
-        if not item.source_segment_id or item.source_segment_id == item.segment_id:
-            item.source_segment_id = item.segment_id.split(":", 1)[0]
-        if item.language == "zh":
+        item.segment_id = str(item.segment_id or f"p-{item.id:06d}")
+        item.language = str(item.language or "unknown")
+        if item.language == "zh" and not is_mixed_source_text(item.text):
             item.text = simplify_chinese(item.text)
-            item.translation_zh = item.text
+            item.translation_zh = simplify_chinese(item.text)
             item.translation_status = "not_needed"
+            item.translation_model = None
+        item.revision = max(1, int(item.revision or 1))
+        item.source_revision = max(1, int(item.source_revision or 1))
         return item
-
-    @staticmethod
-    def _same_segment_key(item: Utterance) -> str:
-        return item.segment_id or item.source_segment_id or f"legacy:{item.id}"
 
     def append(self, item: Utterance, *, event_type: str = "upsert") -> None:
         item = self._normalize(item)
-        payload = item.to_dict()
-        event = {
+        record = {
             "schema_version": self.schema_version,
-            "event": event_type,
-            "segment_id": item.segment_id,
-            "revision": item.revision,
-            "utterance": payload,
+            "event_type": event_type,
+            "paragraph": item.to_dict(),
         }
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         with self._lock:
-            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                handle.flush()
-            with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-                handle.flush()
+            latest = self._ensure_latest_locked()
+            for event_path in (self.path, self.events_path):
+                with event_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            stored = Utterance.from_dict(item.to_dict())
+            if event_type == "delete":
+                latest[:] = [current for current in latest if current.segment_id != stored.segment_id]
+            else:
+                replaced = False
+                for index, current in enumerate(latest):
+                    if current.segment_id == stored.segment_id:
+                        latest[index] = stored
+                        replaced = True
+                        break
+                if not replaced:
+                    latest.append(stored)
+            self._event_signature = self._signature(self.path)
+            self._projection_pending += 1
+            if stored.closed or event_type == "delete" or len(latest) <= 1 or self._projection_pending >= 32:
+                self._write_projection(latest)
+                self._projection_pending = 0
 
     def delete(self, item: Utterance) -> None:
-        item.deleted = True
-        item.revision = max(2, item.revision + 1)
-        item.recognition_stage = "deleted"
         self.append(item, event_type="delete")
 
-    def replace_segment(self, segment_id: str, items: list[Utterance]) -> None:
-        """Emit tombstones for removed revisions, then append replacements."""
-        current = [item for item in self.load() if item.segment_id == segment_id]
-        replacement_ids = {item.id for item in items}
-        for previous in current:
-            if previous.id not in replacement_ids:
-                self.delete(previous)
-        for item in items:
-            self.append(item, event_type="replace")
+    def replace_all(self, items: list[Utterance], *, reason: str = "rewrite") -> None:
+        normalized = [self._normalize(item) for item in items]
+        record = {
+            "schema_version": self.schema_version,
+            "event_type": "replace_all",
+            "reason": reason,
+            "paragraphs": [item.to_dict() for item in normalized],
+        }
+        with self._lock:
+            line = json.dumps(record, ensure_ascii=False) + "\n"
+            for event_path in (self.path, self.events_path):
+                with event_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            self._latest = [Utterance.from_dict(item.to_dict()) for item in normalized]
+            self._event_signature = self._signature(self.path)
+            self._write_projection(normalized)
+            self._projection_pending = 0
 
     def load(self) -> list[Utterance]:
-        latest: dict[str, Utterance] = {}
-        if not self.path.exists():
-            return []
         with self._lock:
-            with self.path.open("r", encoding="utf-8") as handle:
-                for raw in handle:
-                    if not raw.strip():
-                        continue
-                    try:
-                        item = Utterance.from_dict(json.loads(raw))
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        continue
-                    key = self._same_segment_key(item)
-                    previous = latest.get(key)
-                    if previous is None or (item.revision, item.recognition_stage == "refined") >= (
-                        previous.revision,
-                        previous.recognition_stage == "refined",
-                    ):
-                        latest[key] = item
-        return [item for item in latest.values() if not item.deleted]
+            signature = self._signature(self.path)
+            if self._latest is None or signature != self._event_signature:
+                self._latest = self._load_from_disk_locked()
+                self._event_signature = signature
+                self._projection_pending = 0
+            return [Utterance.from_dict(item.to_dict()) for item in self._latest]
+
+    @staticmethod
+    def _signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
+    def _ensure_latest_locked(self) -> list[Utterance]:
+        signature = self._signature(self.path)
+        if self._latest is None or signature != self._event_signature:
+            self._latest = self._load_from_disk_locked()
+            self._event_signature = signature
+            self._projection_pending = 0
+        return self._latest
+
+    def _load_from_disk_locked(self) -> list[Utterance]:
+        event_path = self.path if self.path.is_file() else self.events_path
+        if not event_path.is_file():
+            if not self.projection_path.is_file():
+                return []
+            try:
+                payload = json.loads(self.projection_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return []
+            values = payload.get("paragraphs", []) if isinstance(payload, dict) else []
+            return [Utterance.from_dict(item) for item in values if isinstance(item, dict)]
+        latest: dict[str, Utterance] = {}
+        try:
+            lines = event_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or str(record.get("schema_version")) != self.schema_version:
+                continue
+            event_type = record.get("event_type")
+            if event_type == "replace_all":
+                latest = {
+                    item.segment_id: item
+                    for item in (
+                        Utterance.from_dict(value)
+                        for value in record.get("paragraphs", [])
+                        if isinstance(value, dict)
+                    )
+                }
+                continue
+            value = record.get("paragraph")
+            if not isinstance(value, dict):
+                continue
+            item = Utterance.from_dict(value)
+            if event_type == "delete":
+                latest.pop(item.segment_id, None)
+            else:
+                previous = latest.get(item.segment_id)
+                if previous is None or (item.revision, item.source_revision) >= (previous.revision, previous.source_revision):
+                    latest[item.segment_id] = self._normalize(item)
+        return sorted(latest.values(), key=lambda item: (item.start, item.end, item.id))
+
+    def _write_projection(self, items: list[Utterance]) -> None:
+        atomic_write_json(
+            self.projection_path,
+            {
+                "schema_version": self.schema_version,
+                "paragraphs": [self._normalize(item).to_dict() for item in sorted(items, key=lambda value: (value.start, value.end, value.id))],
+            },
+        )
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -123,7 +203,7 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 
 class LocalMeetingStore:
-    """Filesystem implementation used by Windows v2 and replaceable in enterprise deployments."""
+    """Filesystem store for schema 2 meetings; old state files are ignored."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -150,14 +230,9 @@ class LocalMeetingStore:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
-                # Older releases stored a different schema in timestamped
-                # directories (``state`` instead of ``recording_state``).
-                # Loading those files with v2 defaults turns an old
-                # recording into a new active meeting after every restart.
-                # A v2 state must identify the directory it lives in and
-                # carry the v2 recording state explicitly.
                 if (
                     isinstance(payload, dict)
+                    and payload.get("schema_version") == "2.0"
                     and str(payload.get("id", "")) == directory.name
                     and "recording_state" in payload
                 ):
@@ -188,10 +263,9 @@ class LocalMeetingStore:
                     state = json.loads(state_path.read_text(encoding="utf-8"))
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
-                if not isinstance(state, dict) or (
-                    state.get("recording_state") in {"starting", "recording", "finalizing"}
-                    or not state.get("ended_at")
-                ):
+                if not isinstance(state, dict) or state.get("schema_version") != "2.0":
+                    continue
+                if state.get("recording_state") in {"starting", "recording", "finalizing"} or not state.get("ended_at"):
                     continue
                 try:
                     ended_at = datetime.fromisoformat(str(state["ended_at"]).replace("Z", "+00:00"))

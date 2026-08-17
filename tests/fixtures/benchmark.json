@@ -1,20 +1,39 @@
 {
+  "schema_version": "2.0",
+  "recording_seconds": 12.0,
+  "translation_retries": 0,
   "samples": [
     {
       "duration_seconds": 2.0,
       "language": "zh",
+      "speech_variant": "mandarin",
       "text": "项目按计划推进",
       "hypothesis": "项目按计划推进"
     },
     {
       "duration_seconds": 2.5,
       "language": "en",
+      "speech_variant": "unknown",
       "text": "ship the beta friday",
       "hypothesis": "ship the beta friday",
       "translation": "周五发布测试版",
       "translation_hypothesis": "周五发布测试版"
+    },
+    {
+      "duration_seconds": 2.5,
+      "language": "zh",
+      "speech_variant": "cantonese_guangdong",
+      "text": "项目按计划推进",
+      "hypothesis": "项目按计划推进"
+    },
+    {
+      "duration_seconds": 2.5,
+      "language": "de",
+      "speech_variant": "unknown",
+      "text": "Das Beta wird am Freitag veröffentlicht",
+      "hypothesis": "Das Beta wird am Freitag veröffentlicht",
+      "translation": "测试版将在周五发布",
+      "translation_hypothesis": "测试版将在周五发布"
     }
-  ],
-  "diarization_reference": [],
-  "diarization_hypothesis": []
+  ]
 }

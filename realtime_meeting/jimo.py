@@ -14,8 +14,10 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
-from .models import TodoDocument, TodoItem, Utterance, utc_now_iso
+from .language import is_mixed_source_text
+from .models import TodoDocument, TodoItem, Utterance, speech_variant_label, utc_now_iso
 from .prompts import SUMMARY_SYSTEM_PROMPT, TODO_SYSTEM_PROMPT
+from .storage import TranscriptStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,10 +220,10 @@ class JimoClient:
 def paired_text(item: Utterance) -> str:
     translation = item.translation_zh.strip()
     source = item.text.strip()
-    speaker = f"演讲人{item.speaker_id}"
     label = {"zh": "中文", "en": "英文", "de": "德文"}.get(item.language, item.language)
-    original = f"[{item.start:.3f}-{item.end:.3f}] {speaker}（{label}）：{source}"
-    if translation and item.language != "zh":
+    variant = f"/{speech_variant_label(item.speech_variant)}" if item.speech_variant else ""
+    original = f"[{item.start:.3f}-{item.end:.3f}]（{label}{variant}）：{source}"
+    if translation and (item.language != "zh" or is_mixed_source_text(source)):
         return f"{original}\n[{item.start:.3f}-{item.end:.3f}] 中文翻译：{translation}"
     return original
 
@@ -231,21 +233,20 @@ def transcript_chunks(path: Path, max_chars: int) -> Iterator[tuple[int, float, 
     chars = 0
     index = 0
     start = end = 0.0
-    with path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            if not raw.strip():
-                continue
-            item = Utterance.from_dict(json.loads(raw))
-            pair = paired_text(item)
-            if lines and chars + len(pair) + 1 > max_chars:
-                index += 1
-                yield index, start, end, "\n".join(lines)
-                lines, chars = [], 0
-            if not lines:
-                start = item.start
-            lines.append(pair)
-            chars += len(pair) + 1
-            end = item.end
+    # transcript.jsonl is an append-only revision log.  Summaries must consume
+    # its latest schema-2 projection, otherwise every partial revision would be
+    # sent to Jimo as a duplicate paragraph.
+    for item in TranscriptStore(path).load():
+        pair = paired_text(item)
+        if lines and chars + len(pair) + 1 > max_chars:
+            index += 1
+            yield index, start, end, "\n".join(lines)
+            lines, chars = [], 0
+        if not lines:
+            start = item.start
+        lines.append(pair)
+        chars += len(pair) + 1
+        end = item.end
     if lines:
         index += 1
         yield index, start, end, "\n".join(lines)
@@ -284,7 +285,7 @@ class MeetingSummarizer:
                     await result
             marker = (
                 f"MODE=STATE_UPDATE\nMEETING_ID={meeting_id}\nCHUNK_INDEX={index}\nCHUNK_TOTAL={len(chunks)}\n"
-                f"TIME_RANGE={start:.3f}-{end:.3f}\n\n以下是本轮会议逐句记录：\n{text}\n\n"
+                f"TIME_RANGE={start:.3f}-{end:.3f}\n\n以下是本轮会议按语言/方言聚合的段落记录：\n{text}\n\n"
                 "请将本轮明确事实合并到会议状态中，只输出更新后的紧凑状态。"
             )
             messages = [{"role": "system", "content": SUMMARY_SYSTEM_PROMPT}]

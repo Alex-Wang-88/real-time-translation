@@ -3,20 +3,35 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
     <meta name="description" content="实时中文、英文、德文会议记录、翻译、会议纪要和行动项" />
     <title>会记 v2 · 实时会议记录</title>
-    <link rel="stylesheet" href="/static/styles.css?v=17" />
-    <link rel="stylesheet" href="/static/styles-fixes.css?v=5" />
+    <script>
+      (() => {
+        try {
+          const savedTheme = window.localStorage.getItem("realtime-meeting-theme");
+          document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/styles.css?v=21" />
+    <link rel="stylesheet" href="/static/styles-fixes.css?v=8" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
-          <div>
-            <h1>会记</h1>
+        <div class="sidebar-header">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div>
+              <h1>会记</h1>
+            </div>
           </div>
+          <button id="themeToggle" class="theme-toggle" type="button" aria-pressed="false" aria-label="切换到深色模式" title="切换到深色模式">
+            <span class="theme-toggle-icon" aria-hidden="true">☾</span>
+          </button>
         </div>
 
         <button id="newMeeting" class="primary-button full" type="button" disabled>＋ 新建会议</button>
@@ -48,7 +63,6 @@
           </div>
           <div class="topbar-actions">
             <span id="connectionBadge" class="badge neutral">服务检查中</span>
-            <button id="deleteMeeting" class="ghost-button danger" type="button" hidden>删除会议</button>
           </div>
         </header>
 
@@ -96,33 +110,18 @@
               </div>
               <div class="threshold-feedback"><output id="microphoneLevelValue">当前音量 --</output><span id="microphoneLevelStatus">等待麦克风</span></div>
               <span id="volumeThresholdHint" class="threshold-hint">彩色音量超过滑块位置时，当前声音才会被保留</span>
-              <div id="languageLockGroup" class="language-lock-group" role="group" aria-label="语言锁定">
-                <button type="button" class="language-lock-btn active" data-lang="zh">中文</button>
-                <button type="button" class="language-lock-btn" data-lang="en">英文</button>
-                <button type="button" class="language-lock-btn" data-lang="de">德文</button>
-              </div>
             </div>
           </div>
-
-          <section id="postprocessPanel" class="postprocess-panel panel-card" hidden>
-            <div class="panel-heading compact">
-              <div><h3>后台处理</h3><p id="postprocessMessage" class="muted">等待处理</p></div>
-              <span id="postprocessBadge" class="badge neutral">未开始</span>
-            </div>
-            <div class="postprocess-progress"><span id="postprocessProgressBar"></span></div>
-            <div id="postprocessStages" class="postprocess-stages"></div>
-            <div class="result-actions"><button id="retryPostprocess" class="text-button" type="button" hidden>重试后台处理</button></div>
-          </section>
 
           <div id="notice" class="notice" hidden role="alert"></div>
 
           <section class="transcript-panel panel-card">
             <div class="panel-heading">
-              <div><h3>实时逐句稿</h3></div>
-              <div class="panel-heading-meta"><span id="utteranceCount">0 条记录</span><button id="jumpLatest" class="text-button" type="button" hidden>回到最新</button></div>
+              <div><h3>实时转写</h3></div>
+              <div class="panel-heading-meta"><span id="utteranceCount">0 个段落</span><button id="jumpLatest" class="text-button" type="button" hidden>回到最新</button></div>
             </div>
             <div id="transcriptList" class="transcript-list" tabindex="0" aria-live="polite">
-              <div id="transcriptEmpty" class="content-empty"><span class="wave-mark"></span><p>开始说话后，原文和中文翻译会在这里逐句出现。</p></div>
+              <div id="transcriptEmpty" class="content-empty"><span class="wave-mark"></span><p>开始说话后，连续语音段落会在这里更新。</p></div>
             </div>
           </section>
         </section>
@@ -132,7 +131,7 @@
         <section class="result-card summary-card">
           <div class="panel-heading compact"><div><h3>会议纪要</h3></div><span id="summaryBadge" class="badge neutral">等待会议结束</span></div>
           <div id="summaryProgress" class="progress-line" hidden><span id="summaryProgressBar"></span></div>
-          <div id="summaryText" class="result-content empty-result">停止会议后会先自动完成 ASR 精修、说话人重排和翻译。</div>
+          <div id="summaryText" class="result-content empty-result">停止会议并完成翻译后，可以生成会议纪要。</div>
           <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>生成纪要和 To-do-list</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
         </section>
 
@@ -150,7 +149,7 @@
       </aside>
     </div>
 
-    <dialog id="newMeetingDialog" class="new-dialog">
+    <dialog id="newMeetingDialog" class="app-dialog new-dialog">
       <form method="dialog" id="newMeetingForm">
         <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
         <h3>新建会议</h3><p class="muted">创建后可以先调整输入设备和背景声过滤，再手动开始录音。</p>
@@ -158,64 +157,64 @@
         <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="dialogStart" class="primary-button" value="default" type="submit">创建会议 →</button></div>
       </form>
     </dialog>
-    <dialog id="asrSettingsDialog" class="settings-dialog">
+    <dialog id="renameMeetingDialog" class="app-dialog new-dialog">
+      <form method="dialog" id="renameMeetingForm">
+        <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
+        <h3>重命名会议</h3><p class="muted">修改后的名称会保存到本机，之后打开会议历史仍会保留。</p>
+        <label for="renameMeetingTitle">会议名称</label><input id="renameMeetingTitle" type="text" maxlength="200" placeholder="例如：客户方案评审" autocomplete="off" />
+        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="renameMeetingSubmit" class="primary-button" value="default" type="submit">保存名称</button></div>
+      </form>
+    </dialog>
+    <dialog id="confirmDialog" class="app-dialog action-dialog" aria-labelledby="confirmDialogTitle" aria-describedby="confirmDialogMessage">
+      <form method="dialog" id="confirmDialogForm">
+        <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
+        <div class="dialog-content">
+          <p class="dialog-eyebrow">确认操作</p>
+          <h3 id="confirmDialogTitle">确认操作</h3>
+          <p id="confirmDialogMessage" class="dialog-description"></p>
+        </div>
+        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="confirmDialogSubmit" class="danger-button" value="default" type="submit">确认</button></div>
+      </form>
+    </dialog>
+    <dialog id="authDialog" class="app-dialog action-dialog" aria-labelledby="authDialogTitle" aria-describedby="authDialogMessage">
+      <form method="dialog" id="authDialogForm">
+        <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
+        <div class="dialog-content">
+          <p class="dialog-eyebrow">SECURE ACCESS</p>
+          <h3 id="authDialogTitle">需要访问令牌</h3>
+          <p id="authDialogMessage" class="dialog-description">此会议服务需要访问令牌才能继续。</p>
+          <label for="authToken">访问令牌</label><input id="authToken" type="password" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">取消</button><button id="authDialogSubmit" class="primary-button" value="default" type="submit">继续</button></div>
+      </form>
+    </dialog>
+    <dialog id="asrSettingsDialog" class="app-dialog settings-dialog">
       <form method="dialog" id="asrSettingsForm">
         <button class="dialog-close" value="cancel" type="submit" aria-label="关闭">×</button>
         <div class="settings-dialog-content">
           <p class="settings-eyebrow">ASR CONTROL</p>
           <h3>录音与识别设置</h3>
-          <p class="muted settings-intro">普通设置适合日常调节，高级设置用于控制识别质量、翻译和说话人处理。所有参数只对当前会议生效，录音开始后锁定。</p>
-          <div class="settings-template-picker">
-            <div class="settings-template-heading">
-              <label for="settingsTemplateSelect">参数模板</label>
-              <span id="settingsTemplateHint" class="settings-template-status">预设模板</span>
+          <p class="muted settings-intro">模型、分段和录音保留等参数只对当前会议生效；录音开始后锁定，音频输入可即时调整。</p>
+          <div class="settings-model-picker">
+            <div class="settings-model-heading">
+              <label for="realtimeAsrModel">实时识别架构</label>
+              <span class="settings-model-status">录音前选择</span>
             </div>
-            <select id="settingsTemplateSelect" aria-label="参数模板">
-              <option value="balanced">均衡实时</option>
-              <option value="low_latency">低延迟速记</option>
-              <option value="quality">高质量会议</option>
-              <option value="custom" disabled>自定义模板（手动调整）</option>
+            <select id="realtimeAsrModel" aria-label="实时识别架构">
+              <option value="primary">大+小千问 · 质量优先</option>
+              <option value="small">小千问主识别 · 低延迟</option>
             </select>
-            <small>切换模板会覆盖当前未保存的设置；手动修改任一参数后会变为自定义模板。</small>
+            <small>大+小千问：1.7B 负责实时识别，0.6B 负责语言/方言判断并作兜底；小千问主识别：0.6B 负责实时识别，异常时由 1.7B 兜底。两种架构都会使用 0.6B 做语言/方言判断。</small>
           </div>
-          <div class="settings-tabs" role="tablist" aria-label="设置级别">
-            <button id="settingsBasicTab" class="settings-tab active" type="button" role="tab" aria-selected="true" aria-controls="settingsBasicPanel" data-settings-tab="basic">普通设置</button>
-            <button id="settingsAdvancedTab" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settingsAdvancedPanel" data-settings-tab="advanced">高级设置</button>
-          </div>
-          <section id="settingsBasicPanel" class="settings-panel" role="tabpanel" aria-labelledby="settingsBasicTab" data-settings-panel="basic">
+          <section id="settingsPanel" class="settings-panel">
             <section id="settingsAudioSection" class="settings-audio-section">
               <div class="settings-section-heading"><strong>音频输入</strong><small>设备和环境音滑块会立即应用。</small></div>
             </section>
             <div class="settings-fields">
-              <label class="settings-range" for="asrSpeechStartMs">
-                <span class="settings-range-heading"><span>开始识别前连续语音</span><span class="settings-number-control"><input id="asrSpeechStartMsValue" class="settings-number-input" type="number" min="40" max="1000" step="10" value="80" aria-label="开始识别前连续语音数值" /><span class="settings-unit">ms</span></span></span>
-                <input id="asrSpeechStartMs" class="settings-slider threshold-slider" type="range" min="40" max="1000" step="10" value="80" aria-describedby="asrSpeechStartMsHint" />
-                <small id="asrSpeechStartMsHint">连续达到这个时长才开始识别，调高可以过滤短促噪声。</small>
-              </label>
-              <label class="settings-range" for="asrAudioPreRollMs">
-                <span class="settings-range-heading"><span>语音前置缓冲</span><span class="settings-number-control"><input id="asrAudioPreRollMsValue" class="settings-number-input" type="number" min="40" max="1000" step="10" value="240" aria-label="语音前置缓冲数值" /><span class="settings-unit">ms</span></span></span>
-                <input id="asrAudioPreRollMs" class="settings-slider threshold-slider" type="range" min="40" max="1000" step="10" value="240" aria-describedby="asrAudioPreRollMsHint" />
-                <small id="asrAudioPreRollMsHint">保留说话开始前的声音，避免句首被切掉。</small>
-              </label>
               <label class="settings-range" for="asrSilenceMs">
                 <span class="settings-range-heading"><span>静音结束阈值</span><span class="settings-number-control"><input id="asrSilenceMsValue" class="settings-number-input" type="number" min="160" max="2000" step="10" value="700" aria-label="静音结束阈值数值" /><span class="settings-unit">ms</span></span></span>
                 <input id="asrSilenceMs" class="settings-slider threshold-slider" type="range" min="160" max="2000" step="10" value="700" aria-describedby="asrSilenceHint" />
                 <small id="asrSilenceHint">检测到静音后等待多久再切句。调高能减少一句话被切碎，但会增加出字等待。</small>
-              </label>
-              <label class="settings-range" for="asrMinimumSpeechMs">
-                <span class="settings-range-heading"><span>最短有效语音</span><span class="settings-number-control"><input id="asrMinimumSpeechMsValue" class="settings-number-input" type="number" min="0" max="2000" step="10" value="450" aria-label="最短有效语音数值" /><span class="settings-unit">ms</span></span></span>
-                <input id="asrMinimumSpeechMs" class="settings-slider threshold-slider" type="range" min="0" max="2000" step="10" value="450" aria-describedby="asrMinimumSpeechHint" />
-                <small id="asrMinimumSpeechHint">太短的声音会被视为噪声，调高可减少误触发。</small>
-              </label>
-              <label class="settings-range" for="asrSpeechRatio">
-                <span class="settings-range-heading"><span>有效语音比例</span><span class="settings-number-control"><input id="asrSpeechRatioValue" class="settings-number-input" type="number" min="0" max="1" step="0.01" value="0.12" aria-label="有效语音比例数值" /></span></span>
-                <input id="asrSpeechRatio" class="settings-slider threshold-slider" type="range" min="0" max="1" step="0.01" value="0.12" aria-describedby="asrSpeechRatioHint" />
-                <small id="asrSpeechRatioHint">一个语音片段中至少有多少比例被判断为有效语音。</small>
-              </label>
-              <label class="settings-range" for="asrMaxUtteranceSeconds">
-                <span class="settings-range-heading"><span>最长连续语音</span><span class="settings-number-control"><input id="asrMaxUtteranceSecondsValue" class="settings-number-input" type="number" min="2" max="12" step="0.5" value="8" aria-label="最长连续语音数值" /><span class="settings-unit">秒</span></span></span>
-                <input id="asrMaxUtteranceSeconds" class="settings-slider threshold-slider" type="range" min="2" max="12" step="0.5" value="8" aria-describedby="asrMaxUtteranceSecondsHint" />
-                <small id="asrMaxUtteranceSecondsHint">一段连续发言的最长长度，适合控制长句延迟。</small>
               </label>
               <label class="settings-range" for="asrPartialIntervalMs">
                 <span class="settings-range-heading"><span>实时识别刷新间隔</span><span class="settings-number-control"><input id="asrPartialIntervalMsValue" class="settings-number-input" type="number" min="100" max="5000" step="50" value="900" aria-label="实时识别刷新间隔数值" /><span class="settings-unit">ms</span></span></span>
@@ -223,67 +222,17 @@
                 <small id="asrPartialIntervalMsHint">草稿更新频率，调低更及时但会增加识别负载。</small>
               </label>
             </div>
-          </section>
-          <section id="settingsAdvancedPanel" class="settings-panel" role="tabpanel" aria-labelledby="settingsAdvancedTab" data-settings-panel="advanced" hidden>
-            <div class="settings-panel-heading"><strong>识别质量</strong><small>调高质量通常会增加耗时和算力。</small></div>
+            <div class="settings-panel-heading"><strong>录音分段</strong><small>只调整音频分段和录音保留方式。</small></div>
             <div class="settings-fields">
               <label class="settings-range" for="audioSegmentMinutes"><span class="settings-range-heading"><span>录音分段长度</span><span class="settings-number-control"><input id="audioSegmentMinutesValue" class="settings-number-input" type="number" min="1" max="120" step="1" value="30" aria-label="录音分段长度数值" /><span class="settings-unit">分钟</span></span></span><input id="audioSegmentMinutes" class="settings-slider threshold-slider" type="range" min="1" max="120" step="1" value="30" /></label>
-              <label class="settings-range" for="asrRealtimeBeamSize">
-                <span class="settings-range-heading"><span>实时 beam size</span><span class="settings-number-control"><input id="asrRealtimeBeamSizeValue" class="settings-number-input" type="number" min="1" max="10" step="1" value="5" aria-label="实时 beam size 数值" /></span></span>
-                <input id="asrRealtimeBeamSize" class="settings-slider threshold-slider" type="range" min="1" max="10" step="1" value="5" aria-describedby="asrRealtimeBeamHint" />
-                <small id="asrRealtimeBeamHint">实时识别的搜索宽度。</small>
-              </label>
-              <label class="settings-range" for="asrRefineBeamSize">
-                <span class="settings-range-heading"><span>会后精修 beam size</span><span class="settings-number-control"><input id="asrRefineBeamSizeValue" class="settings-number-input" type="number" min="1" max="12" step="1" value="6" aria-label="会后精修 beam size 数值" /></span></span>
-                <input id="asrRefineBeamSize" class="settings-slider threshold-slider" type="range" min="1" max="12" step="1" value="6" aria-describedby="asrRefineBeamHint" />
-                <small id="asrRefineBeamHint">录音结束后的精修搜索宽度。</small>
-              </label>
-              <label class="settings-range" for="asrBestOf">
-                <span class="settings-range-heading"><span>候选数量 best_of</span><span class="settings-number-control"><input id="asrBestOfValue" class="settings-number-input" type="number" min="1" max="12" step="1" value="5" aria-label="best_of 数值" /></span></span>
-                <input id="asrBestOf" class="settings-slider threshold-slider" type="range" min="1" max="12" step="1" value="5" aria-describedby="asrBestOfHint" />
-                <small id="asrBestOfHint">候选结果数量，适合处理口音和噪声。</small>
-              </label>
-              <label class="settings-range" for="asrRetryTemperature">
-                <span class="settings-range-heading"><span>低质量重试温度</span><span class="settings-number-control"><input id="asrRetryTemperatureValue" class="settings-number-input" type="number" min="0" max="1" step="0.05" value="0.2" aria-label="低质量重试温度数值" /></span></span>
-                <input id="asrRetryTemperature" class="settings-slider threshold-slider" type="range" min="0" max="1" step="0.05" value="0.2" aria-describedby="asrRetryTemperatureHint" />
-                <small id="asrRetryTemperatureHint">识别结果质量不足时的第二次采样温度。</small>
-              </label>
-              <label class="settings-range" for="asrLogProbThreshold">
-                <span class="settings-range-heading"><span>平均置信度阈值</span><span class="settings-number-control"><input id="asrLogProbThresholdValue" class="settings-number-input" type="number" min="-10" max="0" step="0.1" value="-1" aria-label="平均置信度阈值数值" /></span></span>
-                <input id="asrLogProbThreshold" class="settings-slider threshold-slider" type="range" min="-10" max="0" step="0.1" value="-1" aria-describedby="asrLogProbThresholdHint" />
-                <small id="asrLogProbThresholdHint">低于该值会触发重试或丢弃低质量结果。</small>
-              </label>
-              <label class="settings-range" for="asrNoSpeechThreshold">
-                <span class="settings-range-heading"><span>无语音概率阈值</span><span class="settings-number-control"><input id="asrNoSpeechThresholdValue" class="settings-number-input" type="number" min="0" max="1" step="0.01" value="0.6" aria-label="无语音概率阈值数值" /></span></span>
-                <input id="asrNoSpeechThreshold" class="settings-slider threshold-slider" type="range" min="0" max="1" step="0.01" value="0.6" aria-describedby="asrNoSpeechThresholdHint" />
-                <small id="asrNoSpeechThresholdHint">用于过滤无语音或背景噪声幻觉。</small>
-              </label>
-              <label class="settings-range" for="asrCompressionRatioThreshold">
-                <span class="settings-range-heading"><span>重复压缩比阈值</span><span class="settings-number-control"><input id="asrCompressionRatioThresholdValue" class="settings-number-input" type="number" min="1" max="10" step="0.1" value="2.4" aria-label="重复压缩比阈值数值" /></span></span>
-                <input id="asrCompressionRatioThreshold" class="settings-slider threshold-slider" type="range" min="1" max="10" step="0.1" value="2.4" aria-describedby="asrCompressionRatioThresholdHint" />
-                <small id="asrCompressionRatioThresholdHint">识别文本重复度过高时触发质量保护。</small>
-              </label>
             </div>
-            <div class="settings-panel-heading"><strong>翻译与说话人</strong><small>只影响本会议的实时翻译和说话人重排。</small></div>
+            <div class="settings-panel-heading"><strong>录音保留</strong><small>控制本次会议结束后是否保留音频文件。</small></div>
             <div class="settings-fields">
-              <label class="settings-range" for="translationBeamSize"><span class="settings-range-heading"><span>翻译 beam size</span><span class="settings-number-control"><input id="translationBeamSizeValue" class="settings-number-input" type="number" min="1" max="8" step="1" value="2" aria-label="翻译 beam size 数值" /></span></span><input id="translationBeamSize" class="settings-slider threshold-slider" type="range" min="1" max="8" step="1" value="2" /></label>
-              <label class="settings-range" for="translationMaxLength"><span class="settings-range-heading"><span>翻译最大解码长度</span><span class="settings-number-control"><input id="translationMaxLengthValue" class="settings-number-input" type="number" min="64" max="1024" step="16" value="384" aria-label="翻译最大解码长度数值" /></span></span><input id="translationMaxLength" class="settings-slider threshold-slider" type="range" min="64" max="1024" step="16" value="384" /></label>
-              <label class="settings-range" for="translationRepetitionPenalty"><span class="settings-range-heading"><span>翻译重复惩罚</span><span class="settings-number-control"><input id="translationRepetitionPenaltyValue" class="settings-number-input" type="number" min="1" max="2" step="0.01" value="1.05" aria-label="翻译重复惩罚数值" /></span></span><input id="translationRepetitionPenalty" class="settings-slider threshold-slider" type="range" min="1" max="2" step="0.01" value="1.05" /></label>
-              <label class="settings-range" for="speakerClusterThreshold"><span class="settings-range-heading"><span>说话人区分阈值</span><span class="settings-number-control"><input id="speakerClusterThresholdValue" class="settings-number-input" type="number" min="0.4" max="0.95" step="0.01" value="0.68" aria-label="说话人区分阈值数值" /></span></span><input id="speakerClusterThreshold" class="settings-slider threshold-slider" type="range" min="0.4" max="0.95" step="0.01" value="0.68" /></label>
-              <label class="settings-range" for="speakerMinSpeech"><span class="settings-range-heading"><span>说话人最短语音</span><span class="settings-number-control"><input id="speakerMinSpeechValue" class="settings-number-input" type="number" min="0.2" max="2" step="0.05" value="0.35" aria-label="说话人最短语音数值" /><span class="settings-unit">秒</span></span></span><input id="speakerMinSpeech" class="settings-slider threshold-slider" type="range" min="0.2" max="2" step="0.05" value="0.35" /></label>
-              <label class="settings-range" for="speakerMaxGap"><span class="settings-range-heading"><span>说话人最大静音间隔</span><span class="settings-number-control"><input id="speakerMaxGapValue" class="settings-number-input" type="number" min="0.05" max="1" step="0.05" value="0.25" aria-label="说话人最大静音间隔数值" /><span class="settings-unit">秒</span></span></span><input id="speakerMaxGap" class="settings-slider threshold-slider" type="range" min="0.05" max="1" step="0.05" value="0.25" /></label>
-              <label class="settings-range" for="speakerOverlap"><span class="settings-range-heading"><span>重叠说话人纳入比例</span><span class="settings-number-control"><input id="speakerOverlapValue" class="settings-number-input" type="number" min="0" max="1" step="0.01" value="0.15" aria-label="重叠说话人纳入比例数值" /></span></span><input id="speakerOverlap" class="settings-slider threshold-slider" type="range" min="0" max="1" step="0.01" value="0.15" /></label>
-            </div>
-            <div class="settings-panel-heading"><strong>处理策略</strong><small>关闭后可减少处理时间，但会少一个结果阶段。</small></div>
-            <div class="settings-toggle-grid">
-              <label class="settings-toggle"><input id="settingEnableRefinement" type="checkbox" checked /><span><strong>启用会后精修</strong><small>录音结束后重新识别，提升最终文本质量。</small></span></label>
-              <label class="settings-toggle"><input id="settingEnablePostprocess" type="checkbox" checked /><span><strong>启用后台处理</strong><small>执行精修、说话人重排和翻译阶段。</small></span></label>
-              <label class="settings-toggle"><input id="settingDiarizationRequired" type="checkbox" checked /><span><strong>启用说话人重排</strong><small>按声音特征区分匿名说话人。</small></span></label>
               <label class="settings-toggle"><input id="settingKeepAudio" type="checkbox" checked /><span><strong>保留会议录音</strong><small>保留本地音频文件，便于复核和重试。</small></span></label>
             </div>
-            <p class="settings-note">模型名称、计算设备、模型下载策略和 Jimo 纪要/To-do 接口属于服务级配置，不会被会议模板覆盖；修改它们需要在部署配置中调整并重启服务。</p>
+            <p class="settings-note">计算设备、模型下载策略和 Jimo 纪要/To-do 接口属于服务级配置；实时识别架构可在上方按本次会议选择。</p>
           </section>
-          <p id="asrSettingsNotice" class="settings-note">推荐值适合中文会议和实时识别；音频输入调整会立即应用，识别参数需要点击“保存设置”。</p>
+          <p id="asrSettingsNotice" class="settings-note">推荐值适合中文会议和实时识别；可调整识别架构、静音结束阈值和刷新间隔。</p>
         </div>
         <div class="dialog-actions">
           <button id="resetAsrSettings" class="text-button" type="button">恢复推荐值</button>
@@ -292,6 +241,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="/static/app.js?v=19"></script>
+    <script type="module" src="/static/app.js?v=29"></script>
   </body>
 </html>

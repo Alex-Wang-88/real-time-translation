@@ -6,8 +6,9 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     this.packetSamples = opts.packetSamples || 640;
     this.inputRate = sampleRate;
     this.output = [];
-    this.resampleInput = [];
-    this.resamplePosition = 0;
+    this.filterRadius = 12;
+    this.resampleInput = new Array(this.filterRadius).fill(0);
+    this.resamplePosition = this.filterRadius;
     this.sequence = 0;
     this.thresholdPercent = Number(opts.thresholdPercent) || 0;
     this.thresholdRms = 0;
@@ -24,6 +25,26 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     this.thresholdRms = value / 100 / 3;
   }
 
+  resampleAt(position) {
+    const center = Math.floor(position);
+    const cutoff = Math.min(1, this.targetRate / this.inputRate) * 0.94;
+    let weighted = 0;
+    let weightSum = 0;
+    for (let tap = -this.filterRadius + 1; tap <= this.filterRadius; tap += 1) {
+      const index = center + tap;
+      if (index < 0 || index >= this.resampleInput.length) continue;
+      const distance = index - position;
+      if (Math.abs(distance) >= this.filterRadius) continue;
+      const scaled = Math.PI * distance * cutoff;
+      const sinc = Math.abs(scaled) < 1e-8 ? 1 : Math.sin(scaled) / scaled;
+      const window = 0.5 + 0.5 * Math.cos(Math.PI * distance / this.filterRadius);
+      const weight = cutoff * sinc * window;
+      weighted += this.resampleInput[index] * weight;
+      weightSum += weight;
+    }
+    return weightSum ? weighted / weightSum : 0;
+  }
+
   process(inputs) {
     const channels = inputs[0];
     if (!channels || !channels.length || !channels[0].length) return true;
@@ -36,30 +57,24 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     let sum = 0;
     for (const value of mono) sum += value * value;
     this.port.postMessage({ type: "level", value: Math.min(1, Math.sqrt(sum / Math.max(1, mono.length)) * 3) });
-    const ratio = this.inputRate / this.targetRate;
-    this.resampleInput.push(...mono);
-    while (this.resamplePosition + 1 < this.resampleInput.length) {
-      const position = this.resamplePosition;
-      const left = Math.floor(position);
-      const right = left + 1;
-      const fraction = position - left;
-      const sample = this.resampleInput[left] * (1 - fraction) + this.resampleInput[right] * fraction;
-      this.output.push(Math.max(-1, Math.min(1, sample)));
-      this.resamplePosition += ratio;
+    if (this.inputRate === this.targetRate) {
+      this.output.push(...mono);
+    } else {
+      const ratio = this.inputRate / this.targetRate;
+      this.resampleInput.push(...mono);
+      while (this.resamplePosition + this.filterRadius < this.resampleInput.length) {
+        const sample = this.resampleAt(this.resamplePosition);
+        this.output.push(Math.max(-1, Math.min(1, sample)));
+        this.resamplePosition += ratio;
+      }
     }
-    const consumed = Math.floor(this.resamplePosition);
-    if (consumed) {
+    const consumed = Math.max(0, Math.floor(this.resamplePosition) - this.filterRadius);
+    if (this.inputRate !== this.targetRate && consumed) {
       this.resampleInput.splice(0, consumed);
       this.resamplePosition -= consumed;
     }
     while (this.output.length >= this.packetSamples) {
       const packet = this.output.splice(0, this.packetSamples);
-      if (this.thresholdRms > 0) {
-        let packetSum = 0;
-        for (const value of packet) packetSum += value * value;
-        const packetRms = Math.sqrt(packetSum / Math.max(1, packet.length));
-        if (packetRms < this.thresholdRms) packet.fill(0);
-      }
       const pcm = new ArrayBuffer(4 + packet.length * 2);
       const view = new DataView(pcm);
       view.setUint32(0, this.sequence, true);

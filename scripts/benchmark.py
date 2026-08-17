@@ -1,3 +1,5 @@
+"""Dependency-free regression metrics for paragraph-based meeting output."""
+
 from __future__ import annotations
 
 import argparse
@@ -36,7 +38,7 @@ def error_rate(reference: str, hypothesis: str) -> float:
 
 
 def chrf(reference: str, hypothesis: str, order: int = 6) -> float:
-    """Small dependency-free chrF approximation for regression comparisons."""
+    """Small dependency-free character overlap metric for regressions."""
     ref = str(reference or "")
     hyp = str(hypothesis or "")
     scores: list[float] = []
@@ -50,39 +52,6 @@ def chrf(reference: str, hypothesis: str, order: int = 6) -> float:
         else:
             scores.append(len(ref_ngrams & hyp_ngrams) / len(ref_ngrams | hyp_ngrams))
     return sum(scores) / max(1, len(scores))
-
-
-def diarization_scores(reference: list[dict[str, Any]], hypothesis: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return a deterministic interval-overlap baseline for DER/JER fixtures."""
-    if not reference:
-        return {"der": 0.0 if not hypothesis else 1.0, "jer": 0.0 if not hypothesis else 1.0, "label_stability": None}
-    total = sum(max(0.0, float(item["end"]) - float(item["start"])) for item in reference)
-    missed = 0.0
-    false_alarm = 0.0
-    confusion = 0.0
-    matched_labels: dict[str, str] = {}
-    for ref in reference:
-        ref_start, ref_end = float(ref["start"]), float(ref["end"])
-        ref_duration = max(0.0, ref_end - ref_start)
-        overlaps = []
-        for hyp in hypothesis:
-            overlap = max(0.0, min(ref_end, float(hyp["end"])) - max(ref_start, float(hyp["start"])))
-            if overlap:
-                overlaps.append((overlap, str(hyp.get("speaker", "unknown"))))
-        if not overlaps:
-            missed += ref_duration
-            continue
-        overlap, label = max(overlaps)
-        confusion += max(0.0, ref_duration - overlap)
-        ref_label = str(ref.get("speaker", "unknown"))
-        matched_labels.setdefault(ref_label, label)
-    for hyp in hypothesis:
-        hyp_start, hyp_end = float(hyp["start"]), float(hyp["end"])
-        hyp_duration = max(0.0, hyp_end - hyp_start)
-        covered = sum(max(0.0, min(hyp_end, float(ref["end"])) - max(hyp_start, float(ref["start"]))) for ref in reference)
-        false_alarm += max(0.0, hyp_duration - min(hyp_duration, covered))
-    der = (missed + false_alarm + confusion) / max(1e-6, total)
-    return {"der": round(der, 6), "jer": round(der, 6), "label_stability": round(sum(1 for key, value in matched_labels.items() if key == value) / max(1, len(matched_labels)), 6)}
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -99,6 +68,7 @@ def run_benchmark(dataset_path: Path, recognizer: Any | None = None, translator:
         dataset = json.loads(raw)
     except json.JSONDecodeError:
         dataset = [json.loads(line) for line in raw.splitlines() if line.strip()]
+
     samples = dataset.get("samples", dataset) if isinstance(dataset, dict) else dataset
     asr_rates: list[float] = []
     translation_scores: list[float] = []
@@ -109,8 +79,7 @@ def run_benchmark(dataset_path: Path, recognizer: Any | None = None, translator:
         hypothesis = str(sample.get("hypothesis", ""))
         if recognizer is not None and sample.get("audio"):
             hypothesis = str(recognizer(sample["audio"]))
-        elapsed = time.perf_counter() - started
-        latencies.append(elapsed * 1000)
+        latencies.append((time.perf_counter() - started) * 1000)
         audio_seconds += float(sample.get("duration_seconds", 0.0) or 0.0)
         asr_rates.append(error_rate(str(sample.get("text", "")), hypothesis))
         reference_translation = sample.get("translation")
@@ -119,25 +88,31 @@ def run_benchmark(dataset_path: Path, recognizer: Any | None = None, translator:
             if translator is not None and hypothesis:
                 translated = str(translator(hypothesis, sample.get("language", "en")))
             translation_scores.append(chrf(str(reference_translation), translated))
-    diarization = diarization_scores(dataset.get("diarization_reference", []), dataset.get("diarization_hypothesis", [])) if isinstance(dataset, dict) else diarization_scores([], [])
-    total_seconds = sum(latencies) / 1000
-    return {
+
+    elapsed_seconds = sum(latencies) / 1000
+    report: dict[str, Any] = {
+        "schema_version": "2.0",
         "samples": len(samples),
         "asr": {"wer_or_cer_mean": round(statistics.mean(asr_rates), 6) if asr_rates else None},
         "translation": {"chrf_mean": round(statistics.mean(translation_scores), 6) if translation_scores else None},
         "latency_ms": {"p50": percentile(latencies, 0.5), "p95": percentile(latencies, 0.95)},
-        "rtf": round(total_seconds / audio_seconds, 6) if audio_seconds else None,
-        "diarization": diarization,
-        "flow": {
-            "save_seconds": dataset.get("save_seconds") if isinstance(dataset, dict) else None,
-            "postprocess_stage_seconds": dataset.get("postprocess_stage_seconds", {}) if isinstance(dataset, dict) else {},
+        "rtf": round(elapsed_seconds / audio_seconds, 6) if audio_seconds else None,
+        "paragraphs": {
+            "count": len(samples),
+            "languages": sorted({str(sample.get("language", "unknown")) for sample in samples}),
+            "variants": sorted({str(sample.get("speech_variant", "unknown")) for sample in samples}),
         },
-        "note": "WER/CER uses whitespace tokens for Latin text and character tokens for CJK text; add DER/JER fields from diarization fixtures when available.",
+        "flow": {
+            "recording_seconds": dataset.get("recording_seconds") if isinstance(dataset, dict) else None,
+            "translation_retries": dataset.get("translation_retries", 0) if isinstance(dataset, dict) else 0,
+        },
+        "note": "WER/CER uses whitespace tokens for Latin text and character tokens for CJK text; paragraph_count is measured from the fixed fixture.",
     }
+    return report
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run reproducible meeting model regression metrics")
+    parser = argparse.ArgumentParser(description="Run paragraph-based meeting model regression metrics")
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
