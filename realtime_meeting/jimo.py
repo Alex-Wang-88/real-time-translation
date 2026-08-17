@@ -427,7 +427,23 @@ class TodoGenerator:
     ) -> TodoDocument:
         if not minutes.strip():
             raise ValueError("会议纪要为空，无法生成 To-do-list")
-        message = f"MEETING_ID={meeting_id}\nSUMMARY_REVISION={summary_revision}\n\n以下是完整会议纪要：\n{minutes}\n\n请只输出符合要求的 JSON。"
+        prefix = f"MEETING_ID={meeting_id}\nSUMMARY_REVISION={summary_revision}\n\n以下是完整会议纪要：\n"
+        suffix = "\n\n请只输出符合要求的 JSON。"
+        budget = self.settings.jimo_max_request_chars - len(TODO_SYSTEM_PROMPT) - len(prefix) - len(suffix)
+        if budget <= 0:
+            raise ValueError("Jimo 请求上限不足以容纳 To-do-list 提示词")
+        source = minutes.strip()
+        if len(source) > budget:
+            marker = "\n\n[会议纪要中段因请求长度上限省略]\n\n"
+            if len(marker) >= budget:
+                source = source[:budget]
+            else:
+                remaining = budget - len(marker)
+                head = (remaining + 1) // 2
+                tail_length = remaining - head
+                tail = source[-tail_length:] if tail_length else ""
+                source = source[:head] + marker + tail
+        message = prefix + source + suffix
         if on_status:
             result = on_status("request")
             if asyncio.iscoroutine(result):

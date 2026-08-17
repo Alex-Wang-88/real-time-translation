@@ -34,6 +34,23 @@ def _float(name: str, default: float, minimum: float | None = None) -> float:
     return max(minimum, value) if minimum is not None else value
 
 
+RECOGNITION_ARCHITECTURES: dict[str, dict[str, str]] = {
+    "single_1_7b_no_lid": {
+        "label": "默认：单 1.7B，分段级同模确认",
+        "policy": "识别、语言确认和冲突重识别统一使用 1.7B；同一语音段只做一次语言探测，不加载第二个 ASR 模型。",
+    },
+}
+DEFAULT_RECOGNITION_ARCHITECTURE = "single_1_7b_no_lid"
+
+
+def normalize_recognition_architecture(value: object, default: str = DEFAULT_RECOGNITION_ARCHITECTURE) -> str:
+    requested = str(value or "").strip().casefold()
+    if requested in RECOGNITION_ARCHITECTURES:
+        return requested
+    fallback = str(default or DEFAULT_RECOGNITION_ARCHITECTURE).strip().casefold()
+    return fallback if fallback in RECOGNITION_ARCHITECTURES else DEFAULT_RECOGNITION_ARCHITECTURE
+
+
 @dataclass(slots=True)
 class Settings:
     host: str = "127.0.0.1"
@@ -41,33 +58,58 @@ class Settings:
     api_token: str = ""
     device: str = "auto"
     asr_primary: str = "Qwen/Qwen3-ASR-1.7B"
-    asr_fallback: str = "Qwen/Qwen3-ASR-0.6B"
-    language_id_model: str = "Qwen/Qwen3-ASR-0.6B"
+    single_asr_model: bool = True
+    asr_fallback: str = "Qwen/Qwen3-ASR-1.7B"
+    language_id_model: str = "Qwen/Qwen3-ASR-1.7B"
+    # The application currently exposes one strategy only.  The legacy model
+    # fields below remain for benchmark compatibility, while production
+    # defaults route every ASR/LID role to the same 1.7B checkpoint.
+    recognition_architecture: str = DEFAULT_RECOGNITION_ARCHITECTURE
     asr_autodownload: bool = True
     vad_model: str = "fsmn-vad"
     translation_model_root: Path = Path("models/opus-mt")
-    translation_autodownload: bool = True
+    # Translation is local-only by default.  Enabling this only affects the
+    # explicit startup preflight, never a live translation request.
+    translation_autodownload: bool = False
     results_dir: Path = Path("result/meetings")
     audio_segment_minutes: int = 30
     max_utterance_seconds: float = 12.0
-    audio_pre_roll_ms: int = 400
+    audio_pre_roll_ms: int = 500
     speech_start_ms: int = 80
-    silence_ms: int = 850
+    silence_ms: int = 950
     vad_minimum_rms: float = 109.23
     vad_minimum_speech_ms: int = 200
     vad_minimum_speech_ratio: float = 0.06
-    partial_interval_ms: int = 800
-    language_id_min_seconds: float = 0.8
-    language_conflict_confirmations: int = 2
+    partial_interval_ms: int = 1000
+    language_id_min_seconds: float = 1.0
+    language_conflict_confirmations: int = 3
+    language_id_on_segment: bool = True
+    language_id_on_conflict: bool = True
+    language_switch_window_ms: int = 800
+    language_switch_max_wait_ms: int = 1800
     stable_prefix_min_chars: int = 8
     max_audio_packet_bytes: int = 262_144
     max_recording_seconds: float = 4 * 60 * 60
     audio_ingest_burst_seconds: float = 5.0
     inference_queue_size: int = 64
     translation_queue_size: int = 64
+    # Backend-only rollback switch.  The default keeps the segmented,
+    # coalescing pipeline enabled without changing the WebSocket contract.
+    realtime_pipeline: bool = True
     audio_drain_timeout_seconds: float = 3.0
     asr_timeout_seconds: float = 45.0
     translation_timeout_seconds: float = 90.0
+    translation_deadline_seconds: float = 4.5
+    translation_warmup: bool = True
+    translation_partial_debounce_ms: int = 250
+    # Automatic local post-meeting retranscription/retranslation is opt-in.
+    # A future higher-quality external translation agent can be requested
+    # explicitly without adding another resident local model.
+    post_meeting_translation_enabled: bool = False
+    post_meeting_translation_quality_threshold: float = 0.62
+    post_meeting_translation_context_paragraphs: int = 2
+    post_meeting_translation_context_chars: int = 240
+    post_meeting_translation_timeout_seconds: float = 180.0
     queue_join_timeout_seconds: float = 120.0
     websocket_send_timeout_seconds: float = 5.0
     max_active_meetings: int = 1
@@ -173,7 +215,8 @@ def default_meeting_settings(settings: Settings) -> dict[str, Any]:
         "vad_minimum_speech_ratio": settings.vad_minimum_speech_ratio,
         "max_utterance_seconds": settings.max_utterance_seconds,
         "partial_interval_ms": settings.partial_interval_ms,
-        "realtime_asr_model": "primary",
+        "realtime_asr_model": "primary",  # legacy field; the only active strategy always uses 1.7B
+        "recognition_architecture": normalize_recognition_architecture(settings.recognition_architecture),
         "audio_segment_minutes": settings.audio_segment_minutes,
         "translation_beam_size": 2,
         "translation_max_decoding_length": 384,
@@ -217,12 +260,16 @@ def normalize_meeting_settings(values: object, settings: Settings) -> dict[str, 
     requested_model = str(source.get("realtime_asr_model", defaults["realtime_asr_model"]) or "").strip().casefold()
     primary_model = str(settings.asr_primary or "").strip().casefold()
     fallback_model = str(settings.asr_fallback or "").strip().casefold()
-    if requested_model in {"small", "fallback", "0.6b", fallback_model}:
+    if not getattr(settings, "single_asr_model", True) and requested_model in {"small", "fallback", "0.6b", fallback_model}:
         normalized["realtime_asr_model"] = "small"
     elif requested_model in {"primary", "1.7b", primary_model}:
         normalized["realtime_asr_model"] = "primary"
     else:
         normalized["realtime_asr_model"] = defaults["realtime_asr_model"]
+    normalized["recognition_architecture"] = normalize_recognition_architecture(
+        source.get("recognition_architecture", defaults["recognition_architecture"]),
+        defaults["recognition_architecture"],
+    )
     normalized["asr_hotwords"] = normalize_asr_hotwords(source.get("asr_hotwords", defaults["asr_hotwords"]))
     return normalized
 
@@ -243,14 +290,25 @@ def load_settings() -> Settings:
     if load_dotenv:
         load_dotenv()
     defaults = Settings()
+    configured_primary = os.getenv("MEETING_ASR_PRIMARY", defaults.asr_primary)
+    single_asr_model = _bool("MEETING_SINGLE_ASR_MODEL", defaults.single_asr_model)
+    configured_fallback = os.getenv("MEETING_ASR_FALLBACK", defaults.asr_fallback)
+    configured_language_id = os.getenv("MEETING_ASR_LANGUAGE_ID", defaults.language_id_model)
+    if single_asr_model:
+        configured_fallback = configured_primary
+        configured_language_id = configured_primary
     return Settings(
         host=os.getenv("MEETING_HOST", defaults.host),
         port=_int("MEETING_PORT", defaults.port, 1),
         api_token=os.getenv("MEETING_API_TOKEN", defaults.api_token),
         device=os.getenv("MEETING_DEVICE", defaults.device),
-        asr_primary=os.getenv("MEETING_ASR_PRIMARY", defaults.asr_primary),
-        asr_fallback=os.getenv("MEETING_ASR_FALLBACK", defaults.asr_fallback),
-        language_id_model=os.getenv("MEETING_ASR_LANGUAGE_ID", defaults.language_id_model),
+        asr_primary=configured_primary,
+        single_asr_model=single_asr_model,
+        asr_fallback=configured_fallback,
+        language_id_model=configured_language_id,
+        recognition_architecture=normalize_recognition_architecture(
+            os.getenv("MEETING_RECOGNITION_ARCHITECTURE", defaults.recognition_architecture),
+        ),
         asr_autodownload=_bool("MEETING_ASR_AUTODOWNLOAD", defaults.asr_autodownload),
         vad_model=os.getenv("MEETING_VAD", defaults.vad_model),
         translation_model_root=Path(os.getenv("MEETING_TRANSLATION_MODEL_ROOT", str(defaults.translation_model_root))),
@@ -267,15 +325,67 @@ def load_settings() -> Settings:
         partial_interval_ms=min(5000, max(100, _int("MEETING_PARTIAL_INTERVAL_MS", defaults.partial_interval_ms, 100))),
         language_id_min_seconds=min(2.0, max(0.4, _float("MEETING_LANGUAGE_ID_MIN_SECONDS", defaults.language_id_min_seconds, 0.4))),
         language_conflict_confirmations=min(4, max(2, _int("MEETING_LANGUAGE_CONFLICT_CONFIRMATIONS", defaults.language_conflict_confirmations, 2))),
+        language_id_on_segment=_bool("MEETING_LANGUAGE_ID_ON_SEGMENT", defaults.language_id_on_segment),
+        language_id_on_conflict=_bool("MEETING_LANGUAGE_ID_ON_CONFLICT", defaults.language_id_on_conflict),
+        language_switch_window_ms=min(1200, max(200, _int("MEETING_LANGUAGE_SWITCH_WINDOW_MS", defaults.language_switch_window_ms, 200))),
+        language_switch_max_wait_ms=min(3000, max(400, _int("MEETING_LANGUAGE_SWITCH_MAX_WAIT_MS", defaults.language_switch_max_wait_ms, 400))),
         stable_prefix_min_chars=min(64, max(1, _int("MEETING_STABLE_PREFIX_MIN_CHARS", defaults.stable_prefix_min_chars, 1))),
         max_audio_packet_bytes=_int("MEETING_MAX_AUDIO_PACKET_BYTES", defaults.max_audio_packet_bytes, 1024),
         max_recording_seconds=min(24 * 60 * 60, max(60.0, _float("MEETING_MAX_RECORDING_SECONDS", defaults.max_recording_seconds, 60.0))),
         audio_ingest_burst_seconds=min(30.0, max(0.0, _float("MEETING_AUDIO_INGEST_BURST_SECONDS", defaults.audio_ingest_burst_seconds, 0.0))),
         inference_queue_size=_int("MEETING_INFERENCE_QUEUE_SIZE", defaults.inference_queue_size, 1),
         translation_queue_size=_int("MEETING_TRANSLATION_QUEUE_SIZE", defaults.translation_queue_size, 1),
+        realtime_pipeline=_bool("MEETING_REALTIME_PIPELINE", defaults.realtime_pipeline),
         audio_drain_timeout_seconds=max(0.5, _float("MEETING_AUDIO_DRAIN_TIMEOUT_SECONDS", defaults.audio_drain_timeout_seconds, 0.5)),
         asr_timeout_seconds=max(1.0, _float("MEETING_ASR_TIMEOUT_SECONDS", defaults.asr_timeout_seconds, 1.0)),
         translation_timeout_seconds=max(1.0, _float("MEETING_TRANSLATION_TIMEOUT_SECONDS", defaults.translation_timeout_seconds, 1.0)),
+        translation_deadline_seconds=min(30.0, max(1.0, _float("MEETING_TRANSLATION_DEADLINE_SECONDS", defaults.translation_deadline_seconds, 1.0))),
+        translation_warmup=_bool("MEETING_TRANSLATION_WARMUP", defaults.translation_warmup),
+        translation_partial_debounce_ms=min(2000, max(0, _int("MEETING_TRANSLATION_PARTIAL_DEBOUNCE_MS", defaults.translation_partial_debounce_ms, 0))),
+        post_meeting_translation_enabled=_bool(
+            "MEETING_POST_TRANSLATION_ENABLED",
+            defaults.post_meeting_translation_enabled,
+        ),
+        post_meeting_translation_quality_threshold=min(
+            0.95,
+            max(
+                0.0,
+                _float(
+                    "MEETING_POST_TRANSLATION_QUALITY_THRESHOLD",
+                    defaults.post_meeting_translation_quality_threshold,
+                ),
+            ),
+        ),
+        post_meeting_translation_context_paragraphs=min(
+            4,
+            max(
+                0,
+                _int(
+                    "MEETING_POST_TRANSLATION_CONTEXT_PARAGRAPHS",
+                    defaults.post_meeting_translation_context_paragraphs,
+                ),
+            ),
+        ),
+        post_meeting_translation_context_chars=min(
+            2000,
+            max(
+                64,
+                _int(
+                    "MEETING_POST_TRANSLATION_CONTEXT_CHARS",
+                    defaults.post_meeting_translation_context_chars,
+                ),
+            ),
+        ),
+        post_meeting_translation_timeout_seconds=min(
+            1800.0,
+            max(
+                5.0,
+                _float(
+                    "MEETING_POST_TRANSLATION_TIMEOUT_SECONDS",
+                    defaults.post_meeting_translation_timeout_seconds,
+                ),
+            ),
+        ),
         queue_join_timeout_seconds=max(1.0, _float("MEETING_QUEUE_JOIN_TIMEOUT_SECONDS", defaults.queue_join_timeout_seconds, 1.0)),
         websocket_send_timeout_seconds=max(0.5, _float("MEETING_WEBSOCKET_SEND_TIMEOUT_SECONDS", defaults.websocket_send_timeout_seconds, 0.5)),
         max_active_meetings=_int("MEETING_MAX_ACTIVE_MEETINGS", defaults.max_active_meetings, 1),

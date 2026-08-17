@@ -61,6 +61,40 @@ class SegmentEvent:
     # Energy-gated signal evidence is separate from model VAD speech. This
     # prevents a VAD-only noise segment from reaching a hallucinating ASR.
     has_audio: bool = True
+    # Retain the absolute frame timestamps used to build the event.  This is
+    # intentionally optional so legacy callers constructing SegmentEvent
+    # positionally continue to work.
+    frames: tuple[tuple[int, bytes], ...] | None = None
+
+    def slice(self, start: float, end: float) -> "SegmentEvent":
+        """Return a timestamp-preserving PCM slice and its source frame map."""
+
+        left = max(float(self.start), min(float(start), float(self.end)))
+        right = max(left, min(float(end), float(self.end)))
+        start_offset = int(round((left - self.start) * SAMPLE_RATE)) * SAMPLE_WIDTH
+        end_offset = int(round((right - self.start) * SAMPLE_RATE)) * SAMPLE_WIDTH
+        start_offset = max(0, min(len(self.pcm), start_offset))
+        end_offset = max(start_offset, min(len(self.pcm), end_offset))
+        selected_frames = None
+        if self.frames is not None:
+            left_sample = int(round(left * SAMPLE_RATE))
+            right_sample = int(round(right * SAMPLE_RATE))
+            selected_frames = tuple(
+                (offset, frame)
+                for offset, frame in self.frames
+                if offset < right_sample and offset + len(frame) // SAMPLE_WIDTH > left_sample
+            )
+        return SegmentEvent(
+            kind=self.kind,
+            pcm=self.pcm[start_offset:end_offset],
+            start=left,
+            end=right,
+            revision=self.revision,
+            forced=self.forced,
+            has_new_speech=self.has_new_speech,
+            has_audio=self.has_audio,
+            frames=selected_frames,
+        )
 
 
 class StreamSegmenter:
@@ -235,14 +269,15 @@ class StreamSegmenter:
                 for _, frame in frames
             )
         return SegmentEvent(
-            kind,
-            b"".join(frame for _, frame in frames),
-            start / SAMPLE_RATE,
-            end / SAMPLE_RATE,
-            self._revision,
-            forced,
-            has_new_speech,
-            bool(has_audio),
+            kind=kind,
+            pcm=b"".join(frame for _, frame in frames),
+            start=start / SAMPLE_RATE,
+            end=end / SAMPLE_RATE,
+            revision=self._revision,
+            forced=forced,
+            has_new_speech=has_new_speech,
+            has_audio=bool(has_audio),
+            frames=tuple(frames),
         )
 
     def _reset(self, pre_roll: list[tuple[int, bytes]] | None = None) -> None:

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
+import math
 import shutil
 import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -23,11 +24,13 @@ from .audio import (
     StreamSegmenter,
     volume_threshold_percent_to_rms,
 )
-from .config import Settings, normalize_meeting_settings
+from .config import DEFAULT_RECOGNITION_ARCHITECTURE, Settings, normalize_meeting_settings, normalize_recognition_architecture
 from .exporter import export_live_result, render_todo_markdown
 from .jimo import MeetingSummarizer, TodoGenerator
-from .language import LanguageGuess, is_mixed_source_text, language_key, normalize_qwen_label
+from .language import LanguageEvidenceAggregator, LanguageGuess, is_mixed_source_text, normalize_qwen_label, reconcile_language_guess
 from .models import TodoDocument, Utterance, utc_now_iso
+from .quality import AsrQualityAssessment, AsrQualityState, assess_asr_quality
+from .scheduler import LatestEventQueue, LatestTranslationQueue
 from .storage import LocalMeetingStore, TranscriptStore, atomic_write_json, atomic_write_text
 from .text_normalize import simplify_chinese
 
@@ -43,7 +46,8 @@ class CapacityLimitError(RuntimeError):
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) else default
     except (TypeError, ValueError):
         return default
 
@@ -51,7 +55,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -98,6 +102,9 @@ class LiveMeetingSession:
         self.summary_error: str | None = None
         self.todo_error: str | None = None
         self.error: str | None = None
+        self.post_translation_state = "idle"
+        self.post_translation_error: str | None = None
+        self.post_translation_task: asyncio.Task[Any] | None = None
         self.started_at = ""
         self.ended_at = ""
         self.files: list[str] = []
@@ -136,6 +143,12 @@ class LiveMeetingSession:
         self._candidate_confidence = 0.0
         self._lid_checked_revisions: set[int] = set()
         self._language_conflicts = 0
+        self._language_boundary: float | None = None
+        self.language_evidence = LanguageEvidenceAggregator(
+            window_seconds=settings.language_switch_window_ms / 1000.0,
+            max_confirmation_seconds=settings.language_switch_max_wait_ms / 1000.0,
+            confirmations=settings.language_conflict_confirmations,
+        )
         self._active_technical_revision: int | None = None
         # A paragraph may span several technical audio chunks.  Keep the
         # text committed before the current chunk separate from the current
@@ -143,12 +156,23 @@ class LiveMeetingSession:
         self._active_technical_base: str | None = None
         self._forced_chunks_for_active = 0
         self._last_state_persist_at = time.monotonic()
+        self._started_perf = 0.0
         self._previous_partial_text: dict[str, str] = {}
         self._stable_prefixes: dict[str, str] = {}
+        self._asr_quality: dict[str, AsrQualityState] = {}
 
         self.clients: set[WebSocket] = set()
-        self.queue: asyncio.Queue[SegmentEvent | None] = asyncio.Queue(maxsize=max(1, settings.inference_queue_size))
-        self.translation_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=max(1, settings.translation_queue_size))
+        self.realtime_pipeline = bool(getattr(settings, "realtime_pipeline", True))
+        self.queue = (
+            LatestEventQueue(maxsize=max(1, settings.inference_queue_size))
+            if self.realtime_pipeline
+            else asyncio.Queue(maxsize=max(1, settings.inference_queue_size))
+        )
+        self.translation_queue = (
+            LatestTranslationQueue(maxsize=max(1, settings.translation_queue_size))
+            if self.realtime_pipeline
+            else asyncio.Queue(maxsize=max(1, settings.translation_queue_size))
+        )
         self.worker_task: asyncio.Task[Any] | None = None
         self.translation_worker_task: asyncio.Task[Any] | None = None
         self.stop_task: asyncio.Task[Any] | None = None
@@ -156,8 +180,37 @@ class LiveMeetingSession:
         self.summary_task: asyncio.Task[Any] | None = None
         self.todo_task: asyncio.Task[Any] | None = None
         self._translation_pending = 0
-        self._translation_keys: set[tuple[str, int, bool]] = set()
         self.translation_errors: dict[str, str] = {}
+        self.pipeline_metrics: dict[str, Any] = {
+            "asr_partial_dropped": 0,
+            "expired_partial_dropped": 0,
+            "translation_jobs_coalesced": 0,
+            "translation_jobs_dropped": 0,
+            "expired_translation_dropped": 0,
+            "stale_translation_results": 0,
+            "language_switches": 0,
+            "first_partial_ms": [],
+            "language_switch_ms": [],
+            "asr_queue_wait_ms": [],
+            "translation_queue_wait_ms": [],
+            "asr_duration_ms": [],
+            "language_id_duration_ms": [],
+            "translation_duration_ms": [],
+            "final_translation_ms": [],
+            "post_translation_duration_ms": [],
+            "post_translation_candidates": 0,
+            "post_translation_retranslated": 0,
+            "post_translation_skipped": 0,
+            "post_translation_failures": 0,
+            "asr_quality_low_count": 0,
+            "queue_max_depth": 0,
+            "asr_queue_max_depth": 0,
+            "translation_queue_max_depth": 0,
+        }
+        self._asr_enqueue_times: dict[tuple[str, int, float, float], float] = {}
+        self._translation_enqueue_times: dict[tuple[str, int, bool], float] = {}
+        self._language_candidate_wall_at: float | None = None
+        self._first_partial_recorded = False
         self._shutting_down = False
 
         self.summarizer_factory = summarizer_factory or (lambda value: MeetingSummarizer(value))
@@ -172,7 +225,7 @@ class LiveMeetingSession:
             "title", "recording_state", "summary_state", "todo_state", "summary", "summary_revision",
             "summary_error", "todo_error", "error", "started_at", "ended_at", "files", "model_metadata", "snapshot_revision",
             "audio_samples_received", "volume_threshold_percent", "current_language", "current_variant",
-            "transcript_revision",
+            "transcript_revision", "post_translation_state", "post_translation_error",
         ):
             if name not in payload:
                 continue
@@ -186,25 +239,29 @@ class LiveMeetingSession:
             if name in {"transcript_revision"}:
                 value = _safe_int(value)
             if name in {"volume_threshold_percent"}:
-                value = _safe_float(value, self.volume_threshold_percent)
+                value = round(max(0.0, min(30.0, _safe_float(value, self.volume_threshold_percent))), 1)
             if name == "files" and not isinstance(value, list):
                 value = []
             if name == "model_metadata" and not isinstance(value, dict):
                 value = {}
             setattr(self, name, value)
+        # Meetings written before the post-meeting pass was introduced are
+        # already complete and must not be silently reprocessed on recovery.
+        if "post_translation_state" not in payload:
+            self.post_translation_state = "complete" if self.recording_state == "complete" else "idle"
         settings = payload.get("meeting_settings")
         if isinstance(settings, dict):
             self.meeting_settings = normalize_meeting_settings(settings, self.settings)
+            if "volume_threshold_percent" in settings:
+                self.volume_threshold_percent = _safe_float(
+                    self.meeting_settings.get("volume_threshold_percent"),
+                    self.volume_threshold_percent,
+                )
+        self.meeting_settings["volume_threshold_percent"] = self.volume_threshold_percent
         todo = payload.get("todo")
         if isinstance(todo, dict):
             try:
-                self.todo = TodoDocument(
-                    schema_version=str(todo.get("schema_version", "1.0")),
-                    meeting_id=str(todo.get("meeting_id", self.id)),
-                    summary_revision=_safe_int(todo.get("summary_revision")),
-                    generated_at=str(todo.get("generated_at", "")),
-                    items=[],
-                )
+                self.todo = TodoDocument.from_dict(todo, default_meeting_id=self.id)
             except Exception:
                 self.todo = TodoDocument(meeting_id=self.id)
         self.paragraphs = self.transcript_store.load()
@@ -234,17 +291,31 @@ class LiveMeetingSession:
 
     @property
     def has_active_tasks(self) -> bool:
-        tasks = (self.worker_task, self.translation_worker_task, self.stop_task, self.summary_task, self.todo_task)
+        tasks = (
+            self.worker_task,
+            self.translation_worker_task,
+            self.stop_task,
+            self.post_translation_task,
+            self.summary_task,
+            self.todo_task,
+        )
         return any(task is not None and not task.done() for task in tasks)
 
     @property
     def translation_pending(self) -> bool:
-        return self._translation_pending > 0 or not self.translation_queue.empty()
+        return (
+            self._translation_pending > 0
+            or not self.translation_queue.empty()
+            or self.post_translation_state == "running"
+            or self.post_translation_task is not None and not self.post_translation_task.done()
+        )
 
     @property
     def translation_state(self) -> str:
         if self.translation_pending:
             return "pending"
+        if self.post_translation_state == "error":
+            return "error"
         if self.translation_errors:
             return "error"
         if any(item.translation_status in {"ready", "not_needed"} for item in self.paragraphs):
@@ -302,6 +373,8 @@ class LiveMeetingSession:
             "summary_error": self.summary_error,
             "todo_error": self.todo_error,
             "error": self.error,
+            "post_translation_state": self.post_translation_state,
+            "post_translation_error": self.post_translation_error,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "audio_samples_received": self.audio_samples_received,
@@ -313,6 +386,9 @@ class LiveMeetingSession:
             "current_variant": self.current_variant,
             "translation_state": self.translation_state,
             "translation_pending": self.translation_pending,
+            "realtime_pipeline": self.realtime_pipeline,
+            "pipeline_metrics": self.pipeline_metrics,
+            "language_evidence": self.language_evidence.snapshot(),
             "paragraph_count": len(self.paragraphs),
             "files": self.files,
             "model_metadata": self.model_metadata,
@@ -320,6 +396,14 @@ class LiveMeetingSession:
 
     def _write_state(self) -> None:
         atomic_write_json(self.state_path, self._state_payload())
+
+    def _record_metric(self, name: str, value: float) -> None:
+        values = self.pipeline_metrics.setdefault(name, [])
+        if not isinstance(values, list):
+            values = []
+            self.pipeline_metrics[name] = values
+        values.append(round(float(value), 3))
+        del values[:-2000]
 
     def rename(self, title: str) -> None:
         self.title = str(title).strip() or "未命名会议"
@@ -333,8 +417,16 @@ class LiveMeetingSession:
         return payload
 
     def load_transcript(self) -> list[Utterance]:
+        active_segment_id = self.active_paragraph.segment_id if self.active_paragraph else None
         self.paragraphs = self.transcript_store.load()
         self.recent = deque(self.paragraphs[-500:], maxlen=500)
+        if active_segment_id is not None:
+            self.active_paragraph = next(
+                (item for item in self.paragraphs if item.segment_id == active_segment_id and not item.closed),
+                None,
+            )
+        if self.active_paragraph is None:
+            self.active_paragraph = next((item for item in reversed(self.paragraphs) if not item.closed), None)
         return list(self.paragraphs)
 
     def _recent_asr_context(self) -> str:
@@ -352,6 +444,8 @@ class LiveMeetingSession:
         self.recording_state = "starting"
         self._audio_stop_requested = False
         self._audio_inflight = 0
+        self._started_perf = time.perf_counter()
+        self._first_partial_recorded = False
         self.audio_source_id = None
         self.last_audio_sequence = None
         self._forced_chunks_for_active = 0
@@ -378,6 +472,7 @@ class LiveMeetingSession:
     def configure_volume_threshold(self, value: Any) -> None:
         percent = _safe_float(value, self.volume_threshold_percent)
         self.volume_threshold_percent = round(max(0.0, min(30.0, percent)), 1)
+        self.meeting_settings["volume_threshold_percent"] = self.volume_threshold_percent
         if self.segmenter:
             self.segmenter.minimum_rms = volume_threshold_percent_to_rms(self.volume_threshold_percent)
         self._write_state()
@@ -471,14 +566,39 @@ class LiveMeetingSession:
             await self._enqueue_event(event)
 
     async def _enqueue_event(self, event: SegmentEvent) -> None:
-        if event.kind == "partial":
-            try:
+        key = (event.kind, int(event.revision), float(event.start), float(event.end))
+        self._asr_enqueue_times[key] = time.perf_counter()
+        try:
+            if not self.realtime_pipeline:
                 self.queue.put_nowait(event)
-            except asyncio.QueueFull:
-                # Partials are replaceable hypotheses. Keep ingress moving and
-                # retain the next final event for durable transcript state.
+            elif event.kind == "partial":
+                replaced = self.queue.put_latest_nowait(event)
+                if not replaced:
+                    self.pipeline_metrics["asr_partial_dropped"] = int(self.pipeline_metrics.get("asr_partial_dropped", 0)) + 1
+                    self.pipeline_metrics["expired_partial_dropped"] = int(self.pipeline_metrics.get("expired_partial_dropped", 0)) + 1
+                    for old_key in tuple(self._asr_enqueue_times):
+                        if old_key[0] == "partial" and old_key[1] == int(event.revision) and old_key != key:
+                            self._asr_enqueue_times.pop(old_key, None)
+            elif event.kind == "final":
+                self.queue.put_nowait(event)
+                # The final event makes every older partial for this
+                # technical revision obsolete, including its wait timer.
+                for old_key in tuple(self._asr_enqueue_times):
+                    if old_key[0] == "partial" and old_key[1] <= int(event.revision):
+                        self._asr_enqueue_times.pop(old_key, None)
+            self.pipeline_metrics["queue_max_depth"] = max(
+                int(self.pipeline_metrics.get("queue_max_depth", 0)),
+                self.queue.qsize(),
+            )
+            self.pipeline_metrics["asr_queue_max_depth"] = max(
+                int(self.pipeline_metrics.get("asr_queue_max_depth", 0)),
+                self.queue.qsize(),
+            )
+        except asyncio.QueueFull:
+            if event.kind == "partial":
+                self.pipeline_metrics["asr_partial_dropped"] = int(self.pipeline_metrics.get("asr_partial_dropped", 0)) + 1
+                self.pipeline_metrics["expired_partial_dropped"] = int(self.pipeline_metrics.get("expired_partial_dropped", 0)) + 1
                 return
-        else:
             await self.queue.put(event)
 
     @staticmethod
@@ -491,6 +611,74 @@ class LiveMeetingSession:
             return kwargs
         return {key: value for key, value in kwargs.items() if key in parameters}
 
+    def _recognition_architecture(self) -> str:
+        return normalize_recognition_architecture(
+            self.meeting_settings.get("recognition_architecture", self.settings.recognition_architecture),
+            DEFAULT_RECOGNITION_ARCHITECTURE,
+        )
+
+    def _uses_language_id(self) -> bool:
+        # ``single_1_7b_no_lid`` means no separate LID checkpoint.  A single
+        # segment-level probe is still useful for language accuracy and uses
+        # the same resident 1.7B model as ASR.
+        return bool(getattr(self.settings, "language_id_on_segment", True))
+
+    async def _invoke_transcriber(self, method: Any, event: SegmentEvent, kwargs: dict[str, Any]) -> Any:
+        call_kwargs = self._compatible_kwargs(method, kwargs)
+        call = functools.partial(method, event, **call_kwargs)
+        return await self._invoke_model_call(
+            call,
+            timeout=max(1.0, self.settings.asr_timeout_seconds),
+            executor_name="inference_executor",
+        )
+
+    async def _invoke_model_call(
+        self,
+        call: Callable[[], Any],
+        *,
+        timeout: float,
+        executor_name: str,
+    ) -> Any:
+        """Run a synchronous model call through one bounded stage worker."""
+
+        # LiveModelRuntime owns one executor for ASR/LID and one for
+        # translation.  A timed-out future therefore cannot spawn another
+        # model thread while the previous call is unwinding.
+        executor = getattr(self.runtime, executor_name, None)
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(executor, call)
+        # Shield the executor future so cancellation of a session worker does
+        # not wait for ThreadPoolExecutor's non-cancelable callable to settle.
+        # The runtime's single-worker executor still serializes the next call.
+        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+
+    async def _transcribe_with_strategy(
+        self,
+        method: Any,
+        event: SegmentEvent,
+        kwargs: dict[str, Any],
+        *,
+        is_final: bool,
+    ) -> Any:
+        architecture = self._recognition_architecture()
+        if architecture == "single_1_7b_no_lid":
+            direct_kwargs = dict(kwargs)
+            decode_settings = dict(kwargs.get("decode_settings") or {})
+            # The default strategy always uses 1.7B, even if an older client
+            # still sends the legacy ``realtime_asr_model`` key.
+            decode_settings["realtime_asr_model"] = "primary"
+            direct_kwargs["decode_settings"] = decode_settings
+            return await self._invoke_transcriber(method, event, direct_kwargs)
+
+        # The application currently has one active strategy; keep this direct
+        # branch explicit so future experimental strategies can be added
+        # without changing the default path.
+        direct_kwargs = dict(kwargs)
+        direct_settings = dict(kwargs.get("decode_settings") or {})
+        direct_settings["realtime_asr_model"] = "primary"
+        direct_kwargs["decode_settings"] = direct_settings
+        return await self._invoke_transcriber(method, event, direct_kwargs)
+
     async def _worker(self) -> None:
         while True:
             event = await self.queue.get()
@@ -498,6 +686,10 @@ class LiveMeetingSession:
                 if event is None:
                     return
                 try:
+                    key = (event.kind, int(event.revision), float(event.start), float(event.end))
+                    queued_at = self._asr_enqueue_times.pop(key, None)
+                    if queued_at is not None:
+                        self._record_metric("asr_queue_wait_ms", (time.perf_counter() - queued_at) * 1000)
                     await self._handle_event(event)
                 except asyncio.CancelledError:
                     raise
@@ -509,9 +701,11 @@ class LiveMeetingSession:
                 self.queue.task_done()
 
     async def _maybe_detect_language(self, event: SegmentEvent, *, final: bool) -> bool:
-        # One tiny-model call after the first ~0.8 s of each technical speech
-        # chunk.  Forced max-duration chunks get their own check; partials do
-        # not repeatedly invoke the small model.
+        if not self._uses_language_id():
+            return False
+        # One same-model language call after the first stable window of each
+        # technical speech chunk. Forced max-duration chunks get their own
+        # check; partials do not repeatedly invoke a second ASR model.
         if event.revision in self._lid_checked_revisions:
             return False
         if not final and event.end - event.start < self.settings.language_id_min_seconds:
@@ -521,60 +715,77 @@ class LiveMeetingSession:
         if not detector:
             return False
         kwargs = self._compatible_kwargs(detector, {"previous_language": self.current_language})
+        started_lid = time.perf_counter()
         try:
-            guess = await asyncio.wait_for(
-                asyncio.to_thread(detector, event.pcm, **kwargs),
+            guess = await self._invoke_model_call(
+                functools.partial(detector, event.pcm, **kwargs),
                 timeout=max(1.0, self.settings.asr_timeout_seconds),
+                executor_name="inference_executor",
             )
         except Exception:  # noqa: BLE001
             LOGGER.exception("Realtime language detection failed for %s", self.id)
             return False
-        return self._accept_language(guess, final=final)
+        finally:
+            self._record_metric("language_id_duration_ms", (time.perf_counter() - started_lid) * 1000)
+        return self._accept_language(guess, final=final, start=event.start, end=event.end, source="lid")
 
-    def _accept_language(self, guess: LanguageGuess | None, *, final: bool) -> bool:
-        if guess is None or guess.code not in {"zh", "en", "de"}:
+    def _accept_language(
+        self,
+        guess: LanguageGuess | None,
+        *,
+        final: bool,
+        text: str = "",
+        start: float | None = None,
+        end: float | None = None,
+        source: str = "asr",
+    ) -> bool:
+        self._language_boundary = None
+        if self.language_evidence.stable_code is None and self.active_paragraph is not None:
+            active_code = str(self.active_paragraph.language or "").strip().casefold()
+            if active_code in {"zh", "en", "de"}:
+                self.language_evidence.seed_stable(active_code, self.active_paragraph.speech_variant)
+        candidate_code = getattr(guess, "code", None) if guess is not None else None
+        if self.language_evidence.stable_code is not None and candidate_code == self.language_evidence.stable_code:
+            self._language_candidate_wall_at = None
+        elif self.language_evidence.stable_code is not None and candidate_code in {"zh", "en", "de"} and (
+            self.language_evidence.candidate_count == 0
+            or self.language_evidence.candidate_code != candidate_code
+        ):
+            self._language_candidate_wall_at = time.perf_counter()
+        transition = self.language_evidence.observe(
+            guess,
+            text=text,
+            start=start,
+            end=end,
+            final=final,
+            source=source,
+        )
+        stable_code = self.language_evidence.stable_code
+        stable_variant = self.language_evidence.stable_variant
+        self.current_language = stable_code or self.current_language
+        self.current_variant = stable_variant or self.current_variant
+        self._stable_key = (stable_code, stable_variant or "unknown") if stable_code else None
+        self._candidate_key = (
+            self.language_evidence.candidate_code,
+            self.language_evidence.candidate_variant or "unknown",
+        ) if self.language_evidence.candidate_code else None
+        self._candidate_count = self.language_evidence.candidate_count
+        self._candidate_confidence = self.language_evidence.candidate_confidence
+        if transition is None:
             return False
-        key = language_key(guess)
-        if key[0] == "zh" and key[1] == "unknown":
-            # Generic Chinese does not force a dialect boundary.
-            key = ("zh", "unknown")
-        old_stable = self._stable_key
-        if self._stable_key and self._stable_key[0] == "zh" and key == ("zh", "unknown") and self._stable_key[1] != "unknown":
-            # A generic Qwen ``Chinese`` result is not evidence that a known
-            # dialect changed; preserve the last confirmed variant.
-            self.current_language = "zh"
-            self.current_variant = self._stable_key[1]
-            self._candidate_key = None
-            self._candidate_count = 0
-            return False
-        if self._stable_key is not None and _same_language_key(key, self._stable_key):
-            self.current_language, self.current_variant = key[0], None if key[1] == "unknown" else key[1]
-            self._candidate_key = key
-            self._candidate_count = 0
-            self._candidate_confidence = guess.confidence
-            return False
-        if self._candidate_key == key:
-            self._candidate_count += 1
-            self._candidate_confidence = max(self._candidate_confidence, guess.confidence)
-        else:
-            self._candidate_key = key
-            self._candidate_count = 1
-            self._candidate_confidence = guess.confidence
-        if self._stable_key is None:
-            confirmed = self._candidate_count >= 2 or final
-        else:
-            confirmed = self._candidate_count >= self.settings.language_conflict_confirmations or final
-        if not confirmed:
-            return False
-        self._stable_key = key
-        self.current_language, self.current_variant = key[0], None if key[1] == "unknown" else key[1]
-        self._candidate_count = 0
+        self._language_boundary = transition.boundary
+        if self._language_candidate_wall_at is not None:
+            self._record_metric("language_switch_ms", (time.perf_counter() - self._language_candidate_wall_at) * 1000)
+        self._language_candidate_wall_at = None
         self._language_conflicts = 0
-        return old_stable is not None and old_stable != key
+        self.pipeline_metrics["language_switches"] = int(self.pipeline_metrics.get("language_switches", 0)) + 1
+        return True
 
     async def _handle_event(self, event: SegmentEvent) -> None:
         is_final = event.kind == "final" and not event.forced
         paragraph_start: float | None = None
+        quality_language_conflict = False
+        self._language_boundary = None
         if event.kind == "partial" and (
             not getattr(event, "has_new_speech", True)
             or not getattr(event, "has_audio", True)
@@ -587,16 +798,20 @@ class LiveMeetingSession:
         self._forced_chunks_for_active = self._forced_chunks_for_active + 1 if event.forced else 0
         language_changed = await self._maybe_detect_language(event, final=is_final)
         if language_changed:
-            paragraph_start = max(event.start, self.active_paragraph.end) if self.active_paragraph else event.start
+            paragraph_start = max(
+                event.start,
+                self._language_boundary or event.start,
+                self.active_paragraph.end if self.active_paragraph else event.start,
+            )
             await self._close_active(paragraph_start)
 
         # Do not force the previous paragraph language into Qwen while the
         # paragraph is still live. ``language=`` is a hard decode constraint in
         # the Qwen wrapper; keeping it here made a language switch look like
         # the previous language forever and prevented a paragraph boundary.
-        # A language confirmed by the small LID for a new technical segment is
-        # safe to pass through as a constraint.
-        use_stable_language = self.active_paragraph is not None or language_changed
+        # A language confirmed by the same-model probe for a new technical
+        # segment is safe to pass through as a constraint.
+        use_stable_language = self._uses_language_id() and (self.active_paragraph is not None or language_changed)
         stable_language = self.current_language if use_stable_language and self.current_language in {"zh", "en", "de"} else None
         decode_language = self.current_language if language_changed and self.current_language in {"zh", "en", "de"} else None
         decode_variant = self.current_variant if language_changed else None
@@ -609,23 +824,22 @@ class LiveMeetingSession:
             "decode_settings": self.meeting_settings,
         }
         asr_event = event
+        if language_changed and self._language_boundary is not None:
+            asr_event = event.slice(self._language_boundary, event.end)
         if not is_final:
             keep_bytes = int(PARTIAL_ASR_WINDOW_SECONDS * SAMPLE_RATE) * SAMPLE_WIDTH
             if len(event.pcm) > keep_bytes:
-                asr_event = replace(
-                    event,
-                    pcm=event.pcm[-keep_bytes:],
-                    start=max(event.start, event.end - PARTIAL_ASR_WINDOW_SECONDS),
-                )
-        call_kwargs = self._compatible_kwargs(method, kwargs)
+                crop_start = max(event.start, event.end - PARTIAL_ASR_WINDOW_SECONDS)
+                if language_changed and self._language_boundary is not None:
+                    crop_start = max(crop_start, self._language_boundary)
+                asr_event = event.slice(crop_start, event.end)
+        started_asr = time.perf_counter()
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(method, asr_event, **call_kwargs),
-                timeout=max(1.0, self.settings.asr_timeout_seconds),
-            )
+            result = await self._transcribe_with_strategy(method, asr_event, kwargs, is_final=is_final)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Realtime ASR failed for %s", self.id)
             result = None
+        self._record_metric("asr_duration_ms", (time.perf_counter() - started_asr) * 1000)
         if result is None:
             if is_final:
                 await self._close_active(event.end)
@@ -633,14 +847,7 @@ class LiveMeetingSession:
                 await self._close_active(event.end)
             return
         result_text = str(getattr(result, "text", "") or "").strip()
-        result_guess = LanguageGuess(
-            str(getattr(result, "language", "unknown") or "unknown"),
-            _safe_float(getattr(result, "confidence", 0.0)),
-            getattr(result, "speech_variant", None),
-            str(getattr(result, "raw_qwen_label", "") or ""),
-        )
-        if result_guess.code not in {"zh", "en", "de"}:
-            result_guess = normalize_qwen_label(getattr(result, "raw_qwen_label", ""), result_text)
+        result_guess = self._result_language_guess(result, result_text)
         if not result_text:
             # Empty ASR output is not a new paragraph and must not refresh the
             # current paragraph with a model hallucination. A final empty
@@ -651,20 +858,16 @@ class LiveMeetingSession:
                 await self._close_active(event.end)
             return
 
-        result_key = language_key(result_guess) if result_guess.code in {"zh", "en", "de"} else None
-        active_key = (
-            (self.active_paragraph.language, self.active_paragraph.speech_variant or "unknown")
-            if self.active_paragraph is not None
-            else None
-        )
-        expected_key = self._stable_key or active_key
-        if result_key is not None and expected_key is not None:
-            comparable_result_key = result_key
-            if expected_key[0] == "zh" and result_key == ("zh", "unknown") and expected_key[1] != "unknown":
-                # Generic Chinese is compatible with a previously confirmed
-                # dialect; it is not a language boundary by itself.
-                comparable_result_key = expected_key
-            if comparable_result_key != expected_key:
+        if event.kind == "partial" and not self._first_partial_recorded and self._started_perf:
+            self._first_partial_recorded = True
+            self._record_metric("first_partial_ms", (time.perf_counter() - self._started_perf) * 1000)
+
+        result_code = result_guess.code if result_guess.code in {"zh", "en", "de"} else None
+        active_code = self.active_paragraph.language if self.active_paragraph is not None else None
+        expected_code = self._stable_key[0] if self._stable_key is not None else active_code
+        if result_code is not None and expected_code is not None:
+            if result_code != expected_code:
+                quality_language_conflict = True
                 self._language_conflicts += 1
                 confirmed = False
                 if is_final or self._language_conflicts >= self.settings.language_conflict_confirmations:
@@ -674,7 +877,14 @@ class LiveMeetingSession:
                     # old paragraph open indefinitely.
                     confirmed = await self._confirm_language_conflict(event, result_guess)
                     if not confirmed:
-                        confirmed = self._accept_language(result_guess, final=True)
+                        confirmed = self._accept_language(
+                            result_guess,
+                            final=True,
+                            text=result_text,
+                            start=event.start,
+                            end=event.end,
+                            source="asr",
+                        )
                 if not confirmed:
                     # Never write a conflicting hypothesis into the old
                     # paragraph. That was the source of the disappearing
@@ -682,15 +892,86 @@ class LiveMeetingSession:
                     if is_final:
                         await self._close_active(event.end)
                     return
-                paragraph_start = max(event.start, self.active_paragraph.end) if self.active_paragraph else event.start
+                # A real segment carries the absolute frame map.  Re-run the
+                # old prefix and the new suffix after confirmation so one ASR
+                # window cannot leak words across the paragraph boundary.
+                boundary = self._language_boundary
+                if (
+                    event.frames is not None
+                    and boundary is not None
+                    and event.start < boundary < event.end
+                    and self.active_paragraph is not None
+                ):
+                    old_code = expected_code if expected_code in {"zh", "en", "de"} else self.active_paragraph.language
+                    old_event = event.slice(event.start, boundary)
+                    old_kwargs = dict(kwargs)
+                    old_kwargs["language"] = old_code
+                    old_kwargs["previous_language"] = old_code
+                    old_kwargs["speech_variant"] = self.active_paragraph.speech_variant if old_code == "zh" else None
+                    try:
+                        self.active_paragraph.end = min(self.active_paragraph.end, boundary)
+                        old_result = await self._transcribe_with_strategy(
+                            method,
+                            old_event,
+                            old_kwargs,
+                            is_final=is_final,
+                        )
+                        old_text = str(getattr(old_result, "text", "") or "").strip()
+                        if old_text:
+                            # Discard the replaceable mixed-window hypothesis,
+                            # retaining only text committed by prior chunks.
+                            if self._active_technical_base is not None:
+                                self.active_paragraph.text = self._active_technical_base
+                            old_guess = self._result_language_guess(old_result, old_text)
+                            await self._upsert_source(
+                                old_event,
+                                old_text,
+                                language=old_code,
+                                speech_variant=getattr(old_result, "speech_variant", None) or old_guess.speech_variant,
+                                confidence=max(_safe_float(getattr(old_result, "confidence", 0.0)), old_guess.confidence),
+                                asr_model=getattr(old_result, "model", None),
+                                language_source=getattr(old_result, "language_source", "qwen"),
+                            )
+                    except Exception:  # noqa: BLE001
+                        LOGGER.exception("Language boundary prefix re-segmentation failed for %s", self.id)
+                    new_event = event.slice(boundary, event.end)
+                    new_kwargs = dict(kwargs)
+                    new_kwargs["language"] = result_guess.code
+                    new_kwargs["previous_language"] = result_guess.code
+                    new_kwargs["speech_variant"] = result_guess.speech_variant
+                    try:
+                        new_result = await self._transcribe_with_strategy(
+                            method,
+                            new_event,
+                            new_kwargs,
+                            is_final=is_final,
+                        )
+                        new_text = str(getattr(new_result, "text", "") or "").strip()
+                        if new_text:
+                            result = new_result
+                            result_text = new_text
+                            result_guess = self._result_language_guess(new_result, new_text)
+                    except Exception:  # noqa: BLE001
+                        LOGGER.exception("Language boundary suffix re-segmentation failed for %s", self.id)
+                paragraph_start = max(
+                    event.start,
+                    self._language_boundary or event.start,
+                    self.active_paragraph.end if self.active_paragraph else event.start,
+                )
                 await self._close_active(paragraph_start)
                 language_changed = True
             else:
                 self._language_conflicts = 0
-                if self._stable_key is None:
-                    self._accept_language(result_guess, final=is_final)
-        elif result_key is not None and self._stable_key is None:
-            self._accept_language(result_guess, final=is_final)
+                self._accept_language(
+                    result_guess,
+                    final=is_final,
+                    text=result_text,
+                    start=event.start,
+                    end=event.end,
+                    source="asr",
+                )
+        elif result_code is not None and self._stable_key is None:
+            self._accept_language(result_guess, final=is_final, text=result_text, start=event.start, end=event.end)
 
         language = self.current_language if self.current_language in {"zh", "en", "de"} else result_guess.code
         if language not in {"zh", "en", "de"}:
@@ -707,6 +988,7 @@ class LiveMeetingSession:
             confidence=max(_safe_float(getattr(result, "confidence", 0.0)), self._candidate_confidence),
             asr_model=getattr(result, "model", None),
             language_source=getattr(result, "language_source", "qwen"),
+            language_conflict=quality_language_conflict,
         )
         if is_final:
             await self._close_active(event.end)
@@ -714,23 +996,57 @@ class LiveMeetingSession:
             if self._forced_chunks_for_active >= 2:
                 await self._close_active(event.end)
 
+    @staticmethod
+    def _result_language_guess(result: Any, text: str) -> LanguageGuess:
+        raw_language = str(
+            getattr(result, "raw_qwen_label", "")
+            or getattr(result, "language", "unknown")
+            or "unknown"
+        )
+        normalized_result = normalize_qwen_label(raw_language, text)
+        reconciled = reconcile_language_guess(normalized_result, text)
+        if reconciled is not None:
+            normalized_result = reconciled
+        return LanguageGuess(
+            normalized_result.code,
+            max(_safe_float(getattr(result, "confidence", 0.0)), normalized_result.confidence),
+            getattr(result, "speech_variant", None) or normalized_result.speech_variant,
+            raw_language,
+        )
+
     async def _confirm_language_conflict(self, event: SegmentEvent, guess: LanguageGuess) -> bool:
         detector = getattr(self.runtime, "detect_language", None)
-        if not detector:
-            return False
+        if not self.settings.language_id_on_conflict or not detector:
+            self._language_conflicts = 0
+            return self._accept_language(guess, final=True, start=event.start, end=event.end, source="asr")
         kwargs = self._compatible_kwargs(detector, {"previous_language": self.current_language})
+        call = functools.partial(detector, event.pcm, **kwargs)
+        started_lid = time.perf_counter()
         try:
-            confirmed = await asyncio.wait_for(
-                asyncio.to_thread(detector, event.pcm, **kwargs),
+            confirmed = await self._invoke_model_call(
+                call,
                 timeout=max(1.0, self.settings.asr_timeout_seconds),
+                executor_name="inference_executor",
             )
         except Exception:  # noqa: BLE001
             LOGGER.exception("Realtime language conflict detection failed for %s", self.id)
             return False
+        finally:
+            self._record_metric("language_id_duration_ms", (time.perf_counter() - started_lid) * 1000)
         self._language_conflicts = 0
-        # Two consecutive ASR conflicts are the trigger; the small model's
+        # Consecutive ASR conflicts are the trigger; the same 1.7B model's
         # agreeing result is the confirmation that commits the new boundary.
-        return bool(confirmed and language_key(confirmed) == language_key(guess) and self._accept_language(confirmed, final=True))
+        return bool(
+            confirmed
+            and getattr(confirmed, "code", "") == getattr(guess, "code", "")
+            and self._accept_language(
+                confirmed,
+                final=True,
+                start=event.start,
+                end=event.end,
+                source="lid",
+            )
+        )
 
     @staticmethod
     def _merge_technical_text(previous: str, current: str) -> str:
@@ -760,7 +1076,37 @@ class LiveMeetingSession:
     def _translation_language(language: str, text: str) -> str:
         if language in {"en", "de"}:
             return language
-        return "en" if language == "zh" and is_mixed_source_text(text) else language
+        if language == "zh" and is_mixed_source_text(text):
+            guessed = normalize_qwen_label("unknown", text).code
+            return guessed if guessed in {"en", "de"} else "en"
+        return language
+
+    def _observe_asr_quality(
+        self,
+        item: Utterance,
+        event: SegmentEvent,
+        *,
+        confidence: float,
+        language_conflict: bool = False,
+    ) -> AsrQualityAssessment:
+        state = self._asr_quality.setdefault(item.segment_id, AsrQualityState())
+        state.observe(
+            item.text,
+            confidence,
+            is_final=event.kind == "final",
+            is_partial=event.kind == "partial",
+            language_conflict=language_conflict,
+        )
+        assessment = assess_asr_quality(
+            item.text,
+            start=item.start,
+            end=item.end,
+            confidence=confidence,
+            state=state,
+        )
+        if assessment.is_low:
+            self.pipeline_metrics["asr_quality_low_count"] = int(self.pipeline_metrics.get("asr_quality_low_count", 0)) + 1
+        return assessment
 
     async def _upsert_source(
         self,
@@ -773,12 +1119,15 @@ class LiveMeetingSession:
         confidence: float,
         asr_model: str | None,
         language_source: str,
+        language_conflict: bool = False,
     ) -> None:
         if not text and self.active_paragraph is None:
             return
-        key = (language, speech_variant or "unknown")
+        # Dialect metadata may change while the speaker continues speaking;
+        # only a language-code change is a paragraph boundary.
+        key = language
         if self.active_paragraph is not None:
-            active_key = (self.active_paragraph.language, self.active_paragraph.speech_variant or "unknown")
+            active_key = self.active_paragraph.language
             if active_key != key and self.active_paragraph.text.strip():
                 boundary = max(event.start, self.active_paragraph.end)
                 await self._close_active(max(boundary, start_override) if start_override is not None else boundary)
@@ -837,6 +1186,12 @@ class LiveMeetingSession:
             item.text = simplify_chinese(item.text)
             item.translation_zh = item.text
             item.translation_status = "not_needed"
+        self._observe_asr_quality(
+            item,
+            event,
+            confidence=confidence,
+            language_conflict=language_conflict,
+        )
         self._upsert_recent(item)
         self._persist_paragraph(item)
         await self.broadcast("paragraph_update", paragraph=item.to_dict(), transcript_revision=self.transcript_revision)
@@ -922,6 +1277,13 @@ class LiveMeetingSession:
             return
         if prefix == self._stable_prefixes.get(item.segment_id) and not final:
             return
+        now = time.perf_counter()
+        last_scheduled = getattr(self, "_translation_last_schedule_time", {}).get(item.segment_id, 0.0)
+        if not final and now - last_scheduled < self.settings.translation_partial_debounce_ms / 1000.0:
+            return
+        if not hasattr(self, "_translation_last_schedule_time"):
+            self._translation_last_schedule_time = {}
+        self._translation_last_schedule_time[item.segment_id] = now
         self._stable_prefixes[item.segment_id] = prefix
         if item.translation_status != "streaming":
             item.translation_status = "streaming"
@@ -931,11 +1293,6 @@ class LiveMeetingSession:
         self._upsert_recent(item)
         self._persist_paragraph(item)
         await self.broadcast("paragraph_update", paragraph=item.to_dict(), transcript_revision=self.transcript_revision)
-        key = (item.segment_id, item.source_revision, final)
-        if key in self._translation_keys:
-            return
-        self._translation_keys.add(key)
-        self._translation_pending += 1
         job = {
             "segment_id": item.segment_id,
             "source_revision": item.source_revision,
@@ -945,21 +1302,59 @@ class LiveMeetingSession:
             "attempt": 0,
         }
         try:
-            if final:
-                await asyncio.wait_for(
-                    self.translation_queue.put(job),
-                    timeout=max(1.0, self.settings.translation_timeout_seconds),
+            dropped_before = int(getattr(self.translation_queue, "dropped_provisional", 0))
+            if not self.realtime_pipeline:
+                if final:
+                    await asyncio.wait_for(
+                        self.translation_queue.put(job),
+                        timeout=max(1.0, self.settings.translation_deadline_seconds),
+                    )
+                else:
+                    self.translation_queue.put_nowait(job)
+                queued = True
+            elif final:
+                queued = await asyncio.wait_for(
+                    self.translation_queue.put_latest(job),
+                    timeout=max(1.0, self.settings.translation_deadline_seconds),
                 )
             else:
-                self.translation_queue.put_nowait(job)
+                queued = self.translation_queue.put_nowait(job)
+            if queued:
+                self._translation_pending += 1
+                self._translation_enqueue_times[(item.segment_id, item.source_revision, final)] = time.perf_counter()
+            else:
+                self.pipeline_metrics["translation_jobs_coalesced"] = int(self.pipeline_metrics.get("translation_jobs_coalesced", 0)) + 1
+            self.pipeline_metrics["queue_max_depth"] = max(
+                int(self.pipeline_metrics.get("queue_max_depth", 0)),
+                self.translation_queue.qsize(),
+            )
+            self.pipeline_metrics["translation_queue_max_depth"] = max(
+                int(self.pipeline_metrics.get("translation_queue_max_depth", 0)),
+                self.translation_queue.qsize(),
+            )
+            dropped_after = int(getattr(self.translation_queue, "dropped_provisional", 0))
+            if dropped_after > dropped_before:
+                dropped = dropped_after - dropped_before
+                dropped_jobs = list(getattr(self.translation_queue, "dropped_provisional_jobs", ()))
+                dropped_jobs = dropped_jobs[-dropped:]
+                for dropped_job in dropped_jobs:
+                    dropped_key = (
+                        str(dropped_job.get("segment_id", "")),
+                        _safe_int(dropped_job.get("source_revision")),
+                        bool(dropped_job.get("final")),
+                    )
+                    self._translation_enqueue_times.pop(dropped_key, None)
+                self._translation_pending = max(0, self._translation_pending - dropped)
+                self.pipeline_metrics["translation_jobs_dropped"] = int(self.pipeline_metrics.get("translation_jobs_dropped", 0)) + dropped
+                self.pipeline_metrics["expired_translation_dropped"] = int(self.pipeline_metrics.get("expired_translation_dropped", 0)) + dropped
         except asyncio.QueueFull:
             # A partial translation is only a hint; the next final paragraph
             # will enqueue the authoritative source text.
-            self._translation_keys.discard(key)
-            self._translation_pending = max(0, self._translation_pending - 1)
+            self.pipeline_metrics["translation_jobs_dropped"] = int(self.pipeline_metrics.get("translation_jobs_dropped", 0)) + 1
+            self.pipeline_metrics["expired_translation_dropped"] = int(self.pipeline_metrics.get("expired_translation_dropped", 0)) + 1
         except asyncio.TimeoutError:
-            self._translation_keys.discard(key)
-            self._translation_pending = max(0, self._translation_pending - 1)
+            self.pipeline_metrics["translation_jobs_dropped"] = int(self.pipeline_metrics.get("translation_jobs_dropped", 0)) + 1
+            self.pipeline_metrics["expired_translation_dropped"] = int(self.pipeline_metrics.get("expired_translation_dropped", 0)) + 1
             LOGGER.warning("Translation queue remained full for %s", self.id)
 
     async def _translation_worker(self) -> None:
@@ -975,15 +1370,25 @@ class LiveMeetingSession:
                 except Exception:  # noqa: BLE001
                     LOGGER.exception("Translation worker failed for %s", self.id)
             finally:
-                self.translation_queue.task_done()
+                try:
+                    self.translation_queue.task_done(job)
+                except TypeError:
+                    self.translation_queue.task_done()
 
     async def _run_translation_job(self, job: dict[str, Any]) -> None:
-        key = (str(job["segment_id"]), _safe_int(job["source_revision"]), bool(job.get("final")))
-        requeued = False
+        segment_id = str(job["segment_id"])
+        source_revision = _safe_int(job["source_revision"])
+        final = bool(job.get("final"))
+        queued_at = self._translation_enqueue_times.pop((segment_id, source_revision, final), None)
+        if queued_at is not None:
+            self._record_metric("translation_queue_wait_ms", (time.perf_counter() - queued_at) * 1000)
+        started = time.perf_counter()
         try:
-            result = await self._translate(job["text"], job["language"])
-            item = next((value for value in self.paragraphs if value.segment_id == job["segment_id"]), None)
-            if item is None or item.source_revision != _safe_int(job["source_revision"]):
+            result = await self._translate(job["text"], job["language"], final=final)
+            self._record_metric("translation_duration_ms", (time.perf_counter() - started) * 1000)
+            item = next((value for value in self.paragraphs if value.segment_id == segment_id), None)
+            if item is None or item.source_revision != source_revision:
+                self.pipeline_metrics["stale_translation_results"] = int(self.pipeline_metrics.get("stale_translation_results", 0)) + 1
                 return
             status = str(getattr(result, "status", "failed"))
             if status in {"ready", "not_needed"}:
@@ -992,30 +1397,21 @@ class LiveMeetingSession:
                 item.translation_model = getattr(result, "model", None)
                 self.translation_errors.pop(item.segment_id, None)
             else:
-                attempt = _safe_int(job.get("attempt"))
-                if attempt < 2:
-                    retry = dict(job)
-                    retry["attempt"] = attempt + 1
-                    await asyncio.sleep(0.05 * (attempt + 1))
-                    await self.translation_queue.put(retry)
-                    requeued = True
-                    return
+                # A deadline failure is terminal for this revision.  The
+                # source remains visible and the explicit retry endpoint can
+                # enqueue a fresh final job without extending the live ASR
+                # critical path beyond the 4.5 s translation budget.
                 item.translation_status = "failed"
                 self.translation_errors[item.segment_id] = str(getattr(result, "error", None) or status)
             item.revision += 1
             self._upsert_recent(item)
             self._persist_paragraph(item)
             await self.broadcast("paragraph_update", paragraph=item.to_dict(), transcript_revision=self.transcript_revision)
+            if final and queued_at is not None:
+                self._record_metric("final_translation_ms", (time.perf_counter() - queued_at) * 1000)
         except Exception as exc:
-            item = next((value for value in self.paragraphs if value.segment_id == job["segment_id"]), None)
-            attempt = _safe_int(job.get("attempt"))
-            if item is not None and attempt < 2:
-                retry = dict(job)
-                retry["attempt"] = attempt + 1
-                await self.translation_queue.put(retry)
-                requeued = True
-                return
-            if item is not None and item.source_revision == _safe_int(job["source_revision"]):
+            item = next((value for value in self.paragraphs if value.segment_id == segment_id), None)
+            if item is not None and item.source_revision == source_revision:
                 item.translation_status = "failed"
                 item.revision += 1
                 self.translation_errors[item.segment_id] = str(exc)
@@ -1023,19 +1419,232 @@ class LiveMeetingSession:
                 self._persist_paragraph(item)
                 await self.broadcast("paragraph_update", paragraph=item.to_dict(), transcript_revision=self.transcript_revision)
         finally:
-            if not requeued:
-                self._translation_keys.discard(key)
-                self._translation_pending = max(0, self._translation_pending - 1)
+            self._translation_pending = max(0, self._translation_pending - 1)
             with suppress(Exception):
                 self._write_state()
 
-    async def _translate(self, text: str, language: str) -> Any:
+    async def _translate(self, text: str, language: str, *, final: bool = False) -> Any:
         method = getattr(self.runtime, "translate_text")
-        kwargs = self._compatible_kwargs(method, {"translation_settings": self.meeting_settings})
-        return await asyncio.wait_for(
-            asyncio.to_thread(method, text, language, **kwargs),
-            timeout=max(1.0, self.settings.translation_timeout_seconds),
+        settings = dict(self.meeting_settings)
+        settings["_gpu_priority"] = 20 if final else 60
+        kwargs = self._compatible_kwargs(method, {"translation_settings": settings})
+        call = functools.partial(method, text, language, **kwargs)
+        return await self._invoke_model_call(
+            call,
+            timeout=max(
+                1.0,
+                min(
+                    self.settings.translation_timeout_seconds,
+                    self.settings.translation_deadline_seconds,
+                ),
+            ),
+            executor_name="translation_executor",
         )
+
+    def _post_translation_context(self, items: list[Utterance], index: int) -> str:
+        radius = max(0, _safe_int(getattr(self.settings, "post_meeting_translation_context_paragraphs", 2), 2))
+        if radius == 0:
+            return ""
+        parts: list[str] = []
+        start = max(0, index - radius)
+        end = min(len(items), index + radius + 1)
+        for position in range(start, end):
+            if position == index:
+                continue
+            value = items[position].text.strip()
+            if not value:
+                continue
+            label = "上文" if position < index else "下文"
+            parts.append(f"[{label}] {value}")
+        context = "\n".join(parts)
+        limit = max(64, _safe_int(getattr(self.settings, "post_meeting_translation_context_chars", 240), 240))
+        return context[-limit:]
+
+    def _post_translation_candidates(
+        self,
+        items: list[Utterance],
+    ) -> tuple[list[tuple[Utterance, AsrQualityAssessment, str, int]], int]:
+        threshold = max(
+            0.0,
+            min(1.0, _safe_float(getattr(self.settings, "post_meeting_translation_quality_threshold", 0.62), 0.62)),
+        )
+        candidates: list[tuple[Utterance, AsrQualityAssessment, str, int]] = []
+        target_count = 0
+        for index, item in enumerate(items):
+            if not self._needs_translation(item.language, item.text) or not item.text.strip():
+                continue
+            target_count += 1
+            quality = assess_asr_quality(
+                item.text,
+                start=item.start,
+                end=item.end,
+                confidence=item.language_confidence,
+                state=self._asr_quality.get(item.segment_id),
+            )
+            translation_failed = item.translation_status in {"failed", "pending", "streaming"} or item.segment_id in self.translation_errors
+            if translation_failed or quality.score < threshold or quality.is_low:
+                candidates.append((item, quality, self._post_translation_context(items, index), item.source_revision))
+        return candidates, target_count
+
+    async def _translate_post_batch(
+        self,
+        texts: list[str],
+        language: str,
+        contexts: list[str],
+    ) -> list[Any]:
+        settings = dict(self.meeting_settings)
+        settings["_gpu_priority"] = 30
+        settings["_post_meeting"] = True
+        settings["_translation_contexts"] = list(contexts)
+        # The resident OPUS-MT engine remains local and sentence-level.  A
+        # context-capable runtime may consume _translation_contexts; the
+        # current engine still benefits from the more conservative final-pass
+        # decode settings and batched invocation.
+        settings["translation_beam_size"] = max(
+            4,
+            _safe_int(settings.get("translation_beam_size"), 2),
+        )
+        settings["translation_max_decoding_length"] = max(
+            512,
+            _safe_int(settings.get("translation_max_decoding_length"), 384),
+        )
+        settings["translation_repetition_penalty"] = max(
+            1.05,
+            _safe_float(settings.get("translation_repetition_penalty"), 1.05),
+        )
+        batch_method = getattr(self.runtime, "translate_text_batch", None)
+        if callable(batch_method):
+            kwargs = self._compatible_kwargs(batch_method, {"translation_settings": settings})
+            call = functools.partial(batch_method, texts, language, **kwargs)
+            timeout = max(5.0, _safe_float(getattr(self.settings, "post_meeting_translation_timeout_seconds", 180.0), 180.0))
+            result = await self._invoke_model_call(
+                call,
+                timeout=timeout,
+                executor_name="translation_executor",
+            )
+            values = list(result or [])
+            if len(values) != len(texts):
+                raise RuntimeError("post-translation batch returned an unexpected result count")
+            return values
+
+        # Compatibility fallback for test/runtime adapters that only expose
+        # the original single-text method.
+        values: list[Any] = []
+        for text in texts:
+            values.append(await self._translate(text, language, final=True))
+        return values
+
+    async def run_post_meeting_translation(self, *, force: bool = False) -> bool:
+        """Run the quality-filtered final translation pass once per meeting."""
+
+        enabled = bool(getattr(self.settings, "post_meeting_translation_enabled", False))
+        if not enabled and not force:
+            self.post_translation_state = "skipped"
+            self._write_state()
+            return False
+        if self.post_translation_state == "running":
+            return False
+        if self.post_translation_state == "complete" and not force:
+            return False
+
+        self.post_translation_state = "running"
+        self.post_translation_error = None
+        self._write_state()
+        started = time.perf_counter()
+        try:
+            items = sorted(self.load_transcript(), key=lambda value: (value.start, value.end, value.id))
+            candidates, target_count = self._post_translation_candidates(items)
+            self.pipeline_metrics["post_translation_candidates"] = int(
+                self.pipeline_metrics.get("post_translation_candidates", 0)
+            ) + len(candidates)
+            self.pipeline_metrics["post_translation_skipped"] = int(
+                self.pipeline_metrics.get("post_translation_skipped", 0)
+            ) + max(0, target_count - len(candidates))
+            if not candidates:
+                self.post_translation_state = "complete"
+                self._record_metric("post_translation_duration_ms", (time.perf_counter() - started) * 1000)
+                self._write_state()
+                return False
+            await self.status("会议结束，正在进行质量复核翻译", post_translation=True, candidate_count=len(candidates))
+
+            groups: dict[str, list[tuple[Utterance, AsrQualityAssessment, str, int]]] = {}
+            for candidate in candidates:
+                groups.setdefault(self._translation_language(candidate[0].language, candidate[0].text), []).append(candidate)
+
+            changed = 0
+            failures = 0
+            stale = 0
+            for language, group in groups.items():
+                texts = [item.text.strip() for item, _quality, _context, _source_revision in group]
+                contexts = [context for _item, _quality, context, _source_revision in group]
+                try:
+                    results = await self._translate_post_batch(texts, language, contexts)
+                except Exception as exc:  # noqa: BLE001
+                    failures += len(group)
+                    self.post_translation_error = str(exc)
+                    LOGGER.warning("Post-meeting translation failed for %s: %s", self.id, exc)
+                    continue
+                for (item, _quality, _context, source_revision), result in zip(group, results):
+                    current = next((value for value in self.paragraphs if value.segment_id == item.segment_id), None)
+                    if current is None or current.source_revision != source_revision:
+                        stale += 1
+                        self.pipeline_metrics["stale_translation_results"] = int(
+                            self.pipeline_metrics.get("stale_translation_results", 0)
+                        ) + 1
+                        continue
+                    status = str(getattr(result, "status", "failed"))
+                    translated = str(getattr(result, "text", "") or "").strip()
+                    if status not in {"ready", "not_needed"} or not translated:
+                        failures += 1
+                        continue
+                    if translated == current.translation_zh and current.translation_status == "ready":
+                        continue
+                    current.translation_zh = translated
+                    current.translation_status = "ready" if status == "ready" else status
+                    current.translation_model = getattr(result, "model", None) or current.translation_model
+                    self.translation_errors.pop(current.segment_id, None)
+                    current.revision += 1
+                    self._upsert_recent(current)
+                    self._persist_paragraph(current)
+                    await self.broadcast("paragraph_update", paragraph=current.to_dict(), transcript_revision=self.transcript_revision)
+                    changed += 1
+
+            self.pipeline_metrics["post_translation_retranslated"] = int(
+                self.pipeline_metrics.get("post_translation_retranslated", 0)
+            ) + changed
+            self.pipeline_metrics["post_translation_failures"] = int(
+                self.pipeline_metrics.get("post_translation_failures", 0)
+            ) + failures
+            if failures and not changed and not stale:
+                self.post_translation_state = "error"
+            else:
+                self.post_translation_state = "complete"
+            self._record_metric("post_translation_duration_ms", (time.perf_counter() - started) * 1000)
+            if self.recording_state == "complete":
+                self._export_current_files()
+            self._write_state()
+            await self.status(
+                "会后翻译完成" if self.post_translation_state == "complete" else "会后翻译部分失败",
+                post_translation=True,
+                retranslated=changed,
+                failures=failures,
+            )
+            return bool(changed)
+        except asyncio.CancelledError:
+            self.post_translation_state = "error"
+            self.post_translation_error = "post-meeting translation cancelled"
+            self._write_state()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.post_translation_state = "error"
+            self.post_translation_error = str(exc)
+            self.pipeline_metrics["post_translation_failures"] = int(
+                self.pipeline_metrics.get("post_translation_failures", 0)
+            ) + 1
+            self._record_metric("post_translation_duration_ms", (time.perf_counter() - started) * 1000)
+            self._write_state()
+            LOGGER.exception("Post-meeting translation failed for %s", self.id)
+            return False
 
     async def retry_translation(self) -> bool:
         if self.recording_state not in {"complete", "recording", "finalizing"}:
@@ -1052,7 +1661,7 @@ class LiveMeetingSession:
 
     async def _wait_for_queue(
         self,
-        queue: asyncio.Queue[Any],
+        queue: Any,
         worker: asyncio.Task[Any] | None,
         *,
         label: str,
@@ -1069,6 +1678,13 @@ class LiveMeetingSession:
             worker.cancel()
             with suppress(asyncio.CancelledError):
                 await worker
+        abort = getattr(queue, "abort", None)
+        if callable(abort):
+            abort()
+            if label == "translation":
+                self._translation_pending = 0
+                self._translation_enqueue_times.clear()
+            return
         while True:
             try:
                 queued = queue.get_nowait()
@@ -1076,14 +1692,11 @@ class LiveMeetingSession:
                 break
             else:
                 if label == "translation" and isinstance(queued, dict):
-                    key = (
-                        str(queued.get("segment_id", "")),
-                        _safe_int(queued.get("source_revision")),
-                        bool(queued.get("final")),
-                    )
-                    self._translation_keys.discard(key)
                     self._translation_pending = max(0, self._translation_pending - 1)
-                queue.task_done()
+                try:
+                    queue.task_done(queued)
+                except TypeError:
+                    queue.task_done()
 
     async def request_stop(self, reason: str = "user") -> None:
         if self.recording_state in {"created", "complete", "error"}:
@@ -1115,6 +1728,7 @@ class LiveMeetingSession:
                     await self.translation_worker_task
             if self.audio_writer:
                 self.audio_segments = await asyncio.to_thread(self.audio_writer.close)
+            await self.run_post_meeting_translation()
             self.ended_at = utc_now_iso()
             self.recording_state = "complete"
             self.todo_state = "waiting_summary"
@@ -1354,18 +1968,40 @@ class SessionManager:
         self._shutting_down = True
 
     async def delete(self, meeting_id: str) -> bool:
-        session = self.sessions.get(meeting_id)
-        if session and (session.active or session.has_active_tasks):
-            raise ValueError("会议或后台任务进行中，不能删除")
-        if meeting_id not in self.sessions and not self.store.meeting_dir(meeting_id).exists():
-            return False
-        self.sessions.pop(meeting_id, None)
-        self.store.delete(meeting_id)
-        return True
+        async with self._create_lock:
+            session = self.sessions.get(meeting_id)
+            if session and (session.active or session.has_active_tasks):
+                raise ValueError("会议或后台任务进行中，不能删除")
+            try:
+                exists_on_disk = self.store.meeting_dir(meeting_id).exists()
+            except ValueError:
+                return False
+            if meeting_id not in self.sessions and not exists_on_disk:
+                return False
+            self.sessions.pop(meeting_id, None)
+            self.store.delete(meeting_id)
+            return True
 
     async def resume_pending(self, *, model_tasks_ready: bool = True) -> None:
-        del model_tasks_ready
-        # Schema 2 only resumes persisted completed meetings.  Translation is
-        # never silently re-run during recovery; the explicit retry endpoint is
-        # the safe recovery mechanism for a failed translation.
-        return
+        if not model_tasks_ready or self._shutting_down:
+            return
+        # A process can exit after final ASR but before the post-meeting pass
+        # writes its completed state.  Resume only that explicitly persisted
+        # pass; ordinary failed live translations still require the existing
+        # retry endpoint.
+        for session in self.sessions.values():
+            if session.recording_state != "complete" or session.post_translation_state not in {"idle", "running"}:
+                continue
+            if session.post_translation_task and not session.post_translation_task.done():
+                continue
+
+            async def run_post_pass(value: LiveMeetingSession = session) -> None:
+                try:
+                    await value.run_post_meeting_translation(force=True)
+                finally:
+                    value.post_translation_task = None
+
+            session.post_translation_task = asyncio.create_task(
+                run_post_pass(),
+                name=f"post-translation-recovery-{session.id}",
+            )

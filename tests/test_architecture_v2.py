@@ -11,10 +11,10 @@ from fastapi.testclient import TestClient
 from realtime_meeting.audio import SegmentEvent
 from realtime_meeting.config import Settings, default_meeting_settings, normalize_meeting_settings
 from realtime_meeting.exporter import export_live_result
-from realtime_meeting.jimo import transcript_chunks
+from realtime_meeting.jimo import JimoClient, TodoGenerator, transcript_chunks
 from realtime_meeting.language import OFFICIAL_SPEECH_VARIANTS, is_mixed_source_text, normalize_qwen_label
-from realtime_meeting.models import Utterance
-from realtime_meeting.runtime import LiveModelRuntime, PartialResult, TranslationResult
+from realtime_meeting.models import TodoDocument, TodoItem, Utterance
+from realtime_meeting.runtime import LiveModelRuntime, PartialResult, TranslationResult, _canonical_qwen_model
 from realtime_meeting.server import create_app
 from realtime_meeting.session import LiveMeetingSession
 from realtime_meeting.storage import LocalMeetingStore, TranscriptStore
@@ -67,15 +67,24 @@ def test_qwen_language_and_variant_normalization() -> None:
     assert normalize_qwen_label("not-a-language").code == "unknown"
 
 
-def test_settings_use_two_qwen_models_and_have_no_removed_controls() -> None:
+def test_settings_default_to_single_1_7b_no_lid_and_have_no_removed_controls() -> None:
     settings = Settings()
     assert settings.asr_primary == "Qwen/Qwen3-ASR-1.7B"
-    assert settings.asr_fallback == "Qwen/Qwen3-ASR-0.6B"
-    assert settings.language_id_model == "Qwen/Qwen3-ASR-0.6B"
+    assert settings.single_asr_model is True
+    assert settings.asr_fallback == settings.asr_primary
+    assert settings.language_id_model == settings.asr_primary
+    assert settings.language_id_on_segment is True
+    assert settings.language_conflict_confirmations == 3
+    assert settings.post_meeting_translation_enabled is False
+    assert settings.recognition_architecture == "single_1_7b_no_lid"
     values = default_meeting_settings(settings)
     assert "keep_audio" in values
     assert values["realtime_asr_model"] == "primary"
-    assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, settings)["realtime_asr_model"] == "small"
+    assert values["recognition_architecture"] == "single_1_7b_no_lid"
+    assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, settings)["realtime_asr_model"] == "primary"
+    legacy = Settings(single_asr_model=False, asr_fallback="Qwen/Qwen3-ASR-0.6B")
+    assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, legacy)["realtime_asr_model"] == "small"
+    assert normalize_meeting_settings({"recognition_architecture": "router_mixed"}, settings)["recognition_architecture"] == "single_1_7b_no_lid"
     assert not any("refine" in key or "speaker" in key or "diar" in key for key in values)
 
 
@@ -121,6 +130,58 @@ def test_qwen_runtime_can_select_the_small_model_for_realtime() -> None:
     assert calls == ["small", "primary"]
 
 
+def test_single_qwen_runtime_shares_one_checkpoint_across_roles(monkeypatch) -> None:
+    runtime = LiveModelRuntime(
+        "Qwen/Qwen3-ASR-1.7B",
+        "Qwen/Qwen3-ASR-1.7B",
+        "cpu",
+        language_id_model="Qwen/Qwen3-ASR-1.7B",
+        single_model=True,
+        vad_model="disabled",
+    )
+    fake = object()
+    monkeypatch.setattr(runtime.primary_engine, "load", lambda *_args, **_kwargs: fake)
+    monkeypatch.setattr(runtime.small_engine, "load", lambda *_args, **_kwargs: pytest.fail("duplicate model load"))
+    runtime.load(lambda _message: None)
+    assert runtime.primary is fake
+    assert runtime.fallback is fake
+    assert runtime.language_id is fake
+    assert _canonical_qwen_model("Qwen/Qwen3-ASR-1.7B") == _canonical_qwen_model("qwen3-asr-1.7b")
+    runtime.close()
+
+
+def test_runtime_treats_disabled_vad_as_ready(monkeypatch) -> None:
+    runtime = LiveModelRuntime(
+        "Qwen/Qwen3-ASR-1.7B",
+        "Qwen/Qwen3-ASR-1.7B",
+        "cpu",
+        language_id_model="Qwen/Qwen3-ASR-1.7B",
+        vad_model="disabled",
+    )
+    fake_model = object()
+
+    class ReadyTranslator:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def preflight(self):
+            return {"en": {"ready": True}, "de": {"ready": True}}
+
+        def assets_snapshot(self):
+            return {"en": {"ready": True}, "de": {"ready": True}}
+
+    monkeypatch.setattr(runtime, "_prepare_model_cache", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runtime.primary_engine, "load", lambda *_args, **_kwargs: fake_model)
+    monkeypatch.setattr(runtime.small_engine, "load", lambda *_args, **_kwargs: pytest.fail("duplicate model load"))
+    monkeypatch.setattr("realtime_meeting.runtime.LiveChineseTranslator", ReadyTranslator)
+    runtime.load(lambda _message: None)
+    try:
+        assert runtime.ready is True
+        assert runtime.capabilities_ready is True
+    finally:
+        runtime.close()
+
+
 def test_transcript_store_is_schema_2_and_has_only_paragraph_fields(tmp_path) -> None:
     store = TranscriptStore(tmp_path / "transcript.jsonl")
     item = Utterance(
@@ -143,6 +204,71 @@ def test_transcript_store_is_schema_2_and_has_only_paragraph_fields(tmp_path) ->
     assert not any(key.startswith("speaker") or key.startswith("recognition") for key in payload["paragraphs"][0])
     store.delete(loaded)
     assert store.load() == []
+
+
+def test_recovered_todo_and_live_threshold_settings_are_restored(settings) -> None:
+    todo = TodoDocument(
+        items=[TodoItem(task="发布测试版本", owner="研发", id="todo-1", meeting_id="meeting-recovered", summary_revision=2)],
+        meeting_id="meeting-recovered",
+        summary_revision=2,
+        generated_at="2026-08-17T00:00:00+00:00",
+    )
+    meeting = LiveMeetingSession(
+        settings,
+        FakeRuntime(),
+        LocalMeetingStore(settings.results_dir),
+        meeting_id="meeting-recovered",
+        recovered_state={
+            "schema_version": "2.0",
+            "id": "meeting-recovered",
+            "recording_state": "complete",
+            "volume_threshold_percent": 1.0,
+            "meeting_settings": {"volume_threshold_percent": 4.5},
+            "todo": todo.to_dict(),
+        },
+    )
+    assert [item.task for item in meeting.todo.items] == ["发布测试版本"]
+    assert meeting.volume_threshold_percent == 4.5
+    assert meeting.meeting_settings["volume_threshold_percent"] == 4.5
+    meeting.configure_volume_threshold(7.3)
+    assert meeting.meeting_settings["volume_threshold_percent"] == 7.3
+
+
+@pytest.mark.asyncio
+async def test_load_transcript_rebinds_active_paragraph(settings) -> None:
+    meeting = LiveMeetingSession(settings, FakeRuntime(), LocalMeetingStore(settings.results_dir))
+    await meeting._upsert_source(
+        SegmentEvent("partial", b"", 0.0, 1.0, 1),
+        "正在记录",
+        language="zh",
+        speech_variant="mandarin",
+        confidence=0.9,
+        asr_model="fake-qwen",
+        language_source="qwen",
+    )
+    original = meeting.active_paragraph
+    loaded = meeting.load_transcript()
+    assert loaded and meeting.active_paragraph is loaded[0]
+    assert meeting.active_paragraph is not original
+
+
+@pytest.mark.asyncio
+async def test_todo_request_is_bounded_by_jimo_request_limit(settings) -> None:
+    settings.jimo_max_request_chars = 1_200
+
+    class CapturingClient:
+        def __init__(self) -> None:
+            self.messages = None
+
+        async def complete(self, messages, _session_id, **_kwargs):
+            self.messages = messages
+            return '{"items": []}'
+
+    client = CapturingClient()
+    result = await TodoGenerator(settings, client).generate("meeting-1", 1, "行动项内容。" * 2_000)
+    assert result.items == []
+    assert client.messages is not None
+    assert JimoClient.request_chars(client.messages) <= settings.jimo_max_request_chars
 
 
 class FakeRuntime:
@@ -181,6 +307,31 @@ class FakeRuntime:
 
 
 @pytest.mark.asyncio
+async def test_default_single_model_strategy_probes_language_once_and_uses_primary(settings) -> None:
+    class NoLidRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.detect_calls = 0
+            self.roles: list[str] = []
+
+        def detect_language(self, _pcm: bytes, **_kwargs):
+            self.detect_calls += 1
+            from realtime_meeting.language import LanguageGuess
+
+            return LanguageGuess("en", 0.95, raw_qwen_label="English")
+
+        def transcribe_partial(self, event, **kwargs):
+            self.roles.append(str(kwargs.get("decode_settings", {}).get("realtime_asr_model")))
+            return PartialResult(event.revision, event.start, event.end, "hello", "en", 0.9, "fake-qwen")
+
+    runtime = NoLidRuntime()
+    meeting = LiveMeetingSession(settings, runtime, LocalMeetingStore(settings.results_dir))
+    await meeting._handle_event(SegmentEvent("partial", b"\0\0" * 16_000, 0.0, 1.0, 1))
+    assert runtime.detect_calls == 1
+    assert runtime.roles == ["primary"]
+
+
+@pytest.mark.asyncio
 async def test_forced_audio_cut_is_merged_and_language_change_closes_paragraph(settings) -> None:
     from realtime_meeting.language import LanguageGuess
 
@@ -203,6 +354,8 @@ async def test_forced_audio_cut_is_merged_and_language_change_closes_paragraph(s
         assert paragraphs[0].closed is True
         assert paragraphs[1].start >= paragraphs[0].end
         assert paragraphs[0].text == "We will ship the beta next week."
+        # The same-model language probe may enrich Chinese with a dialect
+        # variant, but it never creates a separate paragraph for that variant.
         assert paragraphs[1].speech_variant == "mandarin"
         assert all("speaker" not in key for item in paragraphs for key in item.to_dict())
     finally:
@@ -222,11 +375,13 @@ async def test_consistent_asr_language_change_closes_paragraph_without_lid_confi
                 ("hello everyone", "en"),
                 ("大家好", "zh"),
                 ("大家好", "zh"),
+                ("大家好", "zh"),
             ])
 
         def detect_language(self, _pcm: bytes, **_kwargs):
-            # The LID can be unavailable on a busy machine; two consistent
-            # ASR language labels are still enough to split safely.
+            # The LID can be unavailable on a busy machine; consistent ASR
+            # language labels are still enough to split safely after the
+            # configured three conflicts.
             return None
 
         def transcribe_partial(self, event, **_kwargs):
@@ -237,7 +392,7 @@ async def test_consistent_asr_language_change_closes_paragraph_without_lid_confi
     await meeting.start()
     try:
         event = SegmentEvent("partial", b"\0\0" * 16_000, 0.0, 1.0, 1)
-        for _ in range(4):
+        for _ in range(5):
             await meeting._handle_event(event)
         paragraphs = meeting.load_transcript()
         assert [item.language for item in paragraphs] == ["en", "zh"]
@@ -457,6 +612,29 @@ def test_export_is_paragraph_based_and_does_not_write_identity_artifacts(tmp_pat
     assert "speaker_segments.json" not in files
 
 
+def test_export_exposes_summary_and_todo_files_for_download(tmp_path) -> None:
+    for name, content in (
+        ("meeting_minutes.md", "# 会议纪要"),
+        ("todo_list.json", "{\"items\": []}"),
+        ("todo_list.md", "# To-do-list"),
+    ):
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    files = export_live_result(
+        tmp_path,
+        meeting_id="m1",
+        title="测试",
+        started_at="",
+        ended_at="",
+        duration_seconds=0,
+        utterances=[],
+        audio_segments=[],
+        recording_state="complete",
+        summary_state="complete",
+        todo_state="complete",
+    )
+    assert {"meeting_minutes.md", "todo_list.json", "todo_list.md"} <= set(files)
+
+
 def test_api_removes_old_route_and_exposes_translation_retry(tmp_path) -> None:
     settings = Settings(results_dir=tmp_path / "meetings", translation_model_root=tmp_path / "models")
     app = create_app(settings, FakeRuntime(), load_models=False, store=LocalMeetingStore(settings.results_dir))
@@ -495,7 +673,7 @@ def test_web_client_has_one_paragraph_event_and_no_removed_controls() -> None:
     assert "quality:" not in app_js
     assert 'value="low_latency"' not in html
     assert 'value="quality"' not in html
-    assert 'id="realtimeasrmodel"' in html
+    assert 'id="recognitionarchitecture"' not in html
     for removed in ("asrspeechstartms", "asraudioprerollms", "asrminimumspeechms", "asrspeechratio", "asrmaxutteranceseconds"):
         assert removed not in html
     for removed in ("language_lock", "dialect_hint", "postprocess", "refinement", "diarization", "speaker"):

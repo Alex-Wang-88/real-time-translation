@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,8 +36,9 @@ MODEL_REVISIONS = {
 }
 QWEN_ASR_PRIMARY_MODEL = "Qwen/Qwen3-ASR-1.7B"
 QWEN_ASR_SMALL_MODEL = "Qwen/Qwen3-ASR-0.6B"
-# Public compatibility constants; both point to Qwen models now.
-QWEN_ASR_MODEL = QWEN_ASR_SMALL_MODEL
+# Public compatibility constant now follows the production model.  The small
+# checkpoint name remains available only for explicit legacy benchmarks.
+QWEN_ASR_MODEL = QWEN_ASR_PRIMARY_MODEL
 QWEN_ASR_MODELS = {
     "qwen3-asr-0.6b": QWEN_ASR_SMALL_MODEL,
     "qwen3-asr-1.7b": QWEN_ASR_PRIMARY_MODEL,
@@ -177,6 +179,13 @@ def _is_qwen_asr_model(model_name: str | None) -> bool:
     return short in QWEN_ASR_MODELS
 
 
+def _canonical_qwen_model(model_name: str | None) -> str:
+    """Return a stable identity so one Qwen checkpoint can be shared by roles."""
+    value = str(model_name or "").strip().casefold()
+    short = value.rsplit("/", 1)[-1]
+    return QWEN_ASR_MODELS.get(short, value).casefold()
+
+
 def _model_snapshot(model_name: str, *, local_files_only: bool) -> Path:
     from huggingface_hub import snapshot_download
 
@@ -291,7 +300,7 @@ class RealtimeAsrEngine:
 
 
 class LanguageIdEngine(RealtimeAsrEngine):
-    """The 0.6B Qwen model shared by language ID and ASR fallback."""
+    """Qwen model holder used when language ID needs its own checkpoint."""
 
 
 class LiveChineseTranslator:
@@ -299,15 +308,44 @@ class LiveChineseTranslator:
 
     CACHE_LIMIT = 4096
 
-    def __init__(self, model_root: Path | None, device: str, progress: Callable[[str], None] | None = None, autodownload: bool = False) -> None:
+    def __init__(
+        self,
+        model_root: Path | None,
+        device: str,
+        progress: Callable[[str], None] | None = None,
+        autodownload: bool = False,
+        gpu_manager: GpuResourceManager | None = None,
+    ) -> None:
         self.model_root = model_root
         self.device = device
         self.progress = progress or (lambda _message: None)
         self.autodownload = autodownload
+        self.gpu_manager = gpu_manager
         self.models: dict[str, tuple[Any, Any, Any, str, str]] = {}
         self.failed: dict[str, str] = {}
         self.cache: dict[tuple[str, str, int, int, float], TranslationResult] = {}
         self._lock = threading.RLock()
+        # Optional model downloads are allowed only during explicit startup
+        # preflight.  A live translation request must never reach the network.
+        self._startup_preflight = False
+
+    def warmup(self) -> None:
+        """Load both local translation models and run a tiny decode.
+
+        File preflight alone does not initialize CTranslate2.  Doing that on
+        the first live paragraph is the main source of the apparent first
+        translation delay, so startup owns the cold-load cost instead.
+        """
+
+        for source, text in (("en", "warm up"), ("de", "Aufwärmen")):
+            loaded = self._load(source)
+            if loaded is None:
+                continue
+            source_sp, _target_sp, translator, _model_id, target_tag = loaded
+            pieces = [[target_tag] + source_sp.encode(text, out_type=str) + ["</s>"]]
+            context = self.gpu_manager.acquire_sync("translation_warmup", priority=50) if self.gpu_manager else _null_context()
+            with context:
+                translator.translate_batch(pieces, beam_size=1, max_decoding_length=32, repetition_penalty=1.0)
 
     def _find(self, source: str) -> Path | None:
         if not self.model_root:
@@ -327,7 +365,7 @@ class LiveChineseTranslator:
 
     def _download_if_needed(self, source: str) -> Path | None:
         path = self._find(source)
-        if path is not None or not self.autodownload or self.model_root is None:
+        if path is not None or not self.autodownload or self.model_root is None or not self._startup_preflight:
             return path
         try:
             prepare_opus_mt_model(source, self.model_root, progress=self.progress)
@@ -352,10 +390,14 @@ class LiveChineseTranslator:
         return result
 
     def preflight(self) -> dict[str, dict[str, Any]]:
-        for source in ("en", "de"):
-            path = self._download_if_needed(source)
-            if path is None:
-                self.failed.setdefault(source, "model not cached")
+        self._startup_preflight = True
+        try:
+            for source in ("en", "de"):
+                path = self._download_if_needed(source)
+                if path is None:
+                    self.failed.setdefault(source, "model not cached")
+        finally:
+            self._startup_preflight = False
         return self.assets_snapshot()
 
     @staticmethod
@@ -443,13 +485,18 @@ class LiveChineseTranslator:
             source_sp, target_sp, translator, model_id, target_tag = loaded
             try:
                 pieces = [[target_tag] + source_sp.encode(value, out_type=str) + ["</s>"] for _, value in pending]
-                with self._lock:
-                    generated = translator.translate_batch(
-                        pieces,
-                        beam_size=beam_size,
-                        max_decoding_length=max_decoding_length,
-                        repetition_penalty=repetition_penalty,
-                    )
+                context = self.gpu_manager.acquire_sync(
+                    "translation",
+                    priority=max(1, int(float(values.get("_gpu_priority", 40)))),
+                ) if self.gpu_manager else _null_context()
+                with context:
+                    with self._lock:
+                        generated = translator.translate_batch(
+                            pieces,
+                            beam_size=beam_size,
+                            max_decoding_length=max_decoding_length,
+                            repetition_penalty=repetition_penalty,
+                        )
                 for (index, value), hypothesis in zip(pending, generated):
                     tokens = list(hypothesis.hypotheses[0])
                     translated = simplify_chinese(target_sp.decode(tokens).strip())
@@ -486,7 +533,7 @@ class PartialResult:
 
 
 class LiveModelRuntime:
-    """Resident Qwen3-ASR runtime with one small model shared by LID/fallback."""
+    """Resident Qwen3-ASR runtime with explicit role sharing for model variants."""
 
     def __init__(
         self,
@@ -497,26 +544,34 @@ class LiveModelRuntime:
         asr_autodownload: bool = False,
         translation_model_root: Path | None = None,
         translation_autodownload: bool = False,
+        translation_warmup: bool = True,
         vad_model: str = "fsmn-vad",
         language_id_model: str | None = None,
+        single_model: bool = False,
         **_legacy_options: Any,
     ) -> None:
         if requested_device not in {"auto", "cpu", "cuda"} and legacy_args and legacy_args[0] in {"auto", "cpu", "cuda"}:
             requested_device = legacy_args[0]
         self.asr_primary_name = asr_primary or QWEN_ASR_PRIMARY_MODEL
-        self.asr_fallback_name = asr_fallback or QWEN_ASR_SMALL_MODEL
-        self.language_id_name = language_id_model or self.asr_fallback_name
+        self.single_model = bool(single_model)
+        self.asr_fallback_name = self.asr_primary_name if self.single_model else (asr_fallback or QWEN_ASR_SMALL_MODEL)
+        self.language_id_name = self.asr_primary_name if self.single_model else (language_id_model or self.asr_fallback_name)
         self.requested_device = requested_device
         self.asr_autodownload = asr_autodownload
         self.translation_model_root = translation_model_root
         self.translation_autodownload = translation_autodownload
+        self.translation_warmup = bool(translation_warmup)
         self.vad_model_name = vad_model
         self.device = "cpu"
         self.compute_type = "int8"
         self.gpu_manager = GpuResourceManager()
         self.primary_engine = RealtimeAsrEngine(self.asr_primary_name, self.gpu_manager, autodownload=asr_autodownload)
         self.small_engine = LanguageIdEngine(self.asr_fallback_name, self.gpu_manager, autodownload=asr_autodownload)
-        self.language_id_engine = self.small_engine
+        self.language_id_engine = (
+            self.small_engine
+            if _canonical_qwen_model(self.language_id_name) == _canonical_qwen_model(self.asr_fallback_name)
+            else LanguageIdEngine(self.language_id_name, self.gpu_manager, autodownload=asr_autodownload)
+        )
         self.primary: Any | None = None
         self.fallback: Any | None = None
         self.language_id: Any | None = None
@@ -539,6 +594,12 @@ class LiveModelRuntime:
         self.realtime_cache_ready = False
         self.language_id_cache_ready = False
         self.last_asr_error: str | None = None
+        # A timed-out asyncio wrapper must never allow a second call to enter
+        # the same model concurrently while the original thread is still
+        # unwinding.  Dedicated one-thread executors provide that safety while
+        # the GPU manager arbitrates ASR, LID and translation across stages.
+        self.inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="meeting-asr")
+        self.translation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="meeting-translation")
 
     def _event(self, name: str, **details: Any) -> None:
         events = self.metrics.setdefault("model_events", [])
@@ -579,48 +640,91 @@ class LiveModelRuntime:
         self.device, self.compute_type = choose_device(self.requested_device)
         try:
             primary_ready = self._prepare_model_cache(self.asr_primary_name, progress)
-            small_ready = self._prepare_model_cache(self.asr_fallback_name, progress)
-            if not small_ready:
-                raise RuntimeError(f"small Qwen model unavailable: {self.asr_fallback_name}")
+            primary_identity = _canonical_qwen_model(self.asr_primary_name)
+            fallback_identity = _canonical_qwen_model(self.asr_fallback_name)
+            fallback_ready = (
+                primary_ready
+                if fallback_identity == primary_identity
+                else self._prepare_model_cache(self.asr_fallback_name, progress)
+            )
+            language_id_identity = _canonical_qwen_model(self.language_id_name)
+            language_id_ready = (
+                True
+                if language_id_identity in {primary_identity, fallback_identity}
+                else self._prepare_model_cache(self.language_id_name, progress)
+            )
+            if not language_id_ready:
+                raise RuntimeError(f"language ID Qwen model unavailable: {self.language_id_name}")
             try:
                 progress(f"loading realtime ASR: {self.asr_primary_name}")
                 self.primary = self.primary_engine.load(self.device, self.compute_type)
             except Exception as exc:
                 self._event("primary_load_error", model=self.asr_primary_name, error=str(exc))
                 self.primary = None
-            progress(f"loading small Qwen ASR: {self.asr_fallback_name}")
-            self.fallback = self.small_engine.load(self.device, self.compute_type)
-            self.language_id = self.fallback
-            self.realtime_cache_ready = primary_ready or self.fallback is not None
-            self.asr_cache_ready = self.realtime_cache_ready and self.fallback is not None
-            self.language_id_cache_ready = self.fallback is not None
+            if fallback_identity == primary_identity and self.primary is not None:
+                progress(f"reusing realtime ASR for fallback: {self.asr_fallback_name}")
+                self.fallback = self.primary
+            elif fallback_ready:
+                progress(f"loading fallback Qwen ASR: {self.asr_fallback_name}")
+                try:
+                    self.fallback = self.small_engine.load(self.device, self.compute_type)
+                except Exception as exc:
+                    self._event("fallback_load_error", model=self.asr_fallback_name, error=str(exc))
+                    self.fallback = None
+            else:
+                self._event("fallback_unavailable", model=self.asr_fallback_name)
+            if language_id_identity == primary_identity and self.primary is not None:
+                self.language_id = self.primary
+            elif language_id_identity == fallback_identity and self.fallback is not None:
+                self.language_id = self.fallback
+            elif language_id_ready:
+                progress(f"loading language ID Qwen ASR: {self.language_id_name}")
+                try:
+                    self.language_id = self.language_id_engine.load(self.device, self.compute_type)
+                except Exception as exc:
+                    self._event("language_id_load_error", model=self.language_id_name, error=str(exc))
+                    self.language_id = None
+            del primary_ready
+            self.realtime_cache_ready = self.primary is not None or self.fallback is not None
+            self.asr_cache_ready = self.realtime_cache_ready
+            self.language_id_cache_ready = self.language_id is not None
             self.translator = LiveChineseTranslator(
                 self.translation_model_root,
                 self.device,
                 progress,
                 self.translation_autodownload,
+                self.gpu_manager,
             )
-            translation_assets = self.translator.preflight()
-            try:
-                from funasr import AutoModel
+            self.translator.preflight()
+            if self.translation_warmup:
+                try:
+                    progress("warming local translation models")
+                    warmup = getattr(self.translator, "warmup", None)
+                    if callable(warmup):
+                        warmup()
+                except Exception as exc:
+                    self._event("translation_warmup_error", error=str(exc))
+            if self.vad_model_name != "disabled":
+                try:
+                    from funasr import AutoModel
 
-                runtime_device = f"{self.device}:0" if self.device == "cuda" else self.device
-                self.vad = AutoModel(
-                    model=self._resolve_vad_source(),
-                    hub="hf",
-                    trust_remote_code=True,
-                    disable_update=True,
-                    device=runtime_device,
-                )
-            except Exception as exc:
-                self._event("vad_load_error", error=str(exc))
-                self.vad = None
+                    runtime_device = f"{self.device}:0" if self.device == "cuda" else self.device
+                    self.vad = AutoModel(
+                        model=self._resolve_vad_source(),
+                        hub="hf",
+                        trust_remote_code=True,
+                        disable_update=True,
+                        device=runtime_device,
+                    )
+                except Exception as exc:
+                    self._event("vad_load_error", error=str(exc))
+                    self.vad = None
             self.ready = True
-            self.capabilities_ready = bool(
-                self.asr_cache_ready
-                and self.vad is not None
-                and all(item["ready"] for item in translation_assets.values())
-            )
+            vad_ready = self.vad is not None or self.vad_model_name == "disabled"
+            # Translation is an optional local stage.  Missing OPUS-MT files
+            # must be visible in capabilities, but cannot prevent ASR from
+            # accepting a meeting or closing its final transcript.
+            self.capabilities_ready = bool(self.asr_cache_ready and vad_ready)
             issues = self._capability_issues()
             self.status = "models ready" if not issues else "ASR ready; missing capabilities: " + "; ".join(issues)
             self._event("ready", device=self.device, capabilities_ready=self.capabilities_ready)
@@ -646,9 +750,15 @@ class LiveModelRuntime:
 
     def close(self) -> None:
         with self._model_lock:
-            self.primary_engine.release()
-            self.small_engine.release()
+            released_engines: set[int] = set()
+            for engine in (self.primary_engine, self.small_engine, self.language_id_engine):
+                if id(engine) in released_engines:
+                    continue
+                released_engines.add(id(engine))
+                engine.release()
             self.primary = self.fallback = self.language_id = None
+            self.inference_executor.shutdown(wait=False, cancel_futures=True)
+            self.translation_executor.shutdown(wait=False, cancel_futures=True)
         self.translator = None
         self.vad = None
         self.ready = False
@@ -659,6 +769,13 @@ class LiveModelRuntime:
         # The realtime models stay resident for the entire process; stopping a
         # meeting only flushes queues and never tears down model state.
         del progress
+        if self.translator and self.translation_warmup:
+            try:
+                warmup = getattr(self.translator, "warmup", None)
+                if callable(warmup):
+                    warmup()
+            except Exception as exc:
+                self._event("translation_warmup_error", error=str(exc))
         return
 
     def new_vad(self) -> Callable[[bytes], bool | None] | None:
@@ -721,7 +838,7 @@ class LiveModelRuntime:
         if model is None:
             return None
         try:
-            with self.gpu_manager.acquire_sync("qwen_language_id") if self.device == "cuda" else _null_context():
+            with self.gpu_manager.acquire_sync("qwen_language_id", priority=10) if self.device == "cuda" else _null_context():
                 text, raw = self._qwen_decode(pcm, model)
             self.metrics["language_id_calls"] = int(self.metrics.get("language_id_calls", 0)) + 1
             guess = normalize_qwen_label(raw, text)
@@ -750,6 +867,11 @@ class LiveModelRuntime:
             "0.6b",
             self.asr_fallback_name.casefold(),
         }
+        if self.single_model:
+            # Meeting settings from an older client may still request the
+            # legacy small/fallback role. Production single-model mode must
+            # never route that request to a second checkpoint.
+            small_requested = False
         if small_requested:
             model = self.fallback
             model_name = self.asr_fallback_name
@@ -767,7 +889,10 @@ class LiveModelRuntime:
         try:
             if model is None:
                 raise RuntimeError(f"Qwen ASR model is not loaded: {model_name}")
-            with self.gpu_manager.acquire_sync(model_lock) if self.device == "cuda" else _null_context():
+            # Lower number means higher priority: final ASR > language
+            # switch confirmation > final translation > partial ASR.
+            asr_priority = 5 if event.kind == "final" else 40
+            with self.gpu_manager.acquire_sync(model_lock, priority=asr_priority) if self.device == "cuda" else _null_context():
                 text, raw = self._qwen_decode(model=model, pcm=event.pcm, prompt=prompt, language=language, speech_variant=speech_variant)
         except Exception as exc:
             self.metrics["fallback_count"] = int(self.metrics.get("fallback_count", 0)) + 1
@@ -778,7 +903,7 @@ class LiveModelRuntime:
             try:
                 if model is None:
                     raise RuntimeError(f"Qwen ASR model is not loaded: {model_name}")
-                with self.gpu_manager.acquire_sync(alternate_lock) if self.device == "cuda" else _null_context():
+                with self.gpu_manager.acquire_sync(alternate_lock, priority=asr_priority) if self.device == "cuda" else _null_context():
                     text, raw = self._qwen_decode(model=model, pcm=event.pcm, prompt=prompt, language=language, speech_variant=speech_variant)
             except Exception as fallback_exc:
                 self.metrics["stage_failures"] = int(self.metrics.get("stage_failures", 0)) + 1
@@ -831,7 +956,8 @@ class LiveModelRuntime:
         if language == "zh" and not is_mixed_source_text(text):
             return TranslationResult(simplify_chinese(text), "not_needed")
         if language == "zh" and is_mixed_source_text(text):
-            language = "en"
+            guessed = normalize_qwen_label("unknown", text).code
+            language = guessed if guessed in {"en", "de"} else "en"
         if self.translator is None:
             return TranslationResult("", "failed", error="translator unavailable")
         self.metrics["translation_calls"] = int(self.metrics.get("translation_calls", 0)) + 1
@@ -847,6 +973,7 @@ class LiveModelRuntime:
 
     def capability_snapshot(self) -> dict[str, Any]:
         return {
+            "single_model": self.single_model,
             "asr_primary": {"model": self.asr_primary_name, "ready": self.primary is not None},
             "asr_fallback": {"model": self.asr_fallback_name, "ready": self.fallback is not None},
             "language_id": {"model": self.language_id_name, "ready": self.language_id is not None},

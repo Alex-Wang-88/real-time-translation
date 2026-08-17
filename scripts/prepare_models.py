@@ -11,7 +11,6 @@ from realtime_meeting.runtime import (
     MODEL_REVISIONS,
     OPUS_MT_REPOSITORIES,
     QWEN_ASR_PRIMARY_MODEL,
-    QWEN_ASR_SMALL_MODEL,
     _is_qwen_asr_model,
     _model_snapshot,
     prepare_opus_mt_model,
@@ -66,10 +65,12 @@ def _check_vad(autodownload: bool) -> dict[str, Any]:
 
 
 def _check_asr(autodownload: bool) -> dict[str, Any]:
+    primary = os.getenv("MEETING_ASR_PRIMARY", QWEN_ASR_PRIMARY_MODEL)
+    single_model = os.getenv("MEETING_SINGLE_ASR_MODEL", "1").strip().casefold() in {"1", "true", "yes", "on"}
     models = {
-        "primary": os.getenv("MEETING_ASR_PRIMARY", QWEN_ASR_PRIMARY_MODEL),
-        "fallback": os.getenv("MEETING_ASR_FALLBACK", QWEN_ASR_SMALL_MODEL),
-        "language_id": os.getenv("MEETING_ASR_LANGUAGE_ID", QWEN_ASR_SMALL_MODEL),
+        "primary": primary,
+        "fallback": primary if single_model else os.getenv("MEETING_ASR_FALLBACK", QWEN_ASR_PRIMARY_MODEL),
+        "language_id": primary if single_model else os.getenv("MEETING_ASR_LANGUAGE_ID", QWEN_ASR_PRIMARY_MODEL),
     }
     result: dict[str, Any] = {"models": models, "snapshots": {}, "ready": False, "local_only": not autodownload}
     try:
@@ -97,7 +98,7 @@ def main() -> None:
     report: dict[str, Any] = {
         "asr": {
             **_check_asr(autodownload=not args.check_only),
-            "policy": "Qwen3-ASR-1.7B realtime primary; Qwen3-ASR-0.6B language ID and realtime fallback",
+            "policy": "single Qwen3-ASR-1.7B for realtime ASR, segment language confirmation and conflict re-decoding",
         },
         "vad": _check_vad(autodownload=not args.check_only),
         "translation": {} if args.skip_translation else _prepare_translation(translation_root, args.download_translation and not args.check_only),

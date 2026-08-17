@@ -8,9 +8,7 @@ Chrome / Edge
     ▼
 FastAPI
     ├── VAD / 静音阈值 / 技术性音频切片
-    ├── Qwen3-ASR-0.6B：语言与方言判断、fallback
-    ├── Qwen3-ASR-1.7B：可选的高质量实时转写
-    ├── Qwen3-ASR-0.6B：可选的低延迟实时转写
+    ├── Qwen3-ASR-1.7B：唯一常驻 ASR、语言确认与冲突重识别模型
     ├── 连续语言/方言段落聚合器
     ├── 单 worker 稳定前缀翻译队列
     ├── schema 2.0 文件存储
@@ -26,16 +24,25 @@ FastAPI
 & .venv\Scripts\python.exe scripts/prepare_models.py --check-only
 ```
 
-检查报告只包含 Qwen 1.7B、Qwen 0.6B、VAD 和 en/de 翻译模型。生产环境推荐：
+检查报告包含 Qwen 1.7B、VAD 和 en/de 翻译模型；fallback/LID 角色在单模型模式下只是同一 checkpoint 的兼容别名。生产环境推荐：
 
-每场会议可以在“识别设置”选择 `primary`（1.7B）或 `small`（0.6B）；录音开始后模型锁定。两者的模型 ID 通过下面的服务配置提供。
+生产环境固定使用单模型模式；录音开始后模型锁定。fallback 和 language ID 配置字段保留是为了兼容旧客户端，不会加载第二个 ASR checkpoint。
 
 ```dotenv
+MEETING_SINGLE_ASR_MODEL=1
 MEETING_ASR_PRIMARY=Qwen/Qwen3-ASR-1.7B
-MEETING_ASR_FALLBACK=Qwen/Qwen3-ASR-0.6B
-MEETING_ASR_LANGUAGE_ID=Qwen/Qwen3-ASR-0.6B
+MEETING_ASR_FALLBACK=Qwen/Qwen3-ASR-1.7B
+MEETING_ASR_LANGUAGE_ID=Qwen/Qwen3-ASR-1.7B
 MEETING_ASR_AUTODOWNLOAD=0
+MEETING_PARTIAL_INTERVAL_MS=1000
+MEETING_LANGUAGE_ID_MIN_SECONDS=1.0
+MEETING_LANGUAGE_ID_ON_SEGMENT=1
+MEETING_LANGUAGE_CONFLICT_CONFIRMATIONS=3
+MEETING_LANGUAGE_SWITCH_WINDOW_MS=800
+MEETING_LANGUAGE_SWITCH_MAX_WAIT_MS=1800
 MEETING_TRANSLATION_AUTODOWNLOAD=0
+MEETING_TRANSLATION_WARMUP=1
+MEETING_POST_TRANSLATION_ENABLED=0
 ```
 
 ## 存储和恢复
@@ -44,9 +51,32 @@ MEETING_TRANSLATION_AUTODOWNLOAD=0
 
 翻译任务按段落顺序串行执行。结果提交前检查 `source_revision`，过期任务丢弃；连续失败保留原文并可调用：
 
+当前实时队列按 segment_id 合并任务，新的 source revision 会替换尚未执行的旧任务；final 翻译优先于 provisional partial。自动会后本地复译默认关闭，如需更高质量翻译应由独立翻译智能体显式处理。
+
 ```text
 POST /api/v2/meetings/{id}/translation/retry
 ```
+
+## 当前实时数据流
+
+~~~mermaid
+flowchart LR
+    A["Chrome / Edge<br/>PCM16 16 kHz mono"] --> B["WebSocket / FastAPI"]
+    B --> C["VAD + 时间帧保留<br/>技术性语音切片"]
+    C --> D["Qwen3-ASR-1.7B<br/>partial / final"]
+    D --> E["同一 1.7B<br/>分段级语言确认"]
+    E --> F["语言证据聚合<br/>zh / en / de / 方言"]
+    F --> G["时间边界重切片<br/>段落提交"]
+    G --> H["segment_id 合并翻译队列"]
+    H --> I["OPUS-MT en/de -> zh<br/>本地 warm-up"]
+    G --> J["paragraph_update<br/>JSONL schema 2.0"]
+    I --> J
+    J --> K["会议纪要 / To-do"]
+~~~
+
+系统默认约 1 秒后做一次同模语言探测，连续三次一致证据才确认切换。切换确认后使用带时间戳的音频帧重切旧语言和新语言窗口；短暂 unknown 不切段，中文方言只更新 speech_variant。
+
+GET /api/v2/metrics 会返回首个 partial、语言切换、ASR/翻译队列等待、最终翻译耗时、GPU 等待、过期任务丢弃数量和队列最大深度等指标。
 
 ## 企业扩展边界
 

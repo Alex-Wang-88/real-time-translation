@@ -139,5 +139,6 @@ def export_live_result(
     files = [
         "meeting_transcript.md", "translated_zh.md", "transcript.json", "transcript.jsonl",
         "transcript_events.jsonl", "audio_manifest.json", "manifest.json",
+        "meeting_minutes.md", "todo_list.json", "todo_list.md",
     ] + language_files
     return [name for name in files if (output_dir / name).is_file()]

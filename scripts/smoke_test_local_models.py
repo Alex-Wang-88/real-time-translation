@@ -10,7 +10,6 @@ from huggingface_hub import snapshot_download
 from realtime_meeting.runtime import (
     MODEL_REVISIONS,
     QWEN_ASR_PRIMARY_MODEL,
-    QWEN_ASR_SMALL_MODEL,
     LiveChineseTranslator,
     _model_snapshot,
     choose_device,
@@ -43,7 +42,10 @@ def main() -> None:
     device, compute_type = choose_device(args.device)
     print(json.dumps({"device": device, "compute_type": compute_type}, ensure_ascii=True))
 
-    for model_name in (QWEN_ASR_PRIMARY_MODEL, QWEN_ASR_SMALL_MODEL):
+    # Production keeps one resident ASR model.  The legacy small checkpoint is
+    # intentionally not loaded by this smoke test to avoid a misleading GPU
+    # memory requirement.
+    for model_name in (QWEN_ASR_PRIMARY_MODEL,):
         started = time.perf_counter()
         model = _qwen_model(model_name, device)
         loaded = time.perf_counter()

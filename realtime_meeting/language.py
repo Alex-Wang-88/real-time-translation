@@ -84,6 +84,203 @@ class LanguageGuess:
         return self.code
 
 
+@dataclass(frozen=True, slots=True)
+class LanguageTransition:
+    """A confirmed language-code change inside a continuous speech stream."""
+
+    previous: str | None
+    current: str
+    boundary: float | None
+    confidence: float
+    source: str
+
+
+def _text_language_guess(text: str | None) -> LanguageGuess | None:
+    """Conservative text fallback for missing or unusable Qwen labels.
+
+    This is deliberately weaker than a model label.  It is only intended to
+    keep a label such as ``unknown`` from pinning a live paragraph forever.
+    It never tries to identify a Chinese dialect from spelling alone.
+    """
+
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if contains_cjk(value) and not contains_latin(value):
+        return LanguageGuess("zh", 0.42, raw_qwen_label="text:cjk")
+    if not contains_latin(value):
+        return None
+    german_words = {
+        "der", "die", "das", "den", "dem", "des", "und", "ist", "nicht", "ich", "wir", "sie",
+        "ein", "eine", "mit", "für", "auf", "von", "zu", "werden", "wird", "über", "auch",
+        "guten", "tag", "hallo", "morgen", "abend", "danke", "bitte", "ja", "nein", "aber", "sind",
+        "einer", "einem", "einen", "diese", "dieser", "dieses", "oder", "noch", "schon", "kann",
+    }
+    words = {item.casefold() for item in re.findall(r"[A-Za-zÄÖÜäöüß]+", value)}
+    if words & german_words or re.search(r"[ÄÖÜäöüß]", value):
+        return LanguageGuess("de", 0.4, raw_qwen_label="text:german")
+    return LanguageGuess("en", 0.38, raw_qwen_label="text:latin")
+
+
+class LanguageEvidenceAggregator:
+    """Debounce language-code changes without using dialect as a boundary.
+
+    The aggregator consumes observations from ASR, optional LID and text
+    fallback.  A new code needs a configurable number of consistent
+    observations within the short switch window; unknown observations are
+    ignored.  Variant changes are tracked independently and never create a
+    paragraph on their own.
+    """
+
+    def __init__(self, *, window_seconds: float = 0.6, max_confirmation_seconds: float = 1.2, confirmations: int = 2) -> None:
+        self.window_seconds = max(0.2, float(window_seconds))
+        self.max_confirmation_seconds = max(self.window_seconds, float(max_confirmation_seconds))
+        self.confirmations = max(2, min(4, int(confirmations)))
+        self.stable_code: str | None = None
+        self.stable_variant: str | None = None
+        self.candidate_code: str | None = None
+        self.candidate_variant: str | None = None
+        self.candidate_count = 0
+        self.candidate_confidence = 0.0
+        self.candidate_start: float | None = None
+        self.candidate_end: float | None = None
+
+    def seed_stable(self, code: str, variant: str | None = None) -> None:
+        """Seed the aggregator from an already-created paragraph.
+
+        ASR may create a visible paragraph before the conservative evidence
+        threshold is reached.  Treat that paragraph language as the current
+        baseline so a later conflicting result is a switch, not a new initial
+        language observation.
+        """
+
+        normalized = normalize_language_code(code)
+        if normalized not in SUPPORTED_LANGUAGE_CODES:
+            return
+        self.stable_code = normalized
+        self.stable_variant = variant
+        self._reset_candidate()
+
+    @staticmethod
+    def _code_guess(guess: LanguageGuess | None, text: str | None) -> LanguageGuess | None:
+        text_guess = _text_language_guess(text)
+        if guess is None or guess.code not in SUPPORTED_LANGUAGE_CODES:
+            return text_guess
+        if text_guess is None or text_guess.code == guess.code:
+            return guess
+        value = str(text or "")
+        # Strong script/lexical evidence can correct a stale Qwen label, but
+        # mixed Chinese/Latin text is intentionally left with the model code
+        # so a bilingual sentence does not become two paragraphs by itself.
+        german_marker = bool(re.search(r"[ÄÖÜäöüß]", value)) or bool(
+            set(item.casefold() for item in re.findall(r"[A-Za-zÄÖÜäöüß]+", value))
+            & {"der", "die", "das", "und", "ist", "nicht", "ich", "wir", "guten", "hallo", "danke"}
+        )
+        if (contains_cjk(value) and not contains_latin(value)) or (text_guess.code == "de" and german_marker):
+            return text_guess
+        return guess
+
+    def observe(
+        self,
+        guess: LanguageGuess | None,
+        *,
+        text: str = "",
+        start: float | None = None,
+        end: float | None = None,
+        final: bool = False,
+        source: str = "asr",
+    ) -> LanguageTransition | None:
+        candidate = self._code_guess(guess, text)
+        if candidate is None:
+            return None
+        code = candidate.code
+        variant = candidate.speech_variant
+        if self.stable_code is None:
+            if self.candidate_code == code:
+                self.candidate_count += 1
+                self.candidate_confidence = max(self.candidate_confidence, candidate.confidence)
+                self.candidate_end = end
+            else:
+                self.candidate_code = code
+                self.candidate_variant = variant
+                self.candidate_count = 1
+                self.candidate_confidence = candidate.confidence
+                self.candidate_start = start
+                self.candidate_end = end
+            if self.candidate_count < self.confirmations and not final:
+                return None
+            self.stable_code = code
+            self.stable_variant = variant
+            self._reset_candidate()
+            return None
+
+        if code == self.stable_code:
+            self._reset_candidate()
+            if variant:
+                # Dialect metadata is allowed to move independently of the
+                # paragraph language.  Keep the most recent confirmed model
+                # label without creating a new paragraph.
+                self.stable_variant = variant
+            return None
+
+        if (
+            self.candidate_code != code
+            or (
+                start is not None
+                and self.candidate_start is not None
+                and start - self.candidate_start > self.max_confirmation_seconds
+            )
+        ):
+            self.candidate_code = code
+            self.candidate_variant = variant
+            self.candidate_count = 1
+            self.candidate_confidence = candidate.confidence
+            self.candidate_start = start
+            self.candidate_end = end
+        else:
+            self.candidate_count += 1
+            self.candidate_confidence = max(self.candidate_confidence, candidate.confidence)
+            self.candidate_end = end
+        if self.candidate_count < self.confirmations and not final:
+            return None
+
+        previous = self.stable_code
+        # The second consistent observation confirms a short window ending at
+        # ``candidate_end``.  Put the boundary at the beginning of that
+        # window, while never moving it before the first candidate interval.
+        boundary = self.candidate_start
+        if self.candidate_end is not None:
+            window_boundary = self.candidate_end - self.window_seconds
+            boundary = window_boundary if boundary is None else max(boundary, window_boundary)
+        self.stable_code = code
+        self.stable_variant = variant
+        confidence = self.candidate_confidence
+        self._reset_candidate()
+        return LanguageTransition(previous, code, boundary, confidence, source)
+
+    def _reset_candidate(self) -> None:
+        self.candidate_code = None
+        self.candidate_variant = None
+        self.candidate_count = 0
+        self.candidate_confidence = 0.0
+        self.candidate_start = None
+        self.candidate_end = None
+
+    def snapshot(self) -> dict[str, object | None]:
+        return {
+            "stable_code": self.stable_code,
+            "stable_variant": self.stable_variant,
+            "candidate_code": self.candidate_code,
+            "candidate_count": self.candidate_count,
+        }
+
+
+def reconcile_language_guess(guess: LanguageGuess | None, text: str | None = None) -> LanguageGuess | None:
+    """Return one conservative model/text language evidence result."""
+
+    return LanguageEvidenceAggregator._code_guess(guess, text)
+
+
 def contains_cjk(text: str | None) -> bool:
     return bool(_CJK.search(str(text or "")))
 
@@ -97,6 +294,13 @@ def is_mixed_source_text(text: str | None) -> bool:
 
     value = str(text or "")
     return contains_cjk(value) and contains_latin(value)
+
+
+def is_likely_code_switched(text: str | None) -> bool:
+    """Use the conservative draft heuristic for the optional mixed router."""
+
+    value = str(text or "")
+    return len(_CJK.findall(value)) >= 2 and len(_LATIN_WORD.findall(value)) >= 2
 
 
 def normalize_language_code(value: object) -> str | None:
@@ -323,6 +527,14 @@ def normalize_qwen_label(value: object, text: str | None = None) -> LanguageGues
         if code == "zh":
             return LanguageGuess("zh", 0.72, None, raw_qwen_label=raw)
         return LanguageGuess(code, 0.65, raw_qwen_label=raw)
+    fallback = _text_language_guess(text)
+    if fallback is not None:
+        return LanguageGuess(
+            fallback.code,
+            fallback.confidence,
+            fallback.speech_variant,
+            raw_qwen_label=raw or fallback.raw_qwen_label,
+        )
     return LanguageGuess("unknown", 0.0, raw_qwen_label=raw)
 
 

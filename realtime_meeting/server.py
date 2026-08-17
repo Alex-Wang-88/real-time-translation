@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .audio import SAMPLE_RATE
-from .config import Settings, load_settings
+from .config import RECOGNITION_ARCHITECTURES, Settings, load_settings
 from .models import SUPPORTED_LANGUAGES, SUPPORTED_SPEECH_VARIANTS
 from .runtime import LiveModelRuntime
 from .session import CapacityLimitError, SessionManager
@@ -52,14 +52,20 @@ def create_app(
     web_dir = Path(__file__).with_name("web")
 
     def build_runtime(requested: str) -> LiveModelRuntime:
+        # Production uses one resident 1.7B checkpoint for ASR, segment-level
+        # language confirmation and conflict re-decoding.  Legacy fallback
+        # names are still exposed in the API, but they do not load a second
+        # model when single_asr_model is enabled.
         return LiveModelRuntime(
             config.asr_primary,
             config.asr_fallback,
             requested,
             language_id_model=config.language_id_model,
+            single_model=config.single_asr_model,
             asr_autodownload=config.asr_autodownload,
             translation_model_root=config.translation_model_root,
             translation_autodownload=config.translation_autodownload,
+            translation_warmup=config.translation_warmup,
             vad_model=config.vad_model,
         )
 
@@ -162,6 +168,7 @@ def create_app(
             for task in (
                 meeting.worker_task,
                 meeting.translation_worker_task,
+                meeting.post_translation_task,
                 meeting.summary_task,
                 meeting.todo_task,
                 meeting.stop_task,
@@ -247,8 +254,13 @@ def create_app(
             "speech_variants": list(SUPPORTED_SPEECH_VARIANTS),
             "realtime_asr_models": [
                 {"id": "primary", "model": config.asr_primary, "label": "Qwen 1.7B"},
-                {"id": "small", "model": config.asr_fallback, "label": "Qwen 0.6B"},
+                {"id": "small", "model": config.asr_fallback, "label": "同一 Qwen 1.7B（兼容别名）"},
             ],
+            "recognition_architecture": config.recognition_architecture,
+            "recognition_architectures": [
+                {"id": key, **value} for key, value in RECOGNITION_ARCHITECTURES.items()
+            ],
+            "recognition_architecture_note": "识别、分段级语言确认和冲突重识别统一使用 Qwen 1.7B；默认不加载第二个 ASR 模型。",
             "translation_target": "zh-CN",
             "meeting_start_mode": "manual",
             "jimo_configured": config.jimo_configured,
@@ -256,6 +268,7 @@ def create_app(
             "asr_primary": config.asr_primary,
             "asr_fallback": config.asr_fallback,
             "language_id_model": config.language_id_model,
+            "single_asr_model": config.single_asr_model,
             "capabilities": getattr(runtime, "capability_snapshot", lambda: {})(),
             "active_meetings": manager.active_count(),
             "max_active_meetings": config.max_active_meetings,
@@ -265,12 +278,12 @@ def create_app(
 
     @app.get("/api/v2/metrics")
     async def metrics(_principal: str = Depends(authenticate_request)) -> dict[str, Any]:
-        return {
-            "active_meetings": manager.active_count(),
-            "meeting_count": len(manager.sessions),
-            "runtime": dict(getattr(app.state.runtime, "metrics", {}) or {}),
-            "gpu": getattr(getattr(app.state.runtime, "gpu_manager", None), "metrics", {}),
-            "meetings": [
+        meetings = []
+        for meeting in manager.sessions.values():
+            pipeline = dict(getattr(meeting, "pipeline_metrics", {}) or {})
+            pipeline["asr_queue_depth"] = meeting.queue.qsize()
+            pipeline["translation_queue_depth"] = meeting.translation_queue.qsize()
+            meetings.append(
                 {
                     "id": meeting.id,
                     "recording_state": meeting.recording_state,
@@ -278,9 +291,15 @@ def create_app(
                     "todo_state": meeting.todo_state,
                     "queue_size": meeting.queue.qsize(),
                     "translation_queue_size": meeting.translation_queue.qsize(),
+                    "pipeline": pipeline,
                 }
-                for meeting in manager.sessions.values()
-            ],
+            )
+        return {
+            "active_meetings": manager.active_count(),
+            "meeting_count": len(manager.sessions),
+            "runtime": dict(getattr(app.state.runtime, "metrics", {}) or {}),
+            "gpu": getattr(getattr(app.state.runtime, "gpu_manager", None), "metrics", {}),
+            "meetings": meetings,
         }
 
     @app.get("/api/v2/meetings")

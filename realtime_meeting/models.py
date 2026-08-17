@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -125,6 +126,39 @@ class TodoItem:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TodoItem":
+        values = dict(payload)
+
+        def optional_float(value: Any) -> float | None:
+            if value is None or value == "":
+                return None
+            try:
+                result = float(value)
+                return result if math.isfinite(result) else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        try:
+            summary_revision = max(0, int(values.get("summary_revision", 0) or 0))
+        except (TypeError, ValueError):
+            summary_revision = 0
+        return cls(
+            task=str(values.get("task", "") or ""),
+            owner=str(values["owner"]) if values.get("owner") is not None else None,
+            due_date=str(values["due_date"]) if values.get("due_date") is not None else None,
+            priority=str(values.get("priority", "待确认") or "待确认"),
+            status=str(values.get("status", "未开始") or "未开始"),
+            source_time_start=optional_float(values.get("source_time_start")),
+            source_time_end=optional_float(values.get("source_time_end")),
+            evidence=str(values.get("evidence", "") or ""),
+            notes=str(values.get("notes", "") or ""),
+            id=str(values.get("id", "") or ""),
+            meeting_id=str(values.get("meeting_id", "") or ""),
+            summary_revision=summary_revision,
+            created_at=str(values.get("created_at", "") or ""),
+        )
+
 
 @dataclass(slots=True)
 class TodoDocument:
@@ -142,3 +176,34 @@ class TodoDocument:
             "generated_at": self.generated_at,
             "items": [item.to_dict() for item in self.items],
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any], *, default_meeting_id: str = "") -> "TodoDocument":
+        values = dict(payload)
+        try:
+            summary_revision = max(0, int(values.get("summary_revision", 0) or 0))
+        except (TypeError, ValueError):
+            summary_revision = 0
+        raw_items = values.get("items", [])
+        items: list[TodoItem] = []
+        if isinstance(raw_items, list):
+            for raw_item in raw_items:
+                if not isinstance(raw_item, dict):
+                    continue
+                try:
+                    item = TodoItem.from_dict(raw_item)
+                except (TypeError, ValueError):
+                    continue
+                if item.task.strip():
+                    if not item.meeting_id:
+                        item.meeting_id = str(values.get("meeting_id", default_meeting_id) or default_meeting_id)
+                    if item.summary_revision <= 0:
+                        item.summary_revision = summary_revision
+                    items.append(item)
+        return cls(
+            schema_version=str(values.get("schema_version", "1.0") or "1.0"),
+            items=items,
+            meeting_id=str(values.get("meeting_id", default_meeting_id) or default_meeting_id),
+            summary_revision=summary_revision,
+            generated_at=str(values.get("generated_at", "") or ""),
+        )
