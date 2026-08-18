@@ -44,3 +44,5 @@ uv run python scripts/evaluate_realtime_replay.py `
 ```
 
 说明：`result/` 是运行结果目录，已被 `.gitignore` 忽略；本目录中的音频、文字稿、manifest 和流程说明才是固定测试输入。
+
+四川方言模式是可选的实时回放参数：`--speech-variant-mode sichuan`。它只对中文识别增加方言提示和热词，保留外语路由；模式结果仍需通过 `automatic_evaluation` 与默认 `auto` 结果对比后才能接受。

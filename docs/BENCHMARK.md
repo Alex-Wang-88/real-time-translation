@@ -47,3 +47,16 @@ uv run python scripts/evaluate_realtime_replay.py `
 ```
 
 默认会在回放报告旁生成 `automatic_evaluation.json`。这样可以在不同优化版本之间直接比较相同参考稿的 `summary`，并同时检查 `contract.passed`。
+
+若要验证四川方言模式，在同一条完整实时流程上增加：
+
+```powershell
+uv run python scripts/replay_generated_meeting_realtime.py `
+  tests/fixtures/manufacturing_role_meeting_v3/manifest.json `
+  --output result/benchmarks/manufacturing_role_meeting_v3/realtime_sichuan_mode `
+  --chunk-seconds 0.5 `
+  --playback-rate 1.0 `
+  --speech-variant-mode sichuan
+```
+
+该模式是中文方言软提示，不会把整场会议强制锁定为中文，也不会改变英语/德语路由；方言标签只有在当前段文本出现高置信四川词汇时才生成。

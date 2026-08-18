@@ -27,7 +27,15 @@ from .audio import (
 from .config import DEFAULT_RECOGNITION_ARCHITECTURE, Settings, normalize_meeting_settings, normalize_recognition_architecture
 from .exporter import export_live_result, render_todo_markdown
 from .jimo import MeetingSummarizer, TodoGenerator
-from .language import LanguageEvidenceAggregator, LanguageGuess, is_mixed_source_text, normalize_qwen_label, reconcile_language_guess
+from .language import (
+    LanguageEvidenceAggregator,
+    LanguageGuess,
+    has_sichuan_dialect_evidence,
+    is_mixed_source_text,
+    normalize_qwen_label,
+    normalize_speech_variant_mode,
+    reconcile_language_guess,
+)
 from .models import TodoDocument, Utterance, utc_now_iso
 from .quality import AsrQualityAssessment, AsrQualityState, assess_asr_quality
 from .scheduler import LatestEventQueue, LatestTranslationQueue
@@ -627,6 +635,11 @@ class LiveMeetingSession:
             DEFAULT_RECOGNITION_ARCHITECTURE,
         )
 
+    def _speech_variant_mode(self) -> str:
+        return normalize_speech_variant_mode(
+            self.meeting_settings.get("speech_variant_mode", getattr(self.settings, "speech_variant_mode", "auto")),
+        )
+
     def _uses_language_id(self) -> bool:
         # ``single_1_7b_no_lid`` means no separate LID checkpoint.  A single
         # segment-level probe is still useful for language accuracy and uses
@@ -987,7 +1000,12 @@ class LiveMeetingSession:
         if language not in {"zh", "en", "de"}:
             language = "unknown"
         variant = self.current_variant if language == "zh" else getattr(result, "speech_variant", None)
-        if language == "zh" and not variant:
+        if language == "zh" and self._speech_variant_mode() == "sichuan":
+            # Do not carry a mode-generated dialect label into a later
+            # Mandarin paragraph.  Only the current ASR text can promote this
+            # paragraph to Sichuan; the prompt itself remains a soft hint.
+            variant = "sichuan" if has_sichuan_dialect_evidence(result_text) else None
+        elif language == "zh" and not variant:
             variant = result_guess.speech_variant
         await self._upsert_source(
             event,
@@ -1006,8 +1024,7 @@ class LiveMeetingSession:
             if self._forced_chunks_for_active >= 2:
                 await self._close_active(event.end)
 
-    @staticmethod
-    def _result_language_guess(result: Any, text: str) -> LanguageGuess:
+    def _result_language_guess(self, result: Any, text: str) -> LanguageGuess:
         raw_language = str(
             getattr(result, "raw_qwen_label", "")
             or getattr(result, "language", "unknown")
@@ -1017,6 +1034,17 @@ class LiveMeetingSession:
         reconciled = reconcile_language_guess(normalized_result, text)
         if reconciled is not None:
             normalized_result = reconciled
+        if (
+            self._speech_variant_mode() == "sichuan"
+            and normalized_result.code == "zh"
+            and has_sichuan_dialect_evidence(text)
+        ):
+            normalized_result = LanguageGuess(
+                normalized_result.code,
+                normalized_result.confidence,
+                "sichuan",
+                normalized_result.raw_qwen_label,
+            )
         return LanguageGuess(
             normalized_result.code,
             max(_safe_float(getattr(result, "confidence", 0.0)), normalized_result.confidence),

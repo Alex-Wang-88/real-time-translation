@@ -12,7 +12,13 @@ from realtime_meeting.audio import SegmentEvent
 from realtime_meeting.config import Settings, default_meeting_settings, normalize_meeting_settings
 from realtime_meeting.exporter import export_live_result
 from realtime_meeting.jimo import JimoClient, TodoGenerator, transcript_chunks
-from realtime_meeting.language import OFFICIAL_SPEECH_VARIANTS, is_mixed_source_text, normalize_qwen_label
+from realtime_meeting.language import (
+    OFFICIAL_SPEECH_VARIANTS,
+    has_sichuan_dialect_evidence,
+    is_mixed_source_text,
+    normalize_qwen_label,
+    normalize_speech_variant_mode,
+)
 from realtime_meeting.models import TodoDocument, TodoItem, Utterance
 from realtime_meeting.runtime import LiveModelRuntime, PartialResult, TranslationResult, _canonical_qwen_model
 from realtime_meeting.server import create_app
@@ -81,6 +87,7 @@ def test_settings_default_to_single_1_7b_no_lid_and_have_no_removed_controls() -
     assert "keep_audio" in values
     assert values["realtime_asr_model"] == "primary"
     assert values["max_utterance_seconds"] == 18.0
+    assert values["speech_variant_mode"] == "auto"
     assert values["recognition_architecture"] == "single_1_7b_no_lid"
     assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, settings)["realtime_asr_model"] == "primary"
     legacy = Settings(single_asr_model=False, asr_fallback="Qwen/Qwen3-ASR-0.6B")
@@ -105,6 +112,19 @@ def test_qwen_prompt_scopes_domain_context_to_current_audio() -> None:
     assert "只转写当前音频片段" in prompt
     assert "不要复述或补写上下文" in prompt
     assert "只在音频中确实出现时使用" in prompt
+
+
+def test_sichuan_mode_is_normalized_and_uses_conservative_text_evidence() -> None:
+    assert normalize_speech_variant_mode("四川方言") == "sichuan"
+    assert normalize_speech_variant_mode("unknown") == "auto"
+    assert has_sichuan_dialect_evidence("这个事情确实恼火，先整安逸。") is True
+    assert has_sichuan_dialect_evidence("今天确认预算和交付日期。") is False
+
+
+def test_qwen_prompt_adds_sichuan_mode_without_rewriting_text() -> None:
+    prompt = LiveModelRuntime._prompt("", None, [], "sichuan")
+    assert "四川方言识别模式" in prompt
+    assert "不要把方言改写成书面普通话" in prompt
 
 
 def test_qwen_runtime_uses_cantonese_adapter_and_small_model_for_lid() -> None:

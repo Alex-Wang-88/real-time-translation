@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .language import normalize_speech_variant_mode
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional during import-only tests
@@ -59,6 +61,7 @@ class Settings:
     device: str = "auto"
     asr_primary: str = "Qwen/Qwen3-ASR-1.7B"
     asr_hotwords: list[str] = field(default_factory=list)
+    speech_variant_mode: str = "auto"
     single_asr_model: bool = True
     asr_fallback: str = "Qwen/Qwen3-ASR-1.7B"
     language_id_model: str = "Qwen/Qwen3-ASR-1.7B"
@@ -217,6 +220,7 @@ def default_meeting_settings(settings: Settings) -> dict[str, Any]:
         "max_utterance_seconds": settings.max_utterance_seconds,
         "partial_interval_ms": settings.partial_interval_ms,
         "realtime_asr_model": "primary",  # legacy field; the only active strategy always uses 1.7B
+        "speech_variant_mode": normalize_speech_variant_mode(settings.speech_variant_mode),
         "recognition_architecture": normalize_recognition_architecture(settings.recognition_architecture),
         "audio_segment_minutes": settings.audio_segment_minutes,
         "translation_beam_size": 2,
@@ -271,6 +275,10 @@ def normalize_meeting_settings(values: object, settings: Settings) -> dict[str, 
         source.get("recognition_architecture", defaults["recognition_architecture"]),
         defaults["recognition_architecture"],
     )
+    normalized["speech_variant_mode"] = normalize_speech_variant_mode(
+        source.get("speech_variant_mode", defaults["speech_variant_mode"]),
+        defaults["speech_variant_mode"],
+    )
     normalized["asr_hotwords"] = normalize_asr_hotwords(source.get("asr_hotwords", defaults["asr_hotwords"]))
     return normalized
 
@@ -305,6 +313,9 @@ def load_settings() -> Settings:
         device=os.getenv("MEETING_DEVICE", defaults.device),
         asr_primary=configured_primary,
         asr_hotwords=normalize_asr_hotwords(os.getenv("MEETING_ASR_HOTWORDS", "")),
+        speech_variant_mode=normalize_speech_variant_mode(
+            os.getenv("MEETING_SPEECH_VARIANT_MODE", defaults.speech_variant_mode),
+        ),
         single_asr_model=single_asr_model,
         asr_fallback=configured_fallback,
         language_id_model=configured_language_id,

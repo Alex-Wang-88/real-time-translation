@@ -59,6 +59,27 @@ VARIANT_LABELS = {
     "minnan": "闽南语",
 }
 
+SPEECH_VARIANT_MODES = ("auto", "sichuan")
+SICHUAN_DIALECT_HINTS = (
+    "啥子",
+    "啷个",
+    "没得",
+    "晓得",
+    "恼火",
+    "安逸",
+    "巴适",
+    "拢到",
+    "咋个",
+    "要得",
+    "不得行",
+    "摆龙门阵",
+    "整安逸",
+    "莫",
+    "后头",
+    "拴在一根绳上",
+)
+_SICHUAN_HIGH_SIGNAL_HINTS = tuple(item for item in SICHUAN_DIALECT_HINTS if len(item) > 1 and item not in {"后头"})
+
 _CJK = re.compile(r"[\u3400-\u9fff]")
 _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 
@@ -501,6 +522,29 @@ def normalize_speech_variant(value: object) -> str | None:
     if "普通话" in raw:
         return "mandarin"
     return None
+
+
+def normalize_speech_variant_mode(value: object, default: str = "auto") -> str:
+    """Normalize the optional session-level Chinese dialect preference."""
+
+    raw = str(value or "").strip().casefold().replace("_", "-")
+    if raw in {"sichuan", "sichuan-dialect", "sichuanese", "四川", "四川话", "四川方言"}:
+        return "sichuan"
+    if raw in {"auto", "automatic", "", "none"}:
+        return "auto"
+    fallback = str(default or "auto").strip().casefold()
+    return fallback if fallback in SPEECH_VARIANT_MODES else "auto"
+
+
+def has_sichuan_dialect_evidence(text: str | None) -> bool:
+    """Detect high-signal Sichuan wording without rewriting the transcript."""
+
+    value = str(text or "")
+    if not value or not contains_cjk(value):
+        return False
+    if any(marker in value for marker in _SICHUAN_HIGH_SIGNAL_HINTS):
+        return True
+    return sum(marker in value for marker in ("莫", "后头", "整", "拴", "喊")) >= 2
 
 
 def normalize_qwen_label(value: object, text: str | None = None) -> LanguageGuess:

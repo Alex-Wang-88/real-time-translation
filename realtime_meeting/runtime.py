@@ -13,7 +13,15 @@ from typing import Any, Callable
 import numpy as np
 
 from .audio import SAMPLE_RATE, SegmentEvent
-from .language import LanguageGuess, VARIANT_LABELS, is_mixed_source_text, normalize_language_code, normalize_qwen_label
+from .language import (
+    SICHUAN_DIALECT_HINTS,
+    LanguageGuess,
+    VARIANT_LABELS,
+    is_mixed_source_text,
+    normalize_language_code,
+    normalize_qwen_label,
+    normalize_speech_variant_mode,
+)
 from .scheduler import GpuResourceManager
 from .text_normalize import simplify_chinese
 
@@ -792,10 +800,20 @@ class LiveModelRuntime:
         return bool(str(text or "").strip())
 
     @staticmethod
-    def _prompt(recent_text: str, speech_variant: str | None, hotwords: list[str] | None) -> str:
+    def _prompt(
+        recent_text: str,
+        speech_variant: str | None,
+        hotwords: list[str] | None,
+        speech_variant_mode: str = "auto",
+    ) -> str:
         parts: list[str] = [
             "只转写当前音频片段；不要复述或补写上下文，数字、日期、型号、人名和线路名称按音频原样保留。",
         ]
+        if normalize_speech_variant_mode(speech_variant_mode) == "sichuan":
+            parts.append(
+                "当前开启四川方言识别模式；仅对中文音频生效，保留四川话词汇、语气和句式，"
+                "不要把方言改写成书面普通话，也不要为了显示方言而凭空添加词。"
+            )
         if speech_variant and speech_variant != "mandarin":
             parts.append(f"请保留{VARIANT_LABELS.get(speech_variant, speech_variant)}的原意和表达。")
         if hotwords:
@@ -864,7 +882,10 @@ class LiveModelRuntime:
     ) -> PartialResult:
         values = decode_settings if isinstance(decode_settings, dict) else {}
         hotwords = [str(item) for item in values.get("asr_hotwords", []) if str(item).strip()]
-        prompt = self._prompt(recent_text, speech_variant, hotwords)
+        speech_variant_mode = normalize_speech_variant_mode(values.get("speech_variant_mode", "auto"))
+        if speech_variant_mode == "sichuan" and language == "zh":
+            hotwords = list(dict.fromkeys([*SICHUAN_DIALECT_HINTS, *hotwords]))[:100]
+        prompt = self._prompt(recent_text, speech_variant, hotwords, speech_variant_mode)
         requested_model = str(values.get("realtime_asr_model", "primary") or "").strip().casefold()
         small_requested = requested_model in {
             "small",

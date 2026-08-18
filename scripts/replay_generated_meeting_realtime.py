@@ -133,6 +133,7 @@ async def replay(
     output_root: Path,
     chunk_seconds: float,
     playback_rate: float,
+    speech_variant_mode: str = "auto",
 ) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     audio_path = (manifest_path.parent / str(manifest["full_audio_path"])).resolve()
@@ -168,6 +169,7 @@ async def replay(
         meeting_id=meeting_id,
         title="制造业月会 v3 实时回放测试",
     )
+    meeting.configure_meeting_settings({"speech_variant_mode": speech_variant_mode})
     started = time.perf_counter()
     try:
         await meeting.start()
@@ -208,6 +210,7 @@ async def replay(
             "input_chunk_count": sequence,
             "playback_rate": playback_rate,
             "pacing_mode": "realtime" if playback_rate == 1.0 else ("max_speed" if playback_rate <= 0 else "accelerated"),
+            "speech_variant_mode": meeting.meeting_settings.get("speech_variant_mode", "auto"),
             "feed_wall_seconds": round(feed_wall_seconds, 3),
             "expected_speech_segments": len(manifest.get("samples") or []),
             "paragraph_count": len(paragraphs),
@@ -242,12 +245,26 @@ def main() -> int:
         default=1.0,
         help="输入回放速度；1.0 为真实时间，>1 加速，0 为不等待的压力回放",
     )
+    parser.add_argument(
+        "--speech-variant-mode",
+        choices=("auto", "sichuan"),
+        default="auto",
+        help="中文方言识别偏好；sichuan 只对中文启用四川方言提示，不改变英语/德语路由",
+    )
     args = parser.parse_args()
     if args.chunk_seconds <= 0 or args.chunk_seconds > 8:
         parser.error("--chunk-seconds must be > 0 and <= 8")
     if args.playback_rate < 0 or args.playback_rate > 8:
         parser.error("--playback-rate must be >= 0 and <= 8")
-    asyncio.run(replay(args.manifest.resolve(), args.output.resolve(), args.chunk_seconds, args.playback_rate))
+    asyncio.run(
+        replay(
+            args.manifest.resolve(),
+            args.output.resolve(),
+            args.chunk_seconds,
+            args.playback_rate,
+            args.speech_variant_mode,
+        )
+    )
     return 0
 
 
