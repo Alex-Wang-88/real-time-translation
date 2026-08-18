@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 from realtime_meeting.config import load_settings
+from realtime_meeting.evaluation import evaluate_realtime_replay
 from realtime_meeting.runtime import LiveModelRuntime
 from realtime_meeting.server import create_app
 from realtime_meeting.session import LiveMeetingSession
@@ -219,6 +220,7 @@ async def replay(
             "paragraphs": [item.to_dict() for item in paragraphs],
             "meeting_output_dir": str(output_dir),
         }
+        payload["automatic_evaluation"] = evaluate_realtime_replay(manifest, payload)
         output_root.mkdir(parents=True, exist_ok=True)
         report_path = output_root / "realtime_replay_report.json"
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

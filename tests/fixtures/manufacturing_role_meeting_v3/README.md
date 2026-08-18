@@ -35,4 +35,12 @@ uv run python scripts/replay_generated_meeting_realtime.py `
 
 对比时，以 `manuscript.jsonl` 的 `text`、`language` 和 `speech_variant` 作为识别参考；以 `realtime_replay_report.json` 中的 `paragraphs`、`translation_statuses` 和 `postprocess_api` 作为实际结果。
 
+回放脚本还会自动生成 `automatic_evaluation`，将参考稿和实际段落按顺序对齐，并汇总 ASR、语言、四川方言、翻译、段落覆盖及两次 API 请求的指标。若只想评测已有报告，可运行：
+
+```powershell
+uv run python scripts/evaluate_realtime_replay.py `
+  tests/fixtures/manufacturing_role_meeting_v3/manifest.json `
+  result/benchmarks/manufacturing_role_meeting_v3/realtime_current/realtime_replay_report.json
+```
+
 说明：`result/` 是运行结果目录，已被 `.gitignore` 忽略；本目录中的音频、文字稿、manifest 和流程说明才是固定测试输入。
