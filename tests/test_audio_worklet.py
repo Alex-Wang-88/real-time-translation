@@ -43,3 +43,8 @@ def test_worklet_resampler_attenuates_above_nyquist_input() -> None:
 def test_worklet_volume_threshold_never_zeros_pcm() -> None:
     quiet = run_worklet(48_000, 1_000, amplitude=0.01)
     assert quiet["rms"] > 0.005
+
+
+def test_worklet_keeps_per_block_visual_level_updates() -> None:
+    result = run_worklet(48_000, 1_000)
+    assert result["levelCount"] == (48_000 + 127) // 128

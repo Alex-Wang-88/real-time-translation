@@ -8,12 +8,11 @@ const RECOMMENDED_ASR_SETTINGS = Object.freeze({
 
 const RECOMMENDED_MEETING_SETTINGS = Object.freeze({
   ...RECOMMENDED_ASR_SETTINGS,
-  realtime_asr_model: "primary",
   volume_threshold_percent: 1.0,
   speech_start_ms: 80,
   audio_pre_roll_ms: 400,
   vad_minimum_speech_ratio: 0.06,
-  max_utterance_seconds: 12,
+  max_utterance_seconds: 18,
   partial_interval_ms: 800,
   audio_segment_minutes: 30,
   translation_beam_size: 2,
@@ -38,6 +37,9 @@ const ASR_SETTING_FIELDS = MEETING_NUMBER_FIELDS.filter((field) => [
 // The live microphone level is normalized to 0-100%.  Keep this separate
 // from the 0-30% background-noise filter threshold range.
 const MICROPHONE_METER_MAX_PERCENT = 100;
+const MICROPHONE_LEVEL_SETTLE_EPSILON = 0.0025;
+const MICROPHONE_LEVEL_ATTACK_MS = 55;
+const MICROPHONE_LEVEL_RELEASE_MS = 130;
 
 const state = {
   meetings: [],
@@ -58,6 +60,7 @@ const state = {
   transcriptNodes: new Map(),
   loadedTranscriptRevision: 0,
   transcriptLoadedFor: null,
+  transcriptLoadToken: 0,
   draft: null,
   draftNode: null,
   transcriptNearBottom: true,
@@ -67,13 +70,18 @@ const state = {
   renameMeetingId: null,
   confirmResolver: null,
   authResolver: null,
+  authPromise: null,
   volumeThresholdPercent: 2.2,
   asrSettings: { ...RECOMMENDED_ASR_SETTINGS },
   meetingSettings: { ...RECOMMENDED_MEETING_SETTINGS },
   microphoneLevelPercent: 0,
   pendingMicrophoneLevel: 0,
   microphoneLevelFrame: null,
+  microphoneLevelFrameAt: 0,
   audioStreamingEnabled: false,
+  inputDevicesRefreshId: 0,
+  pendingInputDevices: null,
+  inputDevicePickerOpen: false,
 };
 
 const dom = {
@@ -101,6 +109,9 @@ const dom = {
   levelBar: $("#levelBar"),
   levelText: $("#levelText"),
   inputDevice: $("#inputDevice"),
+  inputDevicePicker: $("#inputDevicePicker"),
+  inputDeviceTrigger: $("#inputDeviceTrigger"),
+  inputDeviceOptions: $("#inputDeviceOptions"),
   notice: $("#notice"),
   summaryBadge: $("#summaryBadge"),
   summaryProgress: $("#summaryProgress"),
@@ -145,7 +156,6 @@ const dom = {
   asrSettingsDialog: $("#asrSettingsDialog"),
   asrSettingsForm: $("#asrSettingsForm"),
   asrSettingsNotice: $("#asrSettingsNotice"),
-  realtimeAsrModel: $("#realtimeAsrModel"),
   resetAsrSettings: $("#resetAsrSettings"),
   saveAsrSettings: $("#saveAsrSettings"),
 };
@@ -321,12 +331,14 @@ function requestConfirmation(title, message, confirmLabel = "确认") {
 }
 
 function requestAuthToken() {
-  return new Promise((resolve) => {
+  if (state.authPromise) return state.authPromise;
+  state.authPromise = new Promise((resolve) => {
     state.authResolver = resolve;
     dom.authToken.value = "";
     dom.authDialog.showModal();
     dom.authToken.focus();
   });
+  return state.authPromise;
 }
 
 async function requestJson(path, options = {}) {
@@ -386,7 +398,7 @@ function setVolumeThreshold(value, propagate = true) {
   state.audioNode?.port.postMessage({ type: "volume_threshold", percent: state.volumeThresholdPercent });
   if (state.meeting) state.meeting.volume_threshold_percent = state.volumeThresholdPercent;
   if (state.ws?.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({ type: "audio_threshold", percent: state.volumeThresholdPercent }));
+    try { state.ws.send(JSON.stringify({ type: "audio_threshold", percent: state.volumeThresholdPercent })); } catch {}
   }
 }
 
@@ -428,10 +440,6 @@ function renderMeetingSettings(settings = state.meetingSettings, { updateState =
     if (input) input.checked = Boolean(values[key]);
     if (updateState) state.meetingSettings[key] = Boolean(values[key]);
   }
-  if (dom.realtimeAsrModel) {
-    dom.realtimeAsrModel.value = values.realtime_asr_model === "small" ? "small" : "primary";
-    if (updateState) state.meetingSettings.realtime_asr_model = dom.realtimeAsrModel.value;
-  }
   const editable = state.meeting?.recording_state === "created";
   dom.openAsrSettings.disabled = !state.meeting;
   dom.openAsrSettings.title = editable ? "调整识别设置" : "识别设置只能在录音开始前调整";
@@ -445,7 +453,6 @@ function renderMeetingSettings(settings = state.meetingSettings, { updateState =
     const input = $(`#${id}`);
     if (input) input.disabled = !editable;
   }
-  if (dom.realtimeAsrModel) dom.realtimeAsrModel.disabled = !editable;
   // The audio threshold is live even though other meeting settings are locked
   // at the start of recording.
   const audioThresholdEditable = ["created", "starting", "recording"].includes(state.meeting?.recording_state);
@@ -481,7 +488,6 @@ function readAsrSettings() {
 function readMeetingSettings() {
   const values = { ...state.meetingSettings };
   for (const field of MEETING_NUMBER_FIELDS) values[field.key] = clampMeetingValue(field, $(`#${field.input}`)?.value);
-  values.realtime_asr_model = dom.realtimeAsrModel?.value === "small" ? "small" : "primary";
   values.keep_audio = Boolean($("#settingKeepAudio")?.checked);
   return values;
 }
@@ -536,14 +542,29 @@ function renderMicrophoneLevel(levelPercent, live = true) {
 function queueMicrophoneLevel(level) {
   state.pendingMicrophoneLevel = Math.max(0, Math.min(1, Number(level) || 0));
   if (state.microphoneLevelFrame != null) return;
-  state.microphoneLevelFrame = window.requestAnimationFrame(() => {
-    state.microphoneLevelFrame = null;
-    const value = state.pendingMicrophoneLevel;
-    renderMicrophoneLevel(value * 100, true);
-    dom.levelBar.style.width = `${Math.round(value * 100)}%`;
-    dom.levelText.textContent = value > 0.03 ? "正在采集声音" : "等待说话";
-    if (state.meeting) state.meeting.audio_level = value;
-  });
+  state.microphoneLevelFrame = window.requestAnimationFrame(renderQueuedMicrophoneLevel);
+}
+
+function renderQueuedMicrophoneLevel() {
+  const now = performance.now();
+  state.microphoneLevelFrame = null;
+  const target = state.pendingMicrophoneLevel;
+  const current = Math.max(0, Math.min(1, state.microphoneLevelPercent / 100));
+  const delta = target - current;
+  const elapsed = state.microphoneLevelFrameAt
+    ? Math.min(100, Math.max(1, now - state.microphoneLevelFrameAt))
+    : 16.7;
+  state.microphoneLevelFrameAt = now;
+  const timeConstant = delta >= 0 ? MICROPHONE_LEVEL_ATTACK_MS : MICROPHONE_LEVEL_RELEASE_MS;
+  const factor = 1 - Math.exp(-elapsed / timeConstant);
+  const value = Math.abs(delta) <= MICROPHONE_LEVEL_SETTLE_EPSILON ? target : current + delta * factor;
+  renderMicrophoneLevel(value * 100, true);
+  dom.levelBar.style.width = `${Math.round(value * 100)}%`;
+  dom.levelText.textContent = value > 0.03 ? "正在采集声音" : "等待说话";
+  if (state.meeting) state.meeting.audio_level = value;
+  if (Math.abs(target - value) > MICROPHONE_LEVEL_SETTLE_EPSILON && state.stream) {
+    state.microphoneLevelFrame = window.requestAnimationFrame(renderQueuedMicrophoneLevel);
+  }
 }
 
 function formatDate(value) {
@@ -618,6 +639,7 @@ function renderMeetings() {
 }
 
 function clearTranscript() {
+  state.transcriptLoadToken += 1;
   clearDraft();
   state.transcript.clear();
   state.transcriptNodes.clear();
@@ -944,17 +966,18 @@ async function loadMeetings() {
 }
 
 async function loadFullTranscript(id, expectedGeneration = null) {
+  const loadToken = ++state.transcriptLoadToken;
   let offset = 0;
   const limit = 1000;
   const transcript = new Map();
-  while (state.meeting?.id === id && (expectedGeneration == null || state.streamGeneration === expectedGeneration)) {
+  while (loadToken === state.transcriptLoadToken && state.meeting?.id === id && (expectedGeneration == null || state.streamGeneration === expectedGeneration)) {
     const page = await requestJson(`/api/v2/meetings/${encodeURIComponent(id)}/transcript?offset=${offset}&limit=${limit}`);
     const items = page.paragraphs || page.items || [];
     for (const item of items) upsertUtterance(item, transcript);
     offset += items.length;
     if (!page.has_more || !items.length) break;
   }
-  if (state.meeting?.id === id && (expectedGeneration == null || state.streamGeneration === expectedGeneration)) {
+  if (loadToken === state.transcriptLoadToken && state.meeting?.id === id && (expectedGeneration == null || state.streamGeneration === expectedGeneration)) {
     for (const item of state.transcript.values()) upsertUtterance(item, transcript);
     state.transcript = transcript;
     state.transcriptLoadedFor = id;
@@ -1037,19 +1060,151 @@ async function checkHealth() {
   }
 }
 
-async function refreshDevices() {
-  if (!navigator.mediaDevices?.enumerateDevices) return;
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const microphones = devices.filter((device) => device.kind === "audioinput");
+function inputDeviceMenuIsOpen() {
+  return Boolean(state.inputDevicePickerOpen);
+}
+
+function inputDeviceOptionButtons() {
+  return dom.inputDeviceOptions ? [...dom.inputDeviceOptions.querySelectorAll('[role="option"]')] : [];
+}
+
+function updateInputDevicePicker() {
+  if (!dom.inputDevice || !dom.inputDeviceTrigger || !dom.inputDeviceOptions) return;
   const selected = dom.inputDevice.value;
-  dom.inputDevice.replaceChildren(new Option("系统默认设备", ""));
-  for (const device of microphones) dom.inputDevice.append(new Option(device.label || `麦克风 ${dom.inputDevice.length}`, device.deviceId));
+  const options = document.createDocumentFragment();
+  dom.inputDeviceTrigger.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
+  for (const option of dom.inputDevice.options) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "device-picker-option";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(option.value === selected));
+    item.dataset.value = option.value;
+    item.textContent = option.textContent;
+    options.append(item);
+  }
+  dom.inputDeviceOptions.replaceChildren(options);
+}
+
+function focusInputDeviceOption(index) {
+  const options = inputDeviceOptionButtons();
+  if (!options.length) return;
+  const nextIndex = Math.max(0, Math.min(options.length - 1, index));
+  options[nextIndex].focus();
+  options[nextIndex].scrollIntoView({ block: "nearest" });
+}
+
+function openInputDevicePicker() {
+  if (!dom.inputDeviceTrigger || !dom.inputDeviceOptions) return;
+  flushPendingInputDevices();
+  state.inputDevicePickerOpen = true;
+  dom.inputDeviceTrigger.setAttribute("aria-expanded", "true");
+  dom.inputDeviceOptions.hidden = false;
+}
+
+function closeInputDevicePicker({ focusTrigger = false } = {}) {
+  if (!dom.inputDeviceTrigger || !dom.inputDeviceOptions) return;
+  state.inputDevicePickerOpen = false;
+  dom.inputDeviceTrigger.setAttribute("aria-expanded", "false");
+  dom.inputDeviceOptions.hidden = true;
+  flushPendingInputDevices();
+  if (focusTrigger) dom.inputDeviceTrigger.focus();
+}
+
+function chooseInputDevice(value) {
+  const option = [...dom.inputDevice.options].find((candidate) => candidate.value === value);
+  if (!option) return;
+  const changed = dom.inputDevice.value !== option.value;
+  dom.inputDevice.value = option.value;
+  updateInputDevicePicker();
+  closeInputDevicePicker({ focusTrigger: true });
+  if (changed) dom.inputDevice.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function handleInputDeviceTriggerKeydown(event) {
+  const options = inputDeviceOptionButtons();
+  const selectedIndex = Math.max(0, options.findIndex((option) => option.getAttribute("aria-selected") === "true"));
+  if (["Enter", " ", "ArrowDown"].includes(event.key)) {
+    event.preventDefault();
+    openInputDevicePicker();
+    if (event.key === "ArrowDown") focusInputDeviceOption(selectedIndex);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    openInputDevicePicker();
+    focusInputDeviceOption(selectedIndex);
+  } else if (event.key === "Escape" && state.inputDevicePickerOpen) {
+    event.preventDefault();
+    closeInputDevicePicker({ focusTrigger: true });
+  }
+}
+
+function handleInputDeviceOptionsKeydown(event) {
+  const current = event.target.closest?.('[role="option"]');
+  const options = inputDeviceOptionButtons();
+  const index = Math.max(0, options.indexOf(current));
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    focusInputDeviceOption(index + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    focusInputDeviceOption(index - 1);
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    focusInputDeviceOption(0);
+  } else if (event.key === "End") {
+    event.preventDefault();
+    focusInputDeviceOption(options.length - 1);
+  } else if (["Enter", " "].includes(event.key) && current) {
+    event.preventDefault();
+    chooseInputDevice(current.dataset.value || "");
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    closeInputDevicePicker({ focusTrigger: true });
+  }
+}
+
+function renderInputDevices(microphones) {
+  const selected = dom.inputDevice.value;
+  const options = document.createDocumentFragment();
+  options.append(new Option("系统默认设备", ""));
+  microphones.forEach((device, index) => {
+    options.append(new Option(device.label || `麦克风 ${index + 1}`, device.deviceId));
+  });
+  // Commit the complete list in one DOM operation. Replacing the select one
+  // option at a time can make the native popup repaint while it is opening.
+  dom.inputDevice.replaceChildren(options);
   if ([...dom.inputDevice.options].some((option) => option.value === selected)) dom.inputDevice.value = selected;
   if (dom.inputDeviceSummary) dom.inputDeviceSummary.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
+  updateInputDevicePicker();
+}
+
+function flushPendingInputDevices() {
+  if (!state.pendingInputDevices || inputDeviceMenuIsOpen()) return;
+  const microphones = state.pendingInputDevices;
+  state.pendingInputDevices = null;
+  renderInputDevices(microphones);
+}
+
+async function refreshDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  const refreshId = ++state.inputDevicesRefreshId;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  if (refreshId !== state.inputDevicesRefreshId) return;
+  const microphones = devices.filter((device) => device.kind === "audioinput");
+  if (inputDeviceMenuIsOpen()) {
+    state.pendingInputDevices = microphones;
+    return;
+  }
+  state.pendingInputDevices = null;
+  renderInputDevices(microphones);
 }
 
 async function prepareMicrophone() {
-  if (state.stream) return;
+  if (state.stream) {
+    const hasLiveTrack = state.stream.getAudioTracks().some((track) => track.readyState === "live");
+    if (hasLiveTrack) return;
+    stopAudioCapture();
+  }
   if (!navigator.mediaDevices?.getUserMedia) throw new Error("当前浏览器不支持麦克风采集，请使用 Chrome 或 Edge。");
   const selected = dom.inputDevice.value;
   const request = navigator.mediaDevices.getUserMedia({ audio: selected ? { deviceId: { exact: selected }, channelCount: 1 } : { channelCount: 1 } });
@@ -1092,6 +1247,7 @@ async function prepareMicrophone() {
       if (["starting", "recording"].includes(state.meeting?.recording_state)) {
         stopMeeting().catch(() => {});
       }
+      stopAudioCapture();
       setConnection("楹﹀厠椋庡凡鏂紑", "danger");
       setNotice("楹﹀厠椋庤澶囧凡鏂紑锛岃閲嶆柊杩炴帴璁惧鍚庡啀寮€濮嬪綍闊?", "error");
     }, { once: true });
@@ -1099,26 +1255,33 @@ async function prepareMicrophone() {
 }
 
 async function startAudioCapture() {
-  if (!state.stream || state.audioContext) return;
-  state.audioContext = new AudioContext();
-  await state.audioContext.audioWorklet.addModule("/static/audio-worklet.js?v=6");
-  state.audioSource = state.audioContext.createMediaStreamSource(state.stream);
-  state.audioNode = new AudioWorkletNode(state.audioContext, "meeting-capture-processor", { processorOptions: { targetRate: 16000, packetSamples: 640, thresholdPercent: state.volumeThresholdPercent } });
-  state.audioNode.port.onmessage = (event) => {
-    if (event.data?.type === "level") {
-      const level = Math.min(1, Number(event.data.value) || 0);
-      queueMicrophoneLevel(level);
-    } else if (event.data?.type === "audio" && state.audioStreamingEnabled && state.ws?.readyState === WebSocket.OPEN) {
-      state.ws.send(event.data.buffer);
-    }
-  };
-  state.audioSource.connect(state.audioNode);
-  const silentGain = state.audioContext.createGain();
-  silentGain.gain.value = 0;
-  state.audioNode.connect(silentGain);
-  silentGain.connect(state.audioContext.destination);
-  await state.audioContext.resume();
-  state.audioReady = true;
+  if (!state.stream) return;
+  if (state.audioReady && state.audioContext && state.audioNode && state.audioSource) return;
+  if (state.audioContext || state.audioNode || state.audioSource) stopAudioCapture();
+  try {
+    state.audioContext = new AudioContext();
+    await state.audioContext.audioWorklet.addModule("/static/audio-worklet.js?v=8");
+    state.audioSource = state.audioContext.createMediaStreamSource(state.stream);
+    state.audioNode = new AudioWorkletNode(state.audioContext, "meeting-capture-processor", { processorOptions: { targetRate: 16000, packetSamples: 640, thresholdPercent: state.volumeThresholdPercent } });
+    state.audioNode.port.onmessage = (event) => {
+      if (event.data?.type === "level") {
+        const level = Math.min(1, Number(event.data.value) || 0);
+        if (state.stream) queueMicrophoneLevel(level);
+      } else if (event.data?.type === "audio" && state.audioStreamingEnabled && state.ws?.readyState === WebSocket.OPEN) {
+        try { state.ws.send(event.data.buffer); } catch { state.audioStreamingEnabled = false; }
+      }
+    };
+    state.audioSource.connect(state.audioNode);
+    const silentGain = state.audioContext.createGain();
+    silentGain.gain.value = 0;
+    state.audioNode.connect(silentGain);
+    silentGain.connect(state.audioContext.destination);
+    await state.audioContext.resume();
+    state.audioReady = true;
+  } catch (error) {
+    stopAudioCapture();
+    throw error;
+  }
 }
 
 function stopAudioCapture() {
@@ -1135,6 +1298,7 @@ function stopAudioCapture() {
   if (stream) stream.getTracks().forEach((track) => track.stop());
   if (state.microphoneLevelFrame != null) window.cancelAnimationFrame(state.microphoneLevelFrame);
   state.microphoneLevelFrame = null;
+  state.microphoneLevelFrameAt = 0;
   renderMicrophoneLevel(0, false);
   dom.levelBar.style.width = "0%";
   dom.levelText.textContent = "麦克风已停止";
@@ -1143,9 +1307,14 @@ function stopAudioCapture() {
 async function startMicrophonePreview() {
   if (state.meeting?.recording_state !== "created") return;
   state.audioStreamingEnabled = false;
-  await prepareMicrophone();
-  await startAudioCapture();
-  dom.levelText.textContent = "麦克风预览中";
+  try {
+    await prepareMicrophone();
+    await startAudioCapture();
+    dom.levelText.textContent = "麦克风预览中";
+  } catch (error) {
+    stopAudioCapture();
+    throw error;
+  }
 }
 
 async function restartMicrophonePreview() {
@@ -1263,9 +1432,11 @@ function closeStream(intentional = true) {
 }
 
 async function flushAudioStream() {
-  state.audioStreamingEnabled = false;
   const socket = state.ws;
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    state.audioStreamingEnabled = false;
+    return false;
+  }
   const requestId = globalThis.crypto?.randomUUID?.() || `flush-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const timeoutId = window.setTimeout(() => {
     const waiter = state.audioFlushWaiters.get(requestId);
@@ -1281,10 +1452,12 @@ async function flushAudioStream() {
     await new Promise((resolve) => window.setTimeout(resolve, 20));
   }
   if (socket.readyState !== WebSocket.OPEN) {
+    state.audioStreamingEnabled = false;
     window.clearTimeout(timeoutId);
     state.audioFlushWaiters.delete(requestId);
     return false;
   }
+  state.audioStreamingEnabled = false;
   try {
     socket.send(JSON.stringify({ type: "audio_flush", request_id: requestId }));
   } catch {
@@ -1496,7 +1669,6 @@ async function stopMeeting() {
   if (!state.meeting || !["starting", "recording"].includes(state.meeting.recording_state)) return;
   dom.recordButton.disabled = true;
   dom.recordingHint.textContent = "正在保存最后一个语音片段，请稍候…";
-  state.audioStreamingEnabled = false;
   try {
     await flushAudioStream();
     await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/stop`, { method: "POST" });
@@ -1627,6 +1799,7 @@ function bindEvents() {
   dom.authDialog.addEventListener("close", () => {
     const resolver = state.authResolver;
     state.authResolver = null;
+    state.authPromise = null;
     resolver?.(dom.authDialog.returnValue === "submit" ? dom.authToken.value.trim() : null);
   });
   $("#refreshMeetings").addEventListener("click", () => loadMeetings().catch((error) => setNotice(error.message, "error")));
@@ -1680,7 +1853,22 @@ function bindEvents() {
   dom.volumeThresholdValue.addEventListener("change", () => {
     setVolumeThreshold(dom.volumeThresholdValue.value);
   });
+  dom.inputDeviceTrigger.addEventListener("click", () => {
+    if (state.inputDevicePickerOpen) closeInputDevicePicker({ focusTrigger: true });
+    else openInputDevicePicker();
+  });
+  dom.inputDeviceTrigger.addEventListener("keydown", handleInputDeviceTriggerKeydown);
+  dom.inputDeviceOptions.addEventListener("click", (event) => {
+    const option = event.target.closest?.('[role="option"]');
+    if (option) chooseInputDevice(option.dataset.value || "");
+  });
+  dom.inputDeviceOptions.addEventListener("keydown", handleInputDeviceOptionsKeydown);
+  document.addEventListener("pointerdown", (event) => {
+    if (state.inputDevicePickerOpen && !dom.inputDevicePicker.contains(event.target)) closeInputDevicePicker();
+  });
   dom.inputDevice.addEventListener("change", async () => {
+    flushPendingInputDevices();
+    updateInputDevicePicker();
     if (dom.inputDeviceSummary) dom.inputDeviceSummary.textContent = dom.inputDevice.selectedOptions[0]?.textContent || "系统默认设备";
     if (state.meeting?.recording_state === "recording") {
       setNotice("设备选择会在下一场会议生效。", "info");
@@ -1699,11 +1887,13 @@ function bindEvents() {
     dom.jumpLatest.hidden = state.transcriptNearBottom || !state.transcript.size;
   });
   dom.jumpLatest.addEventListener("click", () => { state.transcriptNearBottom = true; renderTranscript(true); });
+  dom.asrSettingsDialog.addEventListener("close", () => closeInputDevicePicker());
 }
 
 async function init() {
   applyTheme(storedTheme(), { persist: false });
   moveAudioSettingsIntoDialog();
+  updateInputDevicePicker();
   bindEvents();
   state.timer = window.setInterval(updateTimer, 1000);
   window.setInterval(refreshCurrentMeeting, 3000);

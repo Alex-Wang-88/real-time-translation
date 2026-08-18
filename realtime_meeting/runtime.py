@@ -793,13 +793,18 @@ class LiveModelRuntime:
 
     @staticmethod
     def _prompt(recent_text: str, speech_variant: str | None, hotwords: list[str] | None) -> str:
-        parts: list[str] = []
+        parts: list[str] = [
+            "只转写当前音频片段；不要复述或补写上下文，数字、日期、型号、人名和线路名称按音频原样保留。",
+        ]
         if speech_variant and speech_variant != "mandarin":
             parts.append(f"请保留{VARIANT_LABELS.get(speech_variant, speech_variant)}的原意和表达。")
         if hotwords:
-            parts.append("专有词：" + "、".join(hotwords[:100]))
+            parts.append("当前会议专有词（只在音频中确实出现时使用）：" + "、".join(hotwords[:100]))
         if recent_text.strip():
-            parts.append(recent_text.strip()[-240:])
+            parts.append(
+                "以下是同语言上一段的末尾，仅作为拼写参考，不要把其中没有出现在当前音频里的内容输出：\n"
+                + recent_text.strip()[-160:]
+            )
         return "\n".join(parts)
 
     @staticmethod

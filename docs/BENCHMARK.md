@@ -21,3 +21,11 @@ uv run python scripts/benchmark.py tests/fixtures/benchmark.json --output result
 ```powershell
 uv run python scripts/smoke_test_local_models.py .\samples\speech.wav --device auto
 ```
+
+## 生成会议实时回放测试
+
+项目内自包含的制造业月会音频、文字稿、manifest 和测试流程位于：
+
+tests/fixtures/manufacturing_role_meeting_v3/README.md
+
+该流程使用 scripts/replay_generated_meeting_realtime.py 按 1.0 倍速逐块回放完整音频，并在回放完成后请求会议纪要和 To-do-list 两个本地 API。

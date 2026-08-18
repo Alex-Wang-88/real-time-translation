@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,7 @@ class Settings:
     api_token: str = ""
     device: str = "auto"
     asr_primary: str = "Qwen/Qwen3-ASR-1.7B"
+    asr_hotwords: list[str] = field(default_factory=list)
     single_asr_model: bool = True
     asr_fallback: str = "Qwen/Qwen3-ASR-1.7B"
     language_id_model: str = "Qwen/Qwen3-ASR-1.7B"
@@ -73,7 +74,7 @@ class Settings:
     translation_autodownload: bool = False
     results_dir: Path = Path("result/meetings")
     audio_segment_minutes: int = 30
-    max_utterance_seconds: float = 12.0
+    max_utterance_seconds: float = 18.0
     audio_pre_roll_ms: int = 500
     speech_start_ms: int = 80
     silence_ms: int = 950
@@ -153,7 +154,7 @@ MEETING_SETTING_LIMITS: dict[str, tuple[float, float]] = {
     "silence_ms": (160.0, 2000.0),
     "vad_minimum_speech_ms": (0.0, 2000.0),
     "vad_minimum_speech_ratio": (0.0, 1.0),
-    "max_utterance_seconds": (2.0, 12.0),
+    "max_utterance_seconds": (2.0, 18.0),
     "partial_interval_ms": (100.0, 5000.0),
     "audio_segment_minutes": (1.0, 120.0),
     "translation_beam_size": (1.0, 8.0),
@@ -222,7 +223,7 @@ def default_meeting_settings(settings: Settings) -> dict[str, Any]:
         "translation_max_decoding_length": 384,
         "translation_repetition_penalty": 1.05,
         "keep_audio": settings.keep_audio,
-        "asr_hotwords": [],
+        "asr_hotwords": normalize_asr_hotwords(settings.asr_hotwords),
     }
 
 
@@ -303,6 +304,7 @@ def load_settings() -> Settings:
         api_token=os.getenv("MEETING_API_TOKEN", defaults.api_token),
         device=os.getenv("MEETING_DEVICE", defaults.device),
         asr_primary=configured_primary,
+        asr_hotwords=normalize_asr_hotwords(os.getenv("MEETING_ASR_HOTWORDS", "")),
         single_asr_model=single_asr_model,
         asr_fallback=configured_fallback,
         language_id_model=configured_language_id,
@@ -315,7 +317,7 @@ def load_settings() -> Settings:
         translation_autodownload=_bool("MEETING_TRANSLATION_AUTODOWNLOAD", defaults.translation_autodownload),
         results_dir=Path(os.getenv("MEETING_RESULTS_DIR", str(defaults.results_dir))),
         audio_segment_minutes=_int("MEETING_AUDIO_SEGMENT_MINUTES", defaults.audio_segment_minutes, 1),
-        max_utterance_seconds=min(12.0, max(2.0, _float("MEETING_MAX_UTTERANCE_SECONDS", defaults.max_utterance_seconds, 2.0))),
+        max_utterance_seconds=min(18.0, max(2.0, _float("MEETING_MAX_UTTERANCE_SECONDS", defaults.max_utterance_seconds, 2.0))),
         audio_pre_roll_ms=min(1000, max(40, _int("MEETING_AUDIO_PRE_ROLL_MS", defaults.audio_pre_roll_ms, 40))),
         speech_start_ms=min(1000, max(40, _int("MEETING_SPEECH_START_MS", defaults.speech_start_ms, 40))),
         silence_ms=min(2000, max(160, _int("MEETING_SILENCE_MS", defaults.silence_ms, 160))),

@@ -80,12 +80,31 @@ def test_settings_default_to_single_1_7b_no_lid_and_have_no_removed_controls() -
     values = default_meeting_settings(settings)
     assert "keep_audio" in values
     assert values["realtime_asr_model"] == "primary"
+    assert values["max_utterance_seconds"] == 18.0
     assert values["recognition_architecture"] == "single_1_7b_no_lid"
     assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, settings)["realtime_asr_model"] == "primary"
     legacy = Settings(single_asr_model=False, asr_fallback="Qwen/Qwen3-ASR-0.6B")
     assert normalize_meeting_settings({"realtime_asr_model": "0.6b"}, legacy)["realtime_asr_model"] == "small"
     assert normalize_meeting_settings({"recognition_architecture": "router_mixed"}, settings)["recognition_architecture"] == "single_1_7b_no_lid"
     assert not any("refine" in key or "speaker" in key or "diar" in key for key in values)
+
+
+def test_max_utterance_setting_keeps_configured_eighteen_seconds() -> None:
+    settings = Settings(max_utterance_seconds=18.0)
+    assert normalize_meeting_settings({"max_utterance_seconds": 18}, settings)["max_utterance_seconds"] == 18.0
+
+
+def test_meeting_hotwords_are_carried_into_default_settings() -> None:
+    settings = Settings(asr_hotwords=["A线", "A线", "order pool"])
+    values = default_meeting_settings(settings)
+    assert values["asr_hotwords"] == ["A线", "order pool"]
+
+
+def test_qwen_prompt_scopes_domain_context_to_current_audio() -> None:
+    prompt = LiveModelRuntime._prompt("上一段内容", None, ["A线"])
+    assert "只转写当前音频片段" in prompt
+    assert "不要复述或补写上下文" in prompt
+    assert "只在音频中确实出现时使用" in prompt
 
 
 def test_qwen_runtime_uses_cantonese_adapter_and_small_model_for_lid() -> None:

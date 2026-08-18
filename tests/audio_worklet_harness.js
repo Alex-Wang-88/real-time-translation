@@ -39,8 +39,9 @@ for (const message of processor.port.messages) {
 }
 const settled = samples.slice(Math.min(400, samples.length));
 const rms = Math.sqrt(settled.reduce((sum, value) => sum + value * value, 0) / Math.max(1, settled.length));
+const levelCount = processor.port.messages.filter((message) => message.type === "level").length;
 let maxJump = 0;
 for (let index = 1; index < settled.length; index += 1) {
   maxJump = Math.max(maxJump, Math.abs(settled[index] - settled[index - 1]));
 }
-process.stdout.write(JSON.stringify({ inputRate, frequency, count: samples.length, rms, maxJump }));
+process.stdout.write(JSON.stringify({ inputRate, frequency, count: samples.length, rms, maxJump, levelCount }));

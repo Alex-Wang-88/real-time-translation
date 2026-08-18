@@ -16,7 +16,7 @@
         }
       })();
     </script>
-    <link rel="stylesheet" href="/static/styles.css?v=21" />
+    <link rel="stylesheet" href="/static/styles.css?v=24" />
     <link rel="stylesheet" href="/static/styles-fixes.css?v=8" />
   </head>
   <body>
@@ -99,7 +99,7 @@
                 <div class="settings-summary-row"><span>背景声过滤</span><strong id="volumeThresholdSummary">2.2%</strong></div>
               </div>
               <label for="inputDevice">输入设备</label>
-              <div class="device-row"><select id="inputDevice"><option value="">系统默认设备</option></select><button id="refreshDevices" class="icon-button" type="button" title="刷新设备" aria-label="刷新设备">↻</button></div>
+              <div class="device-row"><div id="inputDevicePicker" class="device-picker"><select id="inputDevice" class="device-picker-native" tabindex="-1" aria-hidden="true"><option value="">系统默认设备</option></select><button id="inputDeviceTrigger" class="device-picker-trigger" type="button" aria-label="输入设备" aria-haspopup="listbox" aria-expanded="false" aria-controls="inputDeviceOptions">系统默认设备</button><div id="inputDeviceOptions" class="device-picker-menu" role="listbox" aria-label="输入设备" hidden></div></div><button id="refreshDevices" class="icon-button" type="button" title="刷新设备" aria-label="刷新设备">↻</button></div>
               <label class="threshold-label" for="volumeThreshold">背景声过滤 <span class="settings-number-control"><input id="volumeThresholdValue" class="settings-number-input settings-number-input--compact" type="number" min="0" max="30" step="0.1" value="2.2" aria-label="背景声过滤数值" /><span class="settings-unit">%</span></span></label>
               <div class="threshold-meter" id="thresholdMeter">
                 <div class="threshold-meter-track" aria-hidden="true">
@@ -195,17 +195,6 @@
           <p class="settings-eyebrow">ASR CONTROL</p>
           <h3>录音与识别设置</h3>
           <p class="muted settings-intro">模型、分段和录音保留等参数只对当前会议生效；录音开始后锁定，音频输入可即时调整。</p>
-          <div class="settings-model-picker">
-            <div class="settings-model-heading">
-              <label for="realtimeAsrModel">实时识别架构</label>
-              <span class="settings-model-status">录音前选择</span>
-            </div>
-            <select id="realtimeAsrModel" aria-label="实时识别架构">
-              <option value="primary">大+小千问 · 质量优先</option>
-              <option value="small">小千问主识别 · 低延迟</option>
-            </select>
-            <small>大+小千问：1.7B 负责实时识别，0.6B 负责语言/方言判断并作兜底；小千问主识别：0.6B 负责实时识别，异常时由 1.7B 兜底。两种架构都会使用 0.6B 做语言/方言判断。</small>
-          </div>
           <section id="settingsPanel" class="settings-panel">
             <section id="settingsAudioSection" class="settings-audio-section">
               <div class="settings-section-heading"><strong>音频输入</strong><small>设备和环境音滑块会立即应用。</small></div>
@@ -230,9 +219,9 @@
             <div class="settings-fields">
               <label class="settings-toggle"><input id="settingKeepAudio" type="checkbox" checked /><span><strong>保留会议录音</strong><small>保留本地音频文件，便于复核和重试。</small></span></label>
             </div>
-            <p class="settings-note">计算设备、模型下载策略和 Jimo 纪要/To-do 接口属于服务级配置；实时识别架构可在上方按本次会议选择。</p>
+            <p class="settings-note">计算设备、模型下载策略、识别架构和 Jimo 纪要/To-do 接口属于服务级配置；当前会议固定使用单一 1.7B 识别策略。</p>
           </section>
-          <p id="asrSettingsNotice" class="settings-note">推荐值适合中文会议和实时识别；可调整识别架构、静音结束阈值和刷新间隔。</p>
+          <p id="asrSettingsNotice" class="settings-note">推荐值适合中文会议和实时识别；可调整静音结束阈值和刷新间隔。</p>
         </div>
         <div class="dialog-actions">
           <button id="resetAsrSettings" class="text-button" type="button">恢复推荐值</button>
@@ -241,6 +230,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="/static/app.js?v=29"></script>
+    <script type="module" src="/static/app.js?v=34"></script>
   </body>
 </html>

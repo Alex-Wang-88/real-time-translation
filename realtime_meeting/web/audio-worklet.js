@@ -56,6 +56,8 @@ class MeetingCaptureProcessor extends AudioWorkletProcessor {
     }
     let sum = 0;
     for (const value of mono) sum += value * value;
+    // Keep the original per-audio-block level reporting. The main thread
+    // coalesces these updates into one animation-frame render.
     this.port.postMessage({ type: "level", value: Math.min(1, Math.sqrt(sum / Math.max(1, mono.length)) * 3) });
     if (this.inputRate === this.targetRate) {
       this.output.push(...mono);

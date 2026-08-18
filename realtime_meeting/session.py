@@ -431,12 +431,22 @@ class LiveMeetingSession:
 
     def _recent_asr_context(self) -> str:
         active_id = self.active_paragraph.segment_id if self.active_paragraph else None
+        context_language = None
+        if self.active_paragraph and self.active_paragraph.language in {"zh", "en", "de"}:
+            context_language = self.active_paragraph.language
+        elif self.current_language in {"zh", "en", "de"}:
+            context_language = self.current_language
         source = [
             item.text
             for item in self.recent
-            if item.text.strip() and item.closed and item.segment_id != active_id
+            if (
+                item.text.strip()
+                and item.closed
+                and item.segment_id != active_id
+                and (context_language is None or item.language == context_language)
+            )
         ][-2:]
-        return " ".join(source)[-240:]
+        return " ".join(source)[-160:]
 
     async def start(self) -> None:
         if self.recording_state not in {"created"}:
