@@ -128,17 +128,21 @@
       </main>
 
       <aside class="results-column">
+        <section class="result-card refined-card">
+          <div class="panel-heading compact"><div><h3>逐句转写（精修）</h3><p class="panel-subtitle">原文与中文翻译</p></div><span id="refinedBadge" class="badge neutral">等待手动生成</span></div>
+          <div id="refinedTranscriptText" class="refined-transcript-content empty-result">会议停止并完成翻译后，点击“生成三段结果”查看精修转写。</div>
+        </section>
+
         <section class="result-card summary-card">
-          <div class="panel-heading compact"><div><h3>会议纪要</h3></div><span id="summaryBadge" class="badge neutral">等待会议结束</span></div>
-          <div id="summaryProgress" class="progress-line" hidden><span id="summaryProgressBar"></span></div>
-          <div id="summaryText" class="result-content empty-result">停止会议并完成翻译后，可以生成会议纪要。</div>
-          <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>生成纪要和 To-do-list</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
+          <div class="panel-heading compact"><div><h3>会议纪要</h3></div><span id="summaryBadge" class="badge neutral">等待手动生成</span></div>
+          <div id="summaryText" class="result-content empty-result">停止会议并完成翻译后，可以生成三段结果。</div>
+          <div class="result-actions"><button id="retrySummary" class="text-button" type="button" hidden>生成三段结果</button><button id="downloadSummary" class="text-button" type="button" hidden>下载 Markdown</button></div>
         </section>
 
         <section class="result-card todo-card">
-          <div class="panel-heading compact"><div><h3>To-do-list</h3></div><span id="todoBadge" class="badge neutral">等待会议纪要</span></div>
-          <div id="todoText" class="todo-content empty-result">会议纪要完成后，系统会从中提取明确的行动项。</div>
-          <div class="result-actions"><button id="retryTodo" class="text-button" type="button" hidden>重试 To-do-list</button><button id="downloadTodo" class="text-button" type="button" hidden>下载 JSON</button></div>
+          <div class="panel-heading compact"><div><h3>To-do-list</h3></div><span id="todoBadge" class="badge neutral">等待手动生成</span></div>
+          <div id="todoText" class="todo-content empty-result">完整转写、会议纪要和待办事项会在点击按钮后分别生成。</div>
+          <div class="result-actions"><button id="downloadTodo" class="text-button" type="button" hidden>下载 JSON</button></div>
         </section>
 
         <section id="filesCard" class="result-card files-card" hidden>

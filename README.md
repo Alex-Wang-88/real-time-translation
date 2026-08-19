@@ -63,8 +63,8 @@ POST   /api/v2/meetings/{id}/stream-ticket
 WS     /api/v2/meetings/{id}/stream
 POST   /api/v2/meetings/{id}/stop
 POST   /api/v2/meetings/{id}/translation/retry
-POST   /api/v2/meetings/{id}/summary
-POST   /api/v2/meetings/{id}/todo
+POST   /api/v2/meetings/{id}/summary       # 手动触发一次三段结果生成
+POST   /api/v2/meetings/{id}/audio-url     # 显式上传录音并返回临时 HTTPS URL
 GET    /api/v2/meetings/{id}/files/{path}
 ```
 
@@ -89,7 +89,18 @@ WebSocket 实时事件统一为：
 
 ## Jimo
 
-会议纪要和 To-do 仍使用本地配置的 Jimo SSE 节点。纪要 prompt 只使用段落中的时间、语言/方言、原文和译文，不要求人员编号。
+默认使用一次 Jimo 请求调用平台内的“完整逐句转写（精修）→会议纪要、待办事项”三节点流程。结束节点返回 `DATA`、`SUMMARY`、`TODOLIST` 三个固定分隔区块；客户端会将三个区块分别适配为精修转写、会议纪要和 To-do 卡片，并保存为 `agent_result.json`、`refined_transcript.md`、`meeting_minutes.md`、`todo_list.json` 和 `todo_list.md`。客户端按完整结果处理，不向前端输出增量；如果 share 网关以 SSE 传输完整结果，客户端只在内部合并后再一次性提交。会议停止后不会自动调用；用户点击“生成三段结果”时才发起这一次请求。
+
+平台内三个节点只接受音频中明确出现的事实；完整转写节点要求每个逐句条目同时提供原文和中文翻译，并通过稳定的句子编号让会议纪要和行动项可以回溯到原句。
+
+录音上传使用积墨公开分享页的三段式流程：先获取临时 COS 凭证，再把本地音频通过签名 `PUT` 上传到腾讯 COS，最后 `POST /v2/upload/file/share` 注册文件。配置 `JIMO_UPLOAD_SHARE_ID` 后，可以在会议完成且本地音频仍保留时显式调用：
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8765/api/v2/meetings/<meeting-id>/audio-url"
+```
+
+接口返回 `audio_urls`，这些是积墨注册后的裸 COS HTTPS URL，可直接作为后续会议转写节点的音频 URL。单节点模式点击“生成精修转写、纪要和 To-do-list”时，会自动执行同一上传流程；停止录音本身不会上传。如果未配置上传分享 ID，单节点会退回使用本地实时转写上下文；如果关闭了 `MEETING_KEEP_AUDIO`，则无法自动把本地录音交给智能体。
 
 ## 测试
 

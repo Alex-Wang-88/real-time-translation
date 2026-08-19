@@ -83,7 +83,7 @@ async def _request_postprocess_apis(
     store: LocalMeetingStore,
     meeting_id: str,
 ) -> dict[str, object]:
-    """Call the real local summary and todo HTTP routes after replay."""
+    """Simulate the user's single manual post-recording request."""
     app = create_app(settings, runtime=runtime, load_models=False, store=store)
     api_meeting = app.state.manager.get(meeting_id)
     if api_meeting is None:
@@ -94,26 +94,18 @@ async def _request_postprocess_apis(
         headers["Authorization"] = f"Bearer {settings.api_token.strip()}"
     task_timeout = max(30.0, settings.jimo_timeout_seconds * max(2, settings.jimo_max_retries))
     summary_path = f"/api/v2/meetings/{meeting_id}/summary"
-    todo_path = f"/api/v2/meetings/{meeting_id}/todo"
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver", headers=headers) as client:
         summary_request = await _post_api(client, summary_path)
         summary_wait = await _wait_for_task(api_meeting.summary_task, task_timeout)
 
-        todo_request = await _post_api(client, todo_path)
-        todo_wait = await _wait_for_task(api_meeting.todo_task, task_timeout)
-
     snapshot = api_meeting.snapshot()
     return {
         "transport": "in_process_httpx_asgi",
-        "request_count": 2,
-        "summary": {
+        "request_count": 1,
+        "request": {
             "request": summary_request,
             "task": summary_wait,
-        },
-        "todo": {
-            "request": todo_request,
-            "task": todo_wait,
         },
         "final_state": {
             "recording_state": snapshot.get("recording_state"),
@@ -124,6 +116,7 @@ async def _request_postprocess_apis(
             "todo_items": len((snapshot.get("todo") or {}).get("items") or []),
             "summary_error": snapshot.get("summary_error"),
             "todo_error": snapshot.get("todo_error"),
+            "agent_error": snapshot.get("agent_error"),
         },
     }
 

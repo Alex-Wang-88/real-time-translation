@@ -84,7 +84,7 @@ uv run python scripts/replay_sichuan_wsc_realtime.py `
 ```
 
 `--playback-rate 1` 可按真实时间回放。WSC 评测是孤立语音片段的 ASR 基准，不会为每个片段请求
-会议纪要和待办 API；制造业月会 fixture 仍负责完整的两次会后 API 合同测试。
+三段结果 API；制造业月会 fixture 仍负责完整的单次会后 API 合同测试。
 
 最终事件若为空、短于默认 1.8 秒或质量信号较弱，会在同一个 1.7B 模型上清空上一段上下文重试一次。
 回放报告的 `pipeline_metrics.asr_segment_diagnostics` 保存每个最终段的质量、触发原因和是否替换，

@@ -28,7 +28,7 @@ uv run python scripts/smoke_test_local_models.py .\samples\speech.wav --device a
 
 tests/fixtures/manufacturing_role_meeting_v3/README.md
 
-该流程使用 scripts/replay_generated_meeting_realtime.py 按 1.0 倍速逐块回放完整音频，并在回放完成后请求会议纪要和 To-do-list 两个本地 API。
+该流程使用 scripts/replay_generated_meeting_realtime.py 按 1.0 倍速逐块回放完整音频，并在回放完成后模拟用户请求一次三段结果本地 API。
 
 回放脚本会在同一份 `realtime_replay_report.json` 中写入 `automatic_evaluation`。评测会按顺序将 `manuscript.jsonl`/`manifest.json` 的参考段与实际段落对齐，允许一条参考发言对应多个实时识别段，并输出：
 
@@ -36,7 +36,7 @@ tests/fixtures/manufacturing_role_meeting_v3/README.md
 - 语言识别准确率与语言覆盖率；
 - 四川方言检测的发出率与准确率；
 - 英语/德语中文翻译的完成率和重叠率；
-- 段落覆盖、拆分/多余段落和两次会后 API 请求的完整性。
+- 段落覆盖、拆分/多余段落和单次会后三段结果 API 请求的完整性。
 
 也可以对已经生成的回放报告单独评测，不需要重新加载模型：
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from .audio import SAMPLE_RATE
 from .config import RECOGNITION_ARCHITECTURES, Settings, load_settings
+from .jimo_upload import JimoUploadClient, JimoUploadError
 from .models import SUPPORTED_LANGUAGES, SUPPORTED_SPEECH_VARIANTS
 from .runtime import LiveModelRuntime
 from .session import CapacityLimitError, SessionManager
@@ -122,6 +123,33 @@ def create_app(
             raise HTTPException(status_code=404, detail="会议不存在")
         return meeting
 
+    def meeting_audio_paths(meeting: Any) -> list[Path]:
+        """Resolve only audio files belonging to the meeting output folder."""
+
+        segments = list(getattr(meeting, "audio_segments", []) or [])
+        if not segments:
+            manifest_path = meeting.output_dir / "audio_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                manifest = {}
+            if isinstance(manifest, dict) and isinstance(manifest.get("segments"), list):
+                segments = manifest["segments"]
+
+        audio_root = (meeting.output_dir / "audio").resolve()
+        paths: list[Path] = []
+        for segment in segments:
+            if not isinstance(segment, dict) or not segment.get("file"):
+                continue
+            candidate = (audio_root / str(segment["file"])).resolve()
+            try:
+                candidate.relative_to(audio_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                paths.append(candidate)
+        return paths
+
     async def startup() -> None:
         removed = await asyncio.to_thread(repository.purge_expired, config.retention_days)
         for meeting_id in removed:
@@ -170,7 +198,6 @@ def create_app(
                 meeting.translation_worker_task,
                 meeting.post_translation_task,
                 meeting.summary_task,
-                meeting.todo_task,
                 meeting.stop_task,
                 meeting.disconnect_stop_task,
             ):
@@ -264,7 +291,7 @@ def create_app(
             "translation_target": "zh-CN",
             "meeting_start_mode": "manual",
             "jimo_configured": config.jimo_configured,
-            "todo_configured": config.todo_configured,
+            "jimo_upload_configured": config.jimo_upload_configured,
             "asr_primary": config.asr_primary,
             "asr_fallback": config.asr_fallback,
             "language_id_model": config.language_id_model,
@@ -391,18 +418,40 @@ def create_app(
         await meeting.request_stop("user")
         return {"status": "accepted", "meeting_id": meeting_id}
 
+    @app.post("/api/v2/meetings/{meeting_id}/audio-url")
+    async def upload_meeting_audio(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, Any]:
+        """Upload completed meeting audio and return short-lived HTTPS URLs.
+
+        This endpoint is deliberately explicit. It is the hand-off point for
+        a later transcription request, so stopping a meeting itself never
+        sends audio to a third party unexpectedly.
+        """
+
+        meeting = require_meeting(meeting_id)
+        if meeting.recording_state != "complete":
+            raise HTTPException(status_code=409, detail="请先等待录音完成")
+        if not config.jimo_upload_configured:
+            raise HTTPException(status_code=503, detail="未配置 JIMO_UPLOAD_SHARE_ID")
+        audio_paths = meeting_audio_paths(meeting)
+        if not audio_paths:
+            raise HTTPException(status_code=409, detail="会议没有可上传的本地音频文件")
+        try:
+            async with JimoUploadClient(config) as uploader:
+                results = await uploader.upload_many(audio_paths)
+        except JimoUploadError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "status": "complete",
+            "meeting_id": meeting_id,
+            "audio_urls": [result.url for result in results],
+            "files": [result.to_dict() for result in results],
+        }
+
     @app.post("/api/v2/meetings/{meeting_id}/summary", status_code=status.HTTP_202_ACCEPTED)
     async def request_summary(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, str]:
         meeting = require_meeting(meeting_id)
         if not await meeting.request_summary():
             raise HTTPException(status_code=409, detail="当前会议不可生成或重试会议纪要；请先等待翻译队列完成")
-        return {"status": "accepted", "meeting_id": meeting_id}
-
-    @app.post("/api/v2/meetings/{meeting_id}/todo", status_code=status.HTTP_202_ACCEPTED)
-    async def request_todo(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, str]:
-        meeting = require_meeting(meeting_id)
-        if not await meeting.request_todo():
-            raise HTTPException(status_code=409, detail="当前会议不可生成或重试 To-do-list")
         return {"status": "accepted", "meeting_id": meeting_id}
 
     @app.post("/api/v2/meetings/{meeting_id}/translation/retry", status_code=status.HTTP_202_ACCEPTED)

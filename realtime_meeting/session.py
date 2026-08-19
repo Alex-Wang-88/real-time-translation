@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import WebSocket
@@ -26,7 +27,8 @@ from .audio import (
 )
 from .config import DEFAULT_RECOGNITION_ARCHITECTURE, Settings, normalize_meeting_settings, normalize_recognition_architecture
 from .exporter import export_live_result, render_todo_markdown
-from .jimo import MeetingSummarizer, TodoGenerator
+from .jimo import MeetingAgent
+from .jimo_upload import JimoUploadClient
 from .language import (
     LanguageEvidenceAggregator,
     LanguageGuess,
@@ -85,9 +87,7 @@ class LiveMeetingSession:
         meeting_id: str | None = None,
         title: str = "未命名会议",
         recovered_state: dict[str, Any] | None = None,
-        summarizer_factory: Callable[[Settings], Any] | None = None,
-        todo_factory: Callable[[Settings], Any] | None = None,
-        **_legacy_options: Any,
+        agent_factory: Callable[[Settings], Any] | None = None,
     ) -> None:
         self.settings = settings
         self.runtime = runtime
@@ -107,8 +107,13 @@ class LiveMeetingSession:
         self.summary_revision = 0
         self.snapshot_revision = 0
         self.todo = TodoDocument(meeting_id=self.id)
+        self.refined_transcript: list[dict[str, Any]] = []
+        self.refined_transcript_markdown = ""
+        self.todo_markdown = ""
+        self.agent_result: dict[str, Any] = {}
         self.summary_error: str | None = None
         self.todo_error: str | None = None
+        self.agent_error: str | None = None
         self.error: str | None = None
         self.post_translation_state = "idle"
         self.post_translation_error: str | None = None
@@ -186,7 +191,6 @@ class LiveMeetingSession:
         self.stop_task: asyncio.Task[Any] | None = None
         self.disconnect_stop_task: asyncio.Task[Any] | None = None
         self.summary_task: asyncio.Task[Any] | None = None
-        self.todo_task: asyncio.Task[Any] | None = None
         self._translation_pending = 0
         self.translation_errors: dict[str, str] = {}
         self.pipeline_metrics: dict[str, Any] = {
@@ -232,8 +236,7 @@ class LiveMeetingSession:
         self._first_partial_recorded = False
         self._shutting_down = False
 
-        self.summarizer_factory = summarizer_factory or (lambda value: MeetingSummarizer(value))
-        self.todo_factory = todo_factory or (lambda value: TodoGenerator(value))
+        self.agent_factory = agent_factory or (lambda value: MeetingAgent(value))
         if recovered_state:
             self._restore_state(recovered_state)
 
@@ -242,9 +245,9 @@ class LiveMeetingSession:
             return
         for name in (
             "title", "recording_state", "summary_state", "todo_state", "summary", "summary_revision",
-            "summary_error", "todo_error", "error", "started_at", "ended_at", "files", "model_metadata", "snapshot_revision",
+            "summary_error", "todo_error", "agent_error", "error", "started_at", "ended_at", "files", "model_metadata", "snapshot_revision",
             "audio_samples_received", "volume_threshold_percent", "current_language", "current_variant",
-            "transcript_revision", "post_translation_state", "post_translation_error",
+            "transcript_revision", "post_translation_state", "post_translation_error", "refined_transcript_markdown", "todo_markdown",
         ):
             if name not in payload:
                 continue
@@ -264,6 +267,12 @@ class LiveMeetingSession:
             if name == "model_metadata" and not isinstance(value, dict):
                 value = {}
             setattr(self, name, value)
+        refined_transcript = payload.get("refined_transcript")
+        self.refined_transcript = refined_transcript if isinstance(refined_transcript, list) else []
+        self.refined_transcript_markdown = str(payload.get("refined_transcript_markdown") or "")
+        self.todo_markdown = str(payload.get("todo_markdown") or "")
+        agent_result = payload.get("agent_result")
+        self.agent_result = agent_result if isinstance(agent_result, dict) else {}
         # Meetings written before the post-meeting pass was introduced are
         # already complete and must not be silently reprocessed on recovery.
         if "post_translation_state" not in payload:
@@ -316,7 +325,6 @@ class LiveMeetingSession:
             self.stop_task,
             self.post_translation_task,
             self.summary_task,
-            self.todo_task,
         )
         return any(task is not None and not task.done() for task in tasks)
 
@@ -389,8 +397,13 @@ class LiveMeetingSession:
             "summary_revision": self.summary_revision,
             "snapshot_revision": self.snapshot_revision,
             "todo": self.todo.to_dict(),
+            "refined_transcript": self.refined_transcript,
+            "refined_transcript_markdown": self.refined_transcript_markdown,
+            "todo_markdown": self.todo_markdown,
+            "agent_result": self.agent_result,
             "summary_error": self.summary_error,
             "todo_error": self.todo_error,
+            "agent_error": self.agent_error,
             "error": self.error,
             "post_translation_state": self.post_translation_state,
             "post_translation_error": self.post_translation_error,
@@ -2016,106 +2029,161 @@ class LiveMeetingSession:
     async def request_summary(self) -> bool:
         if not self.begin_summary():
             return False
-        if self.todo_task and not self.todo_task.done():
-            self.todo_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.todo_task
         if self.summary_task and not self.summary_task.done():
             return True
         self.summary_task = asyncio.create_task(self.run_summary(True), name=f"summary-{self.id}")
         return True
+
+    def _audio_paths_for_agent(self) -> list[Path]:
+        """Resolve completed meeting audio without allowing path traversal."""
+
+        segments = list(self.audio_segments or [])
+        if not segments:
+            manifest_path = self.output_dir / "audio_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                manifest = {}
+            if isinstance(manifest, dict) and isinstance(manifest.get("segments"), list):
+                segments = manifest["segments"]
+        audio_root = (self.output_dir / "audio").resolve()
+        paths: list[Path] = []
+        for segment in segments:
+            if not isinstance(segment, dict) or not segment.get("file"):
+                continue
+            candidate = (audio_root / str(segment["file"])).resolve()
+            try:
+                candidate.relative_to(audio_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                paths.append(candidate)
+        return paths
+
+    def _write_agent_artifacts(self, result: Any) -> None:
+        """Persist the normalized one-node response and update download files."""
+
+        payload = result.to_dict()
+        atomic_write_json(self.output_dir / "agent_result.json", payload)
+        transcript_markdown = str(getattr(result, "transcript_markdown", "") or "").strip()
+        if not transcript_markdown:
+            transcript_lines = ["# 逐句转写（精修）", ""]
+            for item in result.transcript:
+                start = item.get("start")
+                end = item.get("end")
+                if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                    time_range = f"[{float(start):.3f}-{float(end):.3f}]"
+                else:
+                    time_range = "[时间待确认]"
+                speaker = str(item.get("speaker") or "待确认")
+                language = str(item.get("language") or "unknown")
+                transcript_lines.extend(
+                    [
+                        f"## {item.get('index', '')} · {speaker} · {language} · {time_range}",
+                        "",
+                        f"**原文：** {item.get('original', '')}",
+                        "",
+                        f"**中文翻译：** {item.get('translation_zh', '')}",
+                        "",
+                    ]
+                )
+            transcript_markdown = "\n".join(transcript_lines).strip()
+        atomic_write_text(self.output_dir / "refined_transcript.md", transcript_markdown + "\n")
+        atomic_write_text(self.output_dir / "meeting_minutes.md", result.summary_markdown.rstrip() + "\n")
+        todo_markdown = str(getattr(result, "todo_markdown", "") or "").strip() or render_todo_markdown(result.todo)
+        atomic_write_text(
+            self.output_dir / "todo_list.json",
+            json.dumps(result.todo.to_dict(), ensure_ascii=False, indent=2),
+        )
+        atomic_write_text(self.output_dir / "todo_list.md", todo_markdown.rstrip() + "\n")
+        self.files = sorted(
+            set(self.files)
+            | {"agent_result.json", "refined_transcript.md", "meeting_minutes.md", "todo_list.json", "todo_list.md"}
+        )
+
+    async def _run_single_node_agent(self) -> None:
+        try:
+            await self.status("正在准备精修转写、会议纪要和 To-do-list")
+            audio_inputs: list[dict[str, Any]] = []
+            audio_paths = self._audio_paths_for_agent()
+            upload_configured = bool(getattr(self.settings, "jimo_upload_configured", False))
+            if audio_paths and upload_configured:
+                await self.status("正在上传录音到积墨")
+                async with JimoUploadClient(self.settings) as uploader:
+                    uploaded = await uploader.upload_many(audio_paths)
+                audio_inputs = [item.to_dict() for item in uploaded]
+            elif audio_paths:
+                await self.status("未配置积墨音频上传，使用本地转写作为智能体输入")
+            else:
+                await self.status("未找到本地音频，使用本地转写作为智能体输入")
+
+            async def on_status(phase: str) -> None:
+                await self.broadcast("agent_progress", phase=phase, current=1, total=1)
+
+            result = await self.agent_factory(self.settings).process(
+                self.id,
+                summary_revision=self.summary_revision + 1,
+                started_at=self.started_at,
+                ended_at=self.ended_at or utc_now_iso(),
+                title=self.title,
+                audio_files=audio_inputs,
+                transcript=self.load_transcript(),
+                on_status=on_status,
+            )
+            self.summary = str(result.summary_markdown or "").strip()
+            self.refined_transcript = [dict(item) for item in result.transcript]
+            self.refined_transcript_markdown = str(result.transcript_markdown or "").strip()
+            self.todo = result.todo
+            self.todo_markdown = str(result.todo_markdown or "").strip() or render_todo_markdown(result.todo)
+            self.agent_result = result.to_dict()
+            self.summary_revision += 1
+            self.summary_state = "complete"
+            self.todo_state = "complete"
+            self.summary_error = None
+            self.todo_error = None
+            self.agent_error = None
+            self._write_agent_artifacts(result)
+            self._export_current_files()
+            self.files = sorted(
+                set(self.files)
+                | {"agent_result.json", "refined_transcript.md", "meeting_minutes.md", "todo_list.json", "todo_list.md"}
+            )
+            self._write_state()
+            await self.broadcast(
+                "agent_complete",
+                result=self.agent_result,
+                summary=self.summary,
+                todo=self.todo.to_dict(),
+                refined_transcript=self.refined_transcript,
+                refined_transcript_markdown=self.refined_transcript_markdown,
+                todo_markdown=self.todo_markdown,
+                files=self.files,
+                summary_revision=self.summary_revision,
+            )
+            await self.status("精修转写、会议纪要和 To-do-list 已完成")
+        except Exception as exc:
+            self.summary_state = "error"
+            self.todo_state = "error"
+            self.summary_error = str(exc)
+            self.todo_error = str(exc)
+            self.agent_error = str(exc)
+            self._write_state()
+            await self.broadcast(
+                "error",
+                code="agent_failed",
+                message=self.summary_error,
+                retryable=True,
+                summary=self.summary,
+                summary_revision=self.summary_revision,
+                agent=True,
+            )
 
     async def run_summary(self, claimed: bool = False) -> None:
         if not claimed and self.summary_state != "queued":
             return
         if not claimed and not self.begin_summary():
             return
-        try:
-            await self.status("正在生成会议纪要")
-            summarizer = self.summarizer_factory(self.settings)
-            candidate = ""
-
-            async def on_status(kind: str, index: int, total: int) -> None:
-                await self.broadcast("summary_progress", phase=kind, current=index, total=total)
-
-            async def on_delta(content: str) -> None:
-                nonlocal candidate
-                candidate += content
-                await self.broadcast("summary_delta", content=content)
-
-            async def on_reset() -> None:
-                nonlocal candidate
-                candidate = ""
-                await self.broadcast("summary_reset")
-
-            result = await summarizer.summarize(
-                self.transcript_path,
-                self.id,
-                self.started_at,
-                self.ended_at or utc_now_iso(),
-                on_status=on_status,
-                on_delta=on_delta,
-                on_reset=on_reset,
-                attempt_id=f"{self.id}:{self.summary_revision + 1}:{uuid.uuid4().hex}",
-            )
-            self.summary = str(result or candidate).strip()
-            self.summary_revision += 1
-            self.summary_state = "complete"
-            self.todo_state = "queued"
-            self.summary_error = None
-            atomic_write_text(self.output_dir / "meeting_minutes.md", self.summary + "\n")
-            self._export_current_files()
-            self._write_state()
-            await self.broadcast("summary_complete", content=self.summary, summary_revision=self.summary_revision, files=self.files)
-            self.todo_task = asyncio.create_task(self.run_todo(True), name=f"todo-{self.id}-{self.summary_revision}")
-        except Exception as exc:
-            self.summary_state = "error"
-            self.summary_error = str(exc)
-            self._write_state()
-            await self.broadcast("error", code="summary_failed", message=self.summary_error, retryable=True, summary=self.summary, summary_revision=self.summary_revision)
-
-    def begin_todo(self) -> bool:
-        if self.recording_state != "complete" or self.summary_state != "complete" or not self.summary.strip():
-            return False
-        if self.todo_state not in {"queued", "error", "stale", "complete"}:
-            return False
-        self.todo_state = "running"
-        self.todo_error = None
-        self._write_state()
-        return True
-
-    async def request_todo(self) -> bool:
-        if not self.begin_todo():
-            return False
-        if self.todo_task and not self.todo_task.done():
-            return True
-        self.todo_task = asyncio.create_task(self.run_todo(True), name=f"todo-{self.id}-{self.summary_revision}")
-        return True
-
-    async def run_todo(self, claimed: bool = False) -> None:
-        if not claimed and self.todo_state != "queued":
-            return
-        if not claimed and not self.begin_todo():
-            return
-        target_revision, target_summary = self.summary_revision, self.summary
-        try:
-            generator = self.todo_factory(self.settings)
-            todo = await generator.generate(self.id, target_revision, target_summary, on_status=lambda phase: self.broadcast("todo_progress", phase=phase, summary_revision=target_revision))
-            if target_revision != self.summary_revision or target_summary != self.summary:
-                return
-            self.todo = todo
-            self.todo_state = "complete"
-            self.todo_error = None
-            atomic_write_text(self.output_dir / "todo_list.json", json.dumps(todo.to_dict(), ensure_ascii=False, indent=2))
-            atomic_write_text(self.output_dir / "todo_list.md", render_todo_markdown(todo))
-            self._export_current_files()
-            self._write_state()
-            await self.broadcast("todo_complete", todo=todo.to_dict(), files=self.files, summary_revision=self.summary_revision)
-        except Exception as exc:
-            self.todo_state = "error"
-            self.todo_error = str(exc)
-            self._write_state()
-            await self.broadcast("error", code="todo_failed", message=self.todo_error, retryable=True)
+        await self._run_single_node_agent()
 
 
 class SessionManager:

@@ -1,8 +1,8 @@
 """Replay WSC-Eval-ASR clips through the real-time meeting session.
 
-This is an ASR benchmark runner, so it does not call the meeting-minutes and
-todo APIs for every isolated clip.  The existing manufacturing meeting replay
-remains the full end-to-end contract test.  WSC replay focuses on real audio,
+This is an ASR benchmark runner, so it does not call the three-result API for
+every isolated clip. The existing manufacturing meeting replay remains the
+full end-to-end contract test. WSC replay focuses on real audio,
 speech segmentation, Sichuan routing and the dual-text evaluator.
 """
 

@@ -129,8 +129,9 @@ class Settings:
     retention_days: int = 30
     keep_audio: bool = True
     jimo_api_url: str = ""
-    jimo_todo_api_url: str = "https://jimoai-bot-api.xiaohuodui.cn/v2/chat/completions/share?shareId=jSBaVou1SZDrd4bX"
     jimo_authorization: str = ""
+    # One configured platform agent returns the three marked sections together
+    # as one complete response.
     jimo_max_request_chars: int = 12_000
     jimo_max_response_chars: int = 80_000
     jimo_transcript_chars: int = 5_000
@@ -153,10 +154,6 @@ class Settings:
     @property
     def jimo_configured(self) -> bool:
         return bool(self.jimo_api_url.strip() and self.jimo_authorization.strip())
-
-    @property
-    def todo_configured(self) -> bool:
-        return bool(self.jimo_todo_api_url.strip() and self.jimo_authorization.strip())
 
     @property
     def jimo_upload_configured(self) -> bool:
@@ -473,7 +470,6 @@ def load_settings() -> Settings:
         retention_days=_int("MEETING_RETENTION_DAYS", defaults.retention_days, 0),
         keep_audio=_bool("MEETING_KEEP_AUDIO", defaults.keep_audio),
         jimo_api_url=os.getenv("JIMO_API_URL", defaults.jimo_api_url),
-        jimo_todo_api_url=os.getenv("JIMO_TODO_API_URL", defaults.jimo_todo_api_url),
         jimo_authorization=os.getenv("JIMO_AUTHORIZATION", defaults.jimo_authorization),
         jimo_max_request_chars=_int("JIMO_MAX_REQUEST_CHARS", defaults.jimo_max_request_chars, 1000),
         jimo_max_response_chars=_int("JIMO_MAX_RESPONSE_CHARS", defaults.jimo_max_response_chars, 1000),

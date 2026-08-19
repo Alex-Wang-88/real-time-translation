@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import ast
 import asyncio
+import ast
 import json
+import math
 import re
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
+from .exporter import render_todo_markdown
 from .language import is_mixed_source_text
 from .models import TodoDocument, TodoItem, Utterance, speech_variant_label, utc_now_iso
-from .prompts import SUMMARY_SYSTEM_PROMPT, TODO_SYSTEM_PROMPT
-from .storage import TranscriptStore
+from .prompts import MEETING_AGENT_REQUEST_PROMPT
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,34 +26,11 @@ class SseEvent:
 
 
 def parse_sse_lines(lines: Iterable[str]) -> Iterator[SseEvent]:
+    """Read a platform event stream as complete events, without UI streaming."""
+
     event_name = "message"
     data_parts: list[str] = []
     for raw in lines:
-        line = raw.rstrip("\r\n")
-        if not line:
-            if data_parts or event_name != "message":
-                yield SseEvent(event_name, "\n".join(data_parts))
-            event_name, data_parts = "message", []
-            continue
-        if line.startswith(":"):
-            continue
-        field, separator, value = line.partition(":")
-        if not separator:
-            continue
-        if value.startswith(" "):
-            value = value[1:]
-        if field == "event":
-            event_name = value
-        elif field == "data":
-            data_parts.append(value)
-    if data_parts or event_name != "message":
-        yield SseEvent(event_name, "\n".join(data_parts))
-
-
-async def parse_sse_async(lines: AsyncIterator[str]) -> AsyncIterator[SseEvent]:
-    event_name = "message"
-    data_parts: list[str] = []
-    async for raw in lines:
         line = raw.rstrip("\r\n")
         if not line:
             if data_parts or event_name != "message":
@@ -101,11 +77,8 @@ def _event_content(event: SseEvent) -> tuple[str, bool]:
                 payloads.append(payload)
     if not payloads:
         text = event.data.strip()
-        # Many share SSE endpoints stream plain text instead of JSON.
-        # Treat non-empty, non-terminal data as a content chunk.
-        if text and text not in {"[DONE]", "DONE"}:
-            return text, False
-        return "", False
+        return (text, False) if text and text not in {"[DONE]", "DONE"} else ("", False)
+
     contents: list[str] = []
     ended = False
     for payload in payloads:
@@ -118,13 +91,80 @@ def _event_content(event: SseEvent) -> tuple[str, bool]:
                 delta = choices[0].get("delta", choices[0].get("message", {}))
                 if isinstance(delta, dict):
                     content = delta.get("content", "")
+        if content is None:
+            for key in ("answer", "text", "output", "result"):
+                if payload.get(key) is not None:
+                    content = payload[key]
+                    break
         if content is not None:
             contents.append(str(content))
     return "".join(contents), ended
 
 
+def _looks_like_sse(body: str, content_type: str) -> bool:
+    normalized_type = content_type.casefold()
+    if "text/event-stream" in normalized_type:
+        return True
+    stripped = body.lstrip()
+    return stripped.startswith("event:") or stripped.startswith("data:")
+
+
+def _content_for_budget(value: Any) -> str:
+    """Return a stable text representation for request-size accounting."""
+
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _response_content(value: Any) -> str:
+    """Extract assistant text from JSON, OpenAI-like, or Jimo envelopes."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [_response_content(item) for item in value]
+        return "".join(part for part in parts if part)
+    if not isinstance(value, Mapping):
+        return _content_for_budget(value)
+
+    # A single-node agent may return the structured object directly.
+    if {"transcript", "minutes", "todo"}.issubset(value):
+        return json.dumps(dict(value), ensure_ascii=False)
+
+    choices = value.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, Mapping):
+            message = choice.get("message") or choice.get("delta") or choice
+            if isinstance(message, Mapping) and "content" in message:
+                return _response_content(message.get("content"))
+
+    for key in ("content", "answer", "text", "output", "result", "data", "message"):
+        if key not in value:
+            continue
+        candidate = value.get(key)
+        if isinstance(candidate, Mapping) and {"transcript", "minutes", "todo"}.issubset(candidate):
+            return json.dumps(dict(candidate), ensure_ascii=False)
+        extracted = _response_content(candidate)
+        if extracted:
+            return extracted
+    return json.dumps(dict(value), ensure_ascii=False)
+
+
 class JimoClient:
-    """Compatibility client for the existing Jimo share SSE endpoint."""
+    """Client for the single configured Jimo share endpoint.
+
+    The application consumes one complete result. Some share gateways still
+    transport that result as SSE even when JSON is requested, so the response
+    parser collects the stream internally and never exposes token deltas to the
+    frontend.
+    """
 
     def __init__(
         self,
@@ -142,16 +182,13 @@ class JimoClient:
         self._external_client = client
 
     @staticmethod
-    def request_chars(messages: list[dict[str, str]]) -> int:
-        return sum(len(str(item.get("content", ""))) for item in messages)
+    def request_chars(messages: list[dict[str, Any]]) -> int:
+        return sum(len(_content_for_budget(item.get("content", ""))) for item in messages)
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         session_id: str,
-        *,
-        on_delta: Callable[[str], Any] | None = None,
-        on_reset: Callable[[], Any] | None = None,
     ) -> str:
         size = self.request_chars(messages)
         if size > self.settings.jimo_max_request_chars:
@@ -159,17 +196,13 @@ class JimoClient:
         payload = {"messages": messages, "sessionId": session_id, "source": "api", "extra": {}}
         headers = {
             "Authorization": self.settings.jimo_authorization,
-            "Accept": "text/event-stream",
+            "Accept": "application/json",
             "Content-Type": "application/json",
         }
         last_error: Exception | None = None
         for attempt in range(self.settings.jimo_max_retries):
-            if attempt and on_reset:
-                result = on_reset()
-                if asyncio.iscoroutine(result):
-                    await result
             try:
-                return await self._complete_once(payload, headers, on_delta)
+                return await self._complete_once(payload, headers)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 last_error = exc
                 if attempt + 1 < self.settings.jimo_max_retries:
@@ -180,41 +213,45 @@ class JimoClient:
         self,
         payload: dict[str, object],
         headers: dict[str, str],
-        on_delta: Callable[[str], Any] | None,
     ) -> str:
         owned = self._external_client is None
         client = self._external_client or httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.jimo_timeout_seconds, connect=self.settings.jimo_connect_timeout_seconds),
             follow_redirects=True,
         )
-        chunks: list[str] = []
-        response_chars = 0
-        ended = False
         try:
-            async with client.stream("POST", self.endpoint, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                async for event in parse_sse_async(response.aiter_lines()):
-                    content, is_end = _event_content(event)
-                    if content:
-                        response_chars += len(content)
-                        if response_chars > self.settings.jimo_max_response_chars:
-                            raise ValueError(
-                                f"Jimo response exceeds {self.settings.jimo_max_response_chars} characters"
-                            )
-                        chunks.append(content)
-                        if on_delta:
-                            result = on_delta(content)
-                            if asyncio.iscoroutine(result):
-                                await result
+            response = await client.post(self.endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.text
+            if _looks_like_sse(body, response.headers.get("content-type", "")):
+                chunks: list[str] = []
+                ended = False
+                for event in parse_sse_lines(body.splitlines()):
+                    event_text, is_end = _event_content(event)
+                    if event_text:
+                        chunks.append(event_text)
                     if is_end:
                         ended = True
                         break
+                if not ended and chunks:
+                    ended = True
+                content = "".join(chunks).strip()
+                if not ended:
+                    raise RuntimeError("Jimo SSE 响应在结束之前断开")
+            else:
+                try:
+                    response_payload = response.json()
+                except (json.JSONDecodeError, ValueError):
+                    content = body.strip()
+                else:
+                    content = _response_content(response_payload).strip()
+
+            if len(content) > self.settings.jimo_max_response_chars:
+                raise ValueError(f"Jimo response exceeds {self.settings.jimo_max_response_chars} characters")
         finally:
             if owned:
                 await client.aclose()
-        if not ended:
-            raise RuntimeError("Jimo SSE 在结束事件之前断开")
-        return "".join(chunks).strip()
+        return content
 
 
 def paired_text(item: Utterance) -> str:
@@ -226,97 +263,6 @@ def paired_text(item: Utterance) -> str:
     if translation and (item.language != "zh" or is_mixed_source_text(source)):
         return f"{original}\n[{item.start:.3f}-{item.end:.3f}] 中文翻译：{translation}"
     return original
-
-
-def transcript_chunks(path: Path, max_chars: int) -> Iterator[tuple[int, float, float, str]]:
-    lines: list[str] = []
-    chars = 0
-    index = 0
-    start = end = 0.0
-    # transcript.jsonl is an append-only revision log.  Summaries must consume
-    # its latest schema-2 projection, otherwise every partial revision would be
-    # sent to Jimo as a duplicate paragraph.
-    for item in TranscriptStore(path).load():
-        pair = paired_text(item)
-        if lines and chars + len(pair) + 1 > max_chars:
-            index += 1
-            yield index, start, end, "\n".join(lines)
-            lines, chars = [], 0
-        if not lines:
-            start = item.start
-        lines.append(pair)
-        chars += len(pair) + 1
-        end = item.end
-    if lines:
-        index += 1
-        yield index, start, end, "\n".join(lines)
-
-
-class MeetingSummarizer:
-    def __init__(self, settings: Settings, client: JimoClient | None = None) -> None:
-        self.settings = settings
-        self.client = client or JimoClient(settings)
-
-    async def summarize(
-        self,
-        transcript_path: Path,
-        meeting_id: str,
-        started_at: str,
-        ended_at: str,
-        *,
-        on_status: Callable[[str, int, int], Any] | None = None,
-        on_delta: Callable[[str], Any] | None = None,
-        on_reset: Callable[[], Any] | None = None,
-        attempt_id: str | None = None,
-    ) -> str:
-        raw_limit = min(
-            self.settings.jimo_transcript_chars,
-            max(1000, self.settings.jimo_max_request_chars - len(SUMMARY_SYSTEM_PROMPT) - self.settings.jimo_state_chars - 800),
-        )
-        chunks = list(transcript_chunks(transcript_path, raw_limit))
-        if not chunks:
-            raise ValueError("会议没有可总结的有效发言")
-        attempt_id = attempt_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        state = ""
-        for index, start, end, text in chunks:
-            if on_status:
-                result = on_status("chunk", index, len(chunks))
-                if asyncio.iscoroutine(result):
-                    await result
-            marker = (
-                f"MODE=STATE_UPDATE\nMEETING_ID={meeting_id}\nCHUNK_INDEX={index}\nCHUNK_TOTAL={len(chunks)}\n"
-                f"TIME_RANGE={start:.3f}-{end:.3f}\n\n以下是本轮会议按语言/方言聚合的段落记录：\n{text}\n\n"
-                "请将本轮明确事实合并到会议状态中，只输出更新后的紧凑状态。"
-            )
-            messages = [{"role": "system", "content": SUMMARY_SYSTEM_PROMPT}]
-            if state:
-                messages.append({"role": "assistant", "content": state})
-            messages.append({"role": "user", "content": marker})
-            state = await self.client.complete(messages, f"meeting:{meeting_id}:summary:{attempt_id}")
-            if len(state) > self.settings.jimo_state_chars:
-                compact_messages = [
-                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                    {"role": "assistant", "content": state},
-                    {"role": "user", "content": "MODE=STATE_UPDATE\n请压缩会议状态到 4000 个字符以内，保留所有决策、行动项、风险、异议和时间范围。只输出压缩后的状态。"},
-                ]
-                state = await self.client.complete(compact_messages, f"meeting:{meeting_id}:summary:{attempt_id}")
-                state = state[: self.settings.jimo_state_chars]
-        if on_status:
-            result = on_status("final", len(chunks), len(chunks))
-            if asyncio.iscoroutine(result):
-                await result
-        final_messages = [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "assistant", "content": state},
-            {"role": "user", "content": f"MODE=FINAL\nMEETING_ID={meeting_id}\nENDED_AT={ended_at}\nTOTAL_CHUNKS={len(chunks)}\n\n请根据当前会议状态输出最终中文会议纪要。会议开始时间：{started_at}"},
-        ]
-        final = await self.client.complete(
-            final_messages,
-            f"meeting:{meeting_id}:summary:{attempt_id}",
-            on_delta=on_delta,
-            on_reset=on_reset,
-        )
-        return _strip_markdown_fence(final)
 
 
 def _strip_json_fence(value: str) -> str:
@@ -356,6 +302,126 @@ def _strip_markdown_fence(value: str) -> str:
     stripped = re.sub(r"^```(?:markdown)?\s*", "", stripped, flags=re.IGNORECASE)
     stripped = re.sub(r"\s*```$", "", stripped)
     return stripped.strip()
+
+
+_MARKED_AGENT_SECTION_RE = re.compile(
+    r"@@JIMO_SECTION:(DATA|SUMMARY|TODOLIST):BEGIN@@[ \t]*\r?\n"
+    r"(?P<body>.*?)"
+    r"\r?\n@@JIMO_SECTION:\1:END@@",
+    re.DOTALL,
+)
+_TRANSCRIPT_HEADING_RE = re.compile(
+    r"^###\s+\[S?(?P<index>\d+)\]\s+时间\s*[:：]\s*(?P<time>.+?)\s*$",
+    re.MULTILINE,
+)
+_TODO_HEADING_RE = re.compile(r"^###\s+(?P<id>T\d+)\s*$", re.MULTILINE)
+
+
+def _marked_agent_sections(raw: str) -> dict[str, str] | None:
+    """Extract the three fixed sections emitted by the platform end node."""
+
+    text = _strip_markdown_fence(str(raw or ""))
+    sections: dict[str, str] = {}
+    for match in _MARKED_AGENT_SECTION_RE.finditer(text):
+        name = match.group(1)
+        if name in sections:
+            return None
+        sections[name] = match.group("body").strip()
+    if set(sections) != {"DATA", "SUMMARY", "TODOLIST"}:
+        return None
+    return sections
+
+
+def _markdown_fields(block: str, labels: tuple[str, ...]) -> dict[str, str]:
+    label_expr = "|".join(re.escape(label) for label in labels)
+    pattern = re.compile(
+        rf"^- (?P<label>{label_expr})\s*[:：]\s*(?P<value>.*?)"
+        rf"(?=^- (?:{label_expr})\s*[:：]|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    return {match.group("label"): match.group("value").strip() for match in pattern.finditer(block)}
+
+
+def _markdown_time_range(value: str) -> tuple[float | None, float | None]:
+    parts = re.split(r"\s+[-–—]\s+", str(value or "").strip(), maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    return _optional_number(parts[0]), _optional_number(parts[1])
+
+
+def _markdown_language(value: str) -> str:
+    normalized = str(value or "").strip()
+    return {
+        "中文": "zh",
+        "普通话": "zh",
+        "英文": "en",
+        "英语": "en",
+        "德文": "de",
+        "德语": "de",
+    }.get(normalized, normalized or "unknown")
+
+
+def _parse_markdown_transcript(markdown: str, meeting_id: str) -> list[dict[str, Any]]:
+    headings = list(_TRANSCRIPT_HEADING_RE.finditer(markdown))
+    items: list[dict[str, Any]] = []
+    labels = ("说话人", "语言", "原文", "中文翻译", "是否存疑", "存疑说明")
+    for position, heading in enumerate(headings):
+        block_end = headings[position + 1].start() if position + 1 < len(headings) else len(markdown)
+        block = markdown[heading.end() : block_end]
+        fields = _markdown_fields(block, labels)
+        original = fields.get("原文", "").strip()
+        translation = fields.get("中文翻译", "").strip()
+        if not original and not translation:
+            continue
+        start, end = _markdown_time_range(heading.group("time"))
+        index = int(heading.group("index"))
+        items.append(
+            {
+                "index": index,
+                "speaker": fields.get("说话人", "待确认") or "待确认",
+                "language": _markdown_language(fields.get("语言", "")),
+                "start": start,
+                "end": end,
+                "original": original,
+                "translation_zh": translation,
+                "uncertain": fields.get("是否存疑", "").strip().lower() in {"是", "true", "yes"},
+                "uncertainty_note": fields.get("存疑说明", "").strip(),
+            }
+        )
+    return _normalise_agent_transcript(items, meeting_id)
+
+
+def _parse_markdown_todo(markdown: str, meeting_id: str, summary_revision: int) -> TodoDocument:
+    headings = list(_TODO_HEADING_RE.finditer(markdown))
+    labels = ("任务", "负责人", "截止时间", "优先级", "当前状态", "原文依据", "时间范围", "事实说明")
+    raw_items: list[dict[str, Any]] = []
+    for position, heading in enumerate(headings):
+        block_end = headings[position + 1].start() if position + 1 < len(headings) else len(markdown)
+        fields = _markdown_fields(markdown[heading.end() : block_end], labels)
+        task = fields.get("任务", "").strip()
+        if not task or task in {"无", "暂无明确待办事项"}:
+            continue
+        start, end = _markdown_time_range(fields.get("时间范围", ""))
+        source = fields.get("原文依据", "").strip()
+        fact = fields.get("事实说明", "").strip()
+        evidence = fact or source
+        if fact and source:
+            evidence = f"{fact}（依据：{source}）"
+        raw_items.append(
+            {
+                "task": task,
+                "owner": fields.get("负责人") or None,
+                "due_date": fields.get("截止时间") or None,
+                "priority": fields.get("优先级") or "待确认",
+                "status": fields.get("当前状态") or "未开始",
+                "source_time_start": start,
+                "source_time_end": end,
+                "evidence": evidence,
+                "notes": "",
+            }
+        )
+    payload = {"schema_version": "1.0", "items": raw_items}
+    return parse_todo_document(json.dumps(payload, ensure_ascii=False), meeting_id, summary_revision)
 
 
 class _TodoItemPayload(BaseModel):
@@ -412,44 +478,346 @@ def parse_todo_document(raw: str, meeting_id: str, summary_revision: int) -> Tod
     return TodoDocument(payload.schema_version or "1.0", items, meeting_id, summary_revision, now)
 
 
-class TodoGenerator:
+def _first_text(value: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        candidate = value.get(key)
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if text:
+            return text
+    return ""
+
+
+def _optional_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?\s*", value)
+        if match:
+            hours = float(match.group(1) or 0)
+            minutes = float(match.group(2))
+            seconds = float(match.group(3))
+            fraction = float(f"0.{match.group(4)}") if match.group(4) else 0.0
+            value = hours * 3600 + minutes * 60 + seconds + fraction
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(result, 3) if math.isfinite(result) and result >= 0 else None
+
+
+def _source_indices(value: Any) -> list[int]:
+    values = value if isinstance(value, list) else []
+    result: list[int] = []
+    for item in values:
+        try:
+            index = int(item)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if index > 0 and index not in result:
+            result.append(index)
+    return result
+
+
+def _normalise_agent_transcript(raw_items: Any, meeting_id: str) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for position, raw_item in enumerate(raw_items, start=1):
+        if not isinstance(raw_item, Mapping):
+            continue
+        try:
+            index = max(1, int(raw_item.get("index", position) or position))
+        except (TypeError, ValueError, OverflowError):
+            index = position
+        original = _first_text(raw_item, "original", "text", "source")
+        translation = _first_text(raw_item, "translation_zh", "translation", "chinese_translation")
+        if not original and not translation:
+            continue
+        result.append(
+            {
+                "id": str(raw_item.get("id") or f"{meeting_id}-refined-{index}"),
+                "index": index,
+                "speaker": _first_text(raw_item, "speaker", "speaker_id", "speaker_label") or "待确认",
+                "speaker_name": raw_item.get("speaker_name"),
+                "language": _first_text(raw_item, "language", "lang") or "unknown",
+                "speech_variant": raw_item.get("speech_variant"),
+                "start": _optional_number(raw_item.get("start", raw_item.get("time_start"))),
+                "end": _optional_number(raw_item.get("end", raw_item.get("time_end"))),
+                "original": original,
+                "translation_zh": translation,
+                "uncertain": bool(raw_item.get("uncertain", False)),
+                "uncertainty_note": _first_text(raw_item, "uncertainty_note", "uncertainty"),
+                "source_indices": _source_indices(raw_item.get("source_indices")) or [index],
+            }
+        )
+    return result
+
+
+def _normalise_minutes(raw_minutes: Any) -> dict[str, Any]:
+    if isinstance(raw_minutes, Mapping):
+        return dict(raw_minutes)
+    if isinstance(raw_minutes, str) and raw_minutes.strip():
+        return {"topic": "", "plain_text": raw_minutes.strip()}
+    return {}
+
+
+def _markdown_cell(value: Any) -> str:
+    return " ".join(str(value or "").replace("|", "\\|").splitlines()).strip() or "未提及"
+
+
+def _entry_text(value: Any, *keys: str) -> str:
+    if isinstance(value, Mapping):
+        return _first_text(value, *keys)
+    return str(value or "").strip()
+
+
+def render_agent_minutes(minutes: Mapping[str, Any] | str, todo: TodoDocument | None = None) -> str:
+    """Render the structured agent minutes into the existing Markdown card."""
+
+    if isinstance(minutes, str):
+        return _strip_markdown_fence(minutes)
+    values = dict(minutes)
+    plain_text = _first_text(values, "plain_text", "summary_markdown")
+    if plain_text:
+        return _strip_markdown_fence(plain_text)
+
+    topic = _first_text(values, "topic", "title") or "未提及"
+    core = values.get("core_conclusions") or values.get("core_conclusion") or []
+    discussions = values.get("discussion_points") or values.get("key_points") or []
+    decisions = values.get("decisions") or []
+    risks = values.get("risks_and_blockers") or values.get("risks") or []
+    questions = values.get("open_questions") or values.get("unresolved_questions") or []
+    lines = ["# 会议纪要", "", "## 1. 会议主题", topic, "", "## 2. 核心结论"]
+    if isinstance(core, list) and core:
+        for item in core:
+            text = _entry_text(item, "text", "conclusion", "summary")
+            if text:
+                lines.append(f"- {text}")
+    else:
+        lines.append("未提及")
+
+    lines.extend(["", "## 3. 讨论要点"])
+    if isinstance(discussions, list) and discussions:
+        for item in discussions:
+            if isinstance(item, Mapping):
+                heading = _first_text(item, "topic", "title") or "未命名议题"
+                lines.append(f"### {heading}")
+                points = item.get("points") or item.get("items") or []
+                if isinstance(points, list) and points:
+                    lines.extend(f"- {str(point).strip()}" for point in points if str(point).strip())
+                else:
+                    text = _first_text(item, "text", "summary")
+                    lines.append(f"- {text or '未提及'}")
+            else:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"- {text}")
+    else:
+        lines.append("未提及")
+
+    lines.extend(["", "## 4. 决策记录", "", "| 决策 | 条件或依据 | 原文句子 |", "|---|---|---|"])
+    if isinstance(decisions, list) and decisions:
+        for item in decisions:
+            if isinstance(item, Mapping):
+                indices = ", ".join(str(index) for index in _source_indices(item.get("source_indices"))) or "待确认"
+                lines.append(
+                    f"| {_markdown_cell(_first_text(item, 'decision', 'text'))} | "
+                    f"{_markdown_cell(_first_text(item, 'basis', 'condition', 'evidence'))} | {indices} |"
+                )
+            else:
+                lines.append(f"| {_markdown_cell(item)} | 未提及 | 待确认 |")
+    else:
+        lines.append("| 未提及 | 未提及 | 待确认 |")
+
+    lines.extend(["", "## 5. 行动项", "", "| 任务 | 负责人 | 截止时间 | 优先级 | 状态 | 依据 |", "|---|---|---|---|---|---|"])
+    if todo and todo.items:
+        for item in todo.items:
+            lines.append(
+                f"| {_markdown_cell(item.task)} | {_markdown_cell(item.owner)} | {_markdown_cell(item.due_date)} | "
+                f"{_markdown_cell(item.priority)} | {_markdown_cell(item.status)} | {_markdown_cell(item.evidence)} |"
+            )
+    else:
+        lines.append("| 未提及 | 待确认 | 待确认 | 待确认 | 未开始 | 未提及 |")
+
+    def append_text_section(title: str, entries: Any) -> None:
+        lines.extend(["", title])
+        if isinstance(entries, list) and entries:
+            for item in entries:
+                text = _entry_text(item, "text", "question", "risk", "summary")
+                if text:
+                    lines.append(f"- {text}")
+        else:
+            lines.append("未提及")
+
+    append_text_section("## 6. 风险与阻塞", risks)
+    append_text_section("## 7. 未决问题", questions)
+    return "\n".join(lines).strip()
+
+
+@dataclass(frozen=True, slots=True)
+class MeetingAgentResult:
+    schema_version: str
+    meta: dict[str, Any]
+    transcript: list[dict[str, Any]]
+    minutes: dict[str, Any]
+    summary_markdown: str
+    todo: TodoDocument
+    transcript_markdown: str = ""
+    todo_markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "meta": dict(self.meta),
+            "transcript": [dict(item) for item in self.transcript],
+            "minutes": dict(self.minutes),
+            "summary_markdown": self.summary_markdown,
+            "todo": [item.to_dict() for item in self.todo.items],
+            "transcript_markdown": self.transcript_markdown,
+            "todo_markdown": self.todo_markdown,
+        }
+
+
+def _agent_payload_from_raw(raw: str | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(raw, Mapping):
+        payload: Any = dict(raw)
+    else:
+        cleaned = _strip_json_fence(str(raw or ""))
+        try:
+            payload = json.loads(cleaned)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("单节点智能体返回的不是合法 JSON") from exc
+    for _ in range(3):
+        if not isinstance(payload, Mapping):
+            break
+        if {"transcript", "minutes", "todo"}.issubset(payload):
+            return dict(payload)
+        nested = next(
+            (payload.get(key) for key in ("data", "result", "output", "content") if isinstance(payload.get(key), Mapping)),
+            None,
+        )
+        if nested is None:
+            break
+        payload = nested
+    if not isinstance(payload, Mapping):
+        raise ValueError("单节点智能体 JSON 顶层必须是对象")
+    values = dict(payload)
+    if "transcript" not in values:
+        values["transcript"] = values.get("sentences", values.get("segments", []))
+    if "minutes" not in values:
+        values["minutes"] = values.get("meeting_minutes", values.get("summary", {}))
+    if "todo" not in values:
+        values["todo"] = values.get("todo_list", values.get("action_items", []))
+    return values
+
+
+def parse_meeting_agent_result(
+    raw: str | Mapping[str, Any],
+    meeting_id: str,
+    summary_revision: int,
+) -> MeetingAgentResult:
+    if isinstance(raw, str):
+        sections = _marked_agent_sections(raw)
+        if sections is not None:
+            transcript_markdown = sections["DATA"]
+            summary_markdown = sections["SUMMARY"]
+            todo_markdown = sections["TODOLIST"]
+            transcript = _parse_markdown_transcript(transcript_markdown, meeting_id)
+            if not transcript:
+                raise ValueError("分段智能体返回的 DATA 区块中没有可解析的逐句转写")
+            todo = _parse_markdown_todo(todo_markdown, meeting_id, summary_revision)
+            return MeetingAgentResult(
+                schema_version="1.0",
+                meta={"output_format": "marked_markdown"},
+                transcript=transcript,
+                minutes={"plain_text": summary_markdown},
+                summary_markdown=summary_markdown,
+                todo=todo,
+                transcript_markdown=transcript_markdown,
+                todo_markdown=todo_markdown,
+            )
+    payload = _agent_payload_from_raw(raw)
+    transcript = _normalise_agent_transcript(payload.get("transcript"), meeting_id)
+    if not transcript:
+        raise ValueError("单节点智能体返回的 transcript 为空")
+    minutes = _normalise_minutes(payload.get("minutes"))
+    raw_todo = payload.get("todo", [])
+    if isinstance(raw_todo, Mapping):
+        raw_todo = raw_todo.get("items", [])
+    todo_payload = {"schema_version": "1.0", "items": raw_todo if isinstance(raw_todo, list) else []}
+    todo = parse_todo_document(json.dumps(todo_payload, ensure_ascii=False), meeting_id, summary_revision)
+    meta = dict(payload.get("meta")) if isinstance(payload.get("meta"), Mapping) else {}
+    return MeetingAgentResult(
+        schema_version=str(payload.get("schema_version") or "1.0"),
+        meta=meta,
+        transcript=transcript,
+        minutes=minutes,
+        summary_markdown=render_agent_minutes(minutes, todo),
+        todo=todo,
+        todo_markdown=render_todo_markdown(todo),
+    )
+
+
+class MeetingAgent:
+    """One non-streaming request for refined transcript, minutes and todos."""
+
     def __init__(self, settings: Settings, client: JimoClient | None = None) -> None:
         self.settings = settings
-        self.client = client or JimoClient(settings, endpoint=settings.jimo_todo_api_url)
+        self.client = client or JimoClient(settings, endpoint=settings.jimo_api_url)
 
-    async def generate(
+    async def process(
         self,
         meeting_id: str,
-        summary_revision: int,
-        minutes: str,
         *,
+        summary_revision: int = 0,
+        started_at: str = "",
+        ended_at: str = "",
+        title: str = "",
+        audio_files: Iterable[Mapping[str, Any]] | None = None,
+        transcript: Iterable[Utterance] | None = None,
         on_status: Callable[[str], Any] | None = None,
-    ) -> TodoDocument:
-        if not minutes.strip():
-            raise ValueError("会议纪要为空，无法生成 To-do-list")
-        prefix = f"MEETING_ID={meeting_id}\nSUMMARY_REVISION={summary_revision}\n\n以下是完整会议纪要：\n"
-        suffix = "\n\n请只输出符合要求的 JSON。"
-        budget = self.settings.jimo_max_request_chars - len(TODO_SYSTEM_PROMPT) - len(prefix) - len(suffix)
-        if budget <= 0:
-            raise ValueError("Jimo 请求上限不足以容纳 To-do-list 提示词")
-        source = minutes.strip()
-        if len(source) > budget:
-            marker = "\n\n[会议纪要中段因请求长度上限省略]\n\n"
-            if len(marker) >= budget:
-                source = source[:budget]
-            else:
-                remaining = budget - len(marker)
-                head = (remaining + 1) // 2
-                tail_length = remaining - head
-                tail = source[-tail_length:] if tail_length else ""
-                source = source[:head] + marker + tail
-        message = prefix + source + suffix
-        if on_status:
-            result = on_status("request")
-            if asyncio.iscoroutine(result):
-                await result
-        raw = await self.client.complete(
-            [{"role": "system", "content": TODO_SYSTEM_PROMPT}, {"role": "user", "content": message}],
-            f"meeting:{meeting_id}:todo:{summary_revision}",
+    ) -> MeetingAgentResult:
+        files = [dict(item) for item in (audio_files or []) if str(item.get("url", "")).strip()]
+        context = (
+            f"MEETING_ID={meeting_id}\nTITLE={title}\nSTARTED_AT={started_at}\nENDED_AT={ended_at}\n\n"
+            "请完成逐句转写（精修）、会议纪要和 To-do-list 三个步骤，并严格遵循平台智能体配置的三个分隔区块输出格式。\n"
         )
-        return parse_todo_document(raw, meeting_id, summary_revision)
+        if files:
+            context += "音视频文件的链接列表为：\n" + "\n".join(str(item["url"]) for item in files)
+        else:
+            source_lines = [paired_text(item) for item in (transcript or []) if item.text.strip()]
+            source = "\n\n".join(source_lines)
+            budget = max(
+                1000,
+                self.settings.jimo_max_request_chars - len(MEETING_AGENT_REQUEST_PROMPT) - len(context) - 256,
+            )
+            source_limit = min(self.settings.jimo_transcript_chars, budget)
+            if len(source) > source_limit:
+                marker = "\n[本地转写中段省略]"
+                source = source[: max(0, source_limit - len(marker))] + marker
+            if not source:
+                raise ValueError("没有可发送给单节点智能体的音频链接或本地转写")
+            context += "未提供公网音频链接，以下是本地实时转写上下文，请据此完成精修和整理：\n" + source
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": context}]
+        for item in files:
+            file_url: dict[str, Any] = {"url": str(item["url"])}
+            file_id = item.get("file_id") or item.get("fileId")
+            if file_id:
+                file_url["fileId"] = str(file_id)
+            content.append({"type": "file_url", "file_url": file_url})
+
+        if on_status:
+            status_result = on_status("request")
+            if asyncio.iscoroutine(status_result):
+                await status_result
+        raw = await self.client.complete(
+            [
+                {"role": "system", "content": MEETING_AGENT_REQUEST_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            f"meeting:{meeting_id}:agent",
+        )
+        return parse_meeting_agent_result(raw, meeting_id, summary_revision)

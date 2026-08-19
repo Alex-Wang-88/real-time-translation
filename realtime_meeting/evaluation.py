@@ -423,37 +423,28 @@ def _evaluate_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def evaluate_postprocess_api(postprocess_api: dict[str, Any] | None) -> dict[str, Any]:
-    """Check that exactly the two requested post-processing APIs completed."""
+    """Check that the single requested post-recording API completed."""
 
     payload = postprocess_api or {}
-    summary = payload.get("summary") or {}
-    todo = payload.get("todo") or {}
-    summary_request = summary.get("request") or {}
-    todo_request = todo.get("request") or {}
+    request = payload.get("request") or {}
+    request_result = request.get("request") or {}
     final_state = payload.get("final_state") or {}
     checks = {
-        "request_count_is_two": payload.get("request_count") == 2,
-        "summary_http_202": summary_request.get("status_code") == 202,
-        "todo_http_202": todo_request.get("status_code") == 202,
-        "summary_task_complete": summary.get("task", {}).get("status") == "complete",
-        "todo_task_complete": todo.get("task", {}).get("status") == "complete",
+        "request_count_is_one": payload.get("request_count") == 1,
+        "request_http_202": request_result.get("status_code") == 202,
+        "request_task_complete": request.get("task", {}).get("status") == "complete",
         "summary_state_complete": final_state.get("summary_state") == "complete",
         "todo_state_complete": final_state.get("todo_state") == "complete",
         "summary_has_no_error": not final_state.get("summary_error"),
         "todo_has_no_error": not final_state.get("todo_error"),
+        "agent_has_no_error": not final_state.get("agent_error"),
     }
     return {
         "passed": all(checks.values()),
         "checks": checks,
         "request_count": payload.get("request_count"),
-        "request_statuses": {
-            "summary": summary_request.get("status_code"),
-            "todo": todo_request.get("status_code"),
-        },
-        "task_statuses": {
-            "summary": (summary.get("task") or {}).get("status"),
-            "todo": (todo.get("task") or {}).get("status"),
-        },
+        "request_status": request_result.get("status_code"),
+        "task_status": (request.get("task") or {}).get("status"),
         "final_states": {
             "summary": final_state.get("summary_state"),
             "todo": final_state.get("todo_state"),

@@ -76,14 +76,13 @@ def test_alignment_allows_one_reference_turn_to_split_into_two_paragraphs() -> N
     assert [entry["actual_indices"] for entry in entries] == [[0, 1], [2]]
 
 
-def test_postprocess_api_contract_requires_two_completed_requests() -> None:
+def test_postprocess_api_contract_requires_one_completed_request() -> None:
     passed = {
-        "request_count": 2,
-        "summary": {"request": {"status_code": 202}, "task": {"status": "complete"}},
-        "todo": {"request": {"status_code": 202}, "task": {"status": "complete"}},
-        "final_state": {"summary_state": "complete", "todo_state": "complete", "summary_error": None, "todo_error": None},
+        "request_count": 1,
+        "request": {"request": {"status_code": 202}, "task": {"status": "complete"}},
+        "final_state": {"summary_state": "complete", "todo_state": "complete", "summary_error": None, "todo_error": None, "agent_error": None},
     }
-    failed = {**passed, "todo": {**passed["todo"], "request": {"status_code": 500}}}
+    failed = {**passed, "request": {**passed["request"], "request": {"status_code": 500}}}
 
     assert evaluate_postprocess_api(passed)["passed"] is True
     assert evaluate_postprocess_api(failed)["passed"] is False
@@ -117,10 +116,9 @@ def test_replay_evaluation_reports_translation_variant_and_contract_metrics() ->
             {"segment_id": "p-2", "start": 4, "end": 7, "language": "en", "speech_variant": None, "text": "We will confirm the date today.", "translation_zh": "我们今天确认日期。", "translation_status": "ready"},
         ],
         "postprocess_api": {
-            "request_count": 2,
-            "summary": {"request": {"status_code": 202}, "task": {"status": "complete"}},
-            "todo": {"request": {"status_code": 202}, "task": {"status": "complete"}},
-            "final_state": {"summary_state": "complete", "todo_state": "complete", "summary_error": None, "todo_error": None},
+            "request_count": 1,
+            "request": {"request": {"status_code": 202}, "task": {"status": "complete"}},
+            "final_state": {"summary_state": "complete", "todo_state": "complete", "summary_error": None, "todo_error": None, "agent_error": None},
         },
     }
 

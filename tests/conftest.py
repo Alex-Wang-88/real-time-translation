@@ -13,7 +13,6 @@ def settings(tmp_path: Path) -> Settings:
         results_dir=tmp_path / "meetings",
         translation_model_root=tmp_path / "models",
         jimo_api_url="https://summary.example.test/v2/chat/completions/share?shareId=summary",
-        jimo_todo_api_url="https://todo.example.test/v2/chat/completions/share?shareId=todo",
         jimo_authorization="Bearer test-secret",
         audio_pre_roll_ms=40,
         speech_start_ms=40,

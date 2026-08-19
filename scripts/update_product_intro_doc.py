@@ -122,7 +122,7 @@ def _paragraph(document: Document, text: str = "", *, style: str = "Normal", col
 
 def _heading(document: Document, text: str, level: int = 1):
     paragraph = document.add_heading(text, level=level)
-    if level == 1 and (text.startswith("1.") or text.startswith("2.")):
+    if level == 1 and text.startswith("1."):
         paragraph.paragraph_format.page_break_before = True
     for run in paragraph.runs:
         _set_run(run, color=BRIGHT_BLUE if level == 1 else BLUE, size=20 if level == 1 else 14.2, bold=True)
@@ -274,8 +274,8 @@ def build_document(source: Path, output: Path) -> Path:
     section.right_margin = Inches(0.85)
 
     document.core_properties.title = "会记 v2 产品介绍（当前版本）"
-    document.core_properties.subject = "Qwen 单模型、段落式实时转写、翻译与会议行动闭环"
-    document.core_properties.keywords = "会记,实时会议,Qwen3-ASR,同模二次识别,VAD诊断,WSC-Eval,段落转写,会议纪要,To-do-list"
+    document.core_properties.subject = "Qwen 单模型、段落式实时转写、单次平台智能体请求与会议行动闭环"
+    document.core_properties.keywords = "会记,实时会议,Qwen3-ASR,同模二次识别,VAD诊断,段落转写,精修转写,会议纪要,To-do-list,Jimo API"
 
     # Cover and current-version summary.
     _paragraph(document, "产品介绍  ·  当前版本说明", style="Kicker", align=WD_ALIGN_PARAGRAPH.LEFT)
@@ -291,16 +291,16 @@ def build_document(source: Path, output: Path) -> Path:
 
     _table(document, ["项目", "当前产品定义"], [
         ["产品形态", "Windows 本地运行的实时会议记录工作台"],
-        ["当前架构", "Qwen3-ASR-1.7B 单模型 + 同模语言确认 + 连续语音段落输出"],
+        ["当前架构", "本地 Qwen3-ASR-1.7B + VAD + 本地翻译；停录后由用户手动触发一次平台智能体请求"],
         ["语言能力", "普通话、中文方言、英文、德文；中文方言由同一 Qwen 1.7B 判断并按官方类别记录"],
-        ["交付结果", "实时段落、原文与简体中文翻译、会议纪要、To-do-list 和本次会议文件"],
-        ["数据边界", "音频、ASR、VAD 和翻译优先在本机执行；纪要与 To-do 依赖配置的 Jimo SSE 节点"],
+        ["交付结果", "实时段落、原文与简体中文翻译；一次请求返回精修转写、会议纪要和 To-do-list"],
+        ["数据边界", "音频、ASR、VAD 和翻译优先在本机执行；平台请求只使用已保存会议上下文，并由服务端配置授权"],
     ], widths=[1.35, 5.85], font_size=9.8)
-    _callout(document, "一句话定位", "会记把本地录音变成连续、可回看、可执行的会议记录：录音时先看实时段落，停录后完成翻译，再生成纪要和行动项。")
+    _callout(document, "一句话定位", "会记把本地录音变成连续、可回看、可执行的会议记录：录音时先看实时段落，停录后等待翻译完成，用户点击按钮一次生成精修转写、纪要和行动项。")
     _heading(document, "产品一览", level=1)
     _table(document, ["实时理解", "会后可用", "本地优先", "结果可追溯"], [[
         "按连续语音段落持续更新原文和译文",
-        "翻译完成后生成会议纪要与 To-do-list",
+        "手动触发一次请求生成精修转写、会议纪要与 To-do-list",
         "Qwen、VAD、OPUS-MT 在本机运行",
         "schema 2.0、revision 和可下载文件",
     ]], widths=[1.8, 1.8, 1.8, 1.8], font_size=9.1)
@@ -309,22 +309,22 @@ def build_document(source: Path, output: Path) -> Path:
 
     # Positioning and users.
     _heading(document, "1. 产品定位与目标用户", level=1)
-    _paragraph(document, "会记面向需要边开会边理解、会后快速复盘并形成行动清单的个人和小团队。它不是单纯的录音机，也不是只在会后给出一段摘要的黑盒，而是一条从音频采集、实时段落、翻译到纪要和 To-do 的本地化处理链。")
+    _paragraph(document, "会记面向需要边开会边理解、会后快速复盘并形成行动清单的个人和小团队。它不是单纯的录音机，也不是只在会后给出一段摘要的黑盒，而是一条从本地音频采集、实时段落、翻译到一次平台智能体请求和三段结果落盘的可控处理链。")
     _heading(document, "典型场景", level=2)
     _bullet(document, "跨语种项目会议：中文、英文、德文混合讨论，实时查看原文，英文和德文同步补充简体中文翻译。")
     _bullet(document, "研发评审与项目例会：保留连续语音段落和时间信息，减少会后回听和手工整理。")
-    _bullet(document, "访谈、销售和客户沟通：先按段落复盘原始表达，再从已保存内容生成纪要和可追踪行动项。")
-    _bullet(document, "对隐私敏感的本地会议：音频、识别和翻译留在本机；只有纪要与 To-do 所需文本才交给已配置的 Jimo 节点。")
+    _bullet(document, "访谈、销售和客户沟通：先按段落复盘原始表达，停录后由用户确认，再从已保存内容生成纪要和可追踪行动项。")
+    _bullet(document, "对隐私敏感的本地会议：音频、识别和翻译留在本机；只有生成三段结果所需的会议上下文才交给服务端配置的平台智能体。")
 
     _heading(document, "产品承诺", level=2)
     _table(document, ["用户价值", "产品表现"], [
         ["实时可见", "WebSocket 持续更新当前段落；partial 只修订当前卡片，不让同一句话重复堆叠。"],
         ["模型透明", "生产链路固定使用 Qwen3-ASR-1.7B；同一模型负责识别、语言确认和冲突重识别，旧 fallback/LID 字段仅作兼容别名。"],
-        ["本地优先", "Qwen ASR、VAD 与英文/德文翻译采用本地模型；外部服务只承担配置范围内的纪要和 To-do。"],
+        ["本地优先", "Qwen ASR、VAD 与英文/德文翻译采用本地模型；外部平台只在用户点击后承担一次三段结果生成。"],
         ["可复盘", "同一段落使用 segment_id 和 revision 追踪更新，并保存 JSON、JSONL、Markdown 等结果文件。"],
         ["可恢复", "翻译失败保留原文并支持重试；停录后按固定顺序完成保存、翻译和纪要前置状态。"],
     ], widths=[1.35, 5.85], font_size=9.6)
-    _callout(document, "当前版本边界", "会记不保存人员身份，不做说话人身份分离，也不存在会后再跑一套旧 ASR 的隐藏阶段；产品以连续段落和原文/译文为核心记录单位。", fill="FFF7E8", border=GOLD, label_color=GOLD)
+    _callout(document, "当前版本边界", "会记不保存人员身份，不做说话人身份分离，也不存在会后再跑一套旧 ASR 的隐藏阶段；平台结果由一次请求返回三个固定区块，产品以连续段落和原文/译文为核心记录单位。", fill="FFF7E8", border=GOLD, label_color=GOLD)
 
     _page_break(document)
 
@@ -362,15 +362,15 @@ def build_document(source: Path, output: Path) -> Path:
     _number(document, "新建会议并填写名称；服务检查完成后进入当前会议工作台。")
     _number(document, "在录音前打开“录音与识别设置”，确认输入设备和背景声过滤；实时识别固定使用 Qwen3-ASR-1.7B，不再选择模型架构。")
     _number(document, "开始录音后，实时转写区按连续段落更新原文；英文和德文在对应段落下补充简体中文译文。")
-    _number(document, "停录后，系统依次完成最后音频 flush、最终 ASR、实时翻译队列和本地保存；默认不自动执行会后本地复译，然后将会议推进到可生成纪要的状态。")
-    _number(document, "生成会议纪要后，系统从已保存内容提取 To-do-list；失败时可分别重试，不影响已保存的录音和转写。")
-    _number(document, "在右侧结果区查看会议纪要、To-do-list 和本次文件，并下载 Markdown、JSON 等结果。")
+    _number(document, "停录后，系统依次完成最后音频 flush、最终 ASR、实时翻译队列和本地保存；不会自动调用平台，会议进入可生成三段结果的状态。")
+    _number(document, "用户点击“生成三段结果”后，服务端向已配置的平台智能体发起一次请求；平台返回 DATA、SUMMARY、TODOLIST 三个固定区块，分别对应精修转写、会议纪要和 To-do-list。")
+    _number(document, "在右侧结果区查看三段结果和本次文件，并下载 Markdown、JSON 等结果；如果失败，从同一个按钮重新发起整次请求。")
 
     _heading(document, "3.2 当前界面与设置设计", level=2)
     _table(document, ["界面区域", "当前能力"], [
         ["左侧栏", "会记品牌、会议历史、搜索和新建会议；深浅色主题切换为品牌区域右上角的纯图标按钮。"],
         ["中间工作区", "录音状态、计时、设备与环境音、实时转写段落；可回到最新段落。"],
-        ["右侧结果区", "会议纪要、To-do-list 和本次文件，随会议状态显示生成、重试和下载操作。"],
+        ["右侧结果区", "逐句转写（精修）、会议纪要、To-do-list 和本次文件；录音完成后显示手动生成按钮，完成后提供下载。"],
         ["录音与识别设置", "固定单一 Qwen 1.7B 识别链路；输入设备、背景声过滤、静音结束阈值、实时刷新间隔、录音分段长度和录音保留。"],
     ], widths=[1.65, 5.6], font_size=9.4)
     _callout(document, "设置简化", "当前设置已经合并为一个页面，不再区分“普通设置”和“高级设置”，也不再保留“参数模板”概念。点击设置弹窗外部会直接取消并关闭，不保存本次未提交的修改。", fill="E8F3F1", border=TEAL, label_color=TEAL)
@@ -391,9 +391,9 @@ def build_document(source: Path, output: Path) -> Path:
     ], widths=[1.75, 5.5], font_size=9.5)
 
     _heading(document, "4.2 停录顺序与会议状态", level=2)
-    _callout(document, "固定顺序", "flush 最后音频段 → 等待最终 ASR → 等待实时翻译队列 → 跳过默认关闭的会后本地复译 → recording_state=complete → ready_for_summary。只有完成实时翻译队列后，右侧才开放生成纪要和 To-do-list。", fill="FFF7E8", border=GOLD, label_color=GOLD)
+    _callout(document, "固定顺序", "flush 最后音频段 → 等待最终 ASR → 等待实时翻译队列 → 本地保存 → recording_state=complete → ready_for_summary → 用户点击按钮 → 一次平台请求返回三段结果。停录本身不会自动调用平台。", fill="FFF7E8", border=GOLD, label_color=GOLD)
     _bullet(document, "实时 ASR 运行期间保持模型链路，停录不再触发一套隐藏的会后 Whisper/说话人处理流程。")
-    _bullet(document, "翻译失败不抹掉原文；会议结果仍可查看，修复服务或模型后可以重新排队翻译。会后如需更高质量，可单独请求外部翻译智能体 API。")
+    _bullet(document, "翻译失败不抹掉原文；会议结果仍可查看，修复服务或模型后可以重新排队翻译。三段结果生成失败时，从同一手动入口重试整次平台请求。")
     _bullet(document, "模型缺失、服务异常和处理失败通过明确状态展示，避免把失败伪装成成功。")
 
     _heading(document, "4.3 本次会议输出", level=2)
@@ -414,10 +414,10 @@ def build_document(source: Path, output: Path) -> Path:
     _table(document, ["处理内容", "当前归属"], [
         ["音频采集、VAD、Qwen ASR、语言/方言判断", "本机浏览器与本机服务；默认使用唯一的 Qwen3-ASR-1.7B 本地模型缓存。"],
         ["英文/德文 → 简体中文翻译", "本地 OPUS-MT 模型，不依赖云端翻译 API。"],
-        ["会议纪要与 To-do-list", "使用本地配置的 Jimo SSE 节点；prompt 只使用段落时间、语言/方言、原文和译文。"],
+        ["精修转写、会议纪要与 To-do-list", "使用一个服务端配置的平台智能体 API；一次请求返回 DATA/SUMMARY/TODOLIST 三个固定区块。客户端内部兼容完整结果的 SSE 传输，但不向前端输出增量。"],
         ["身份信息与说话人分离", "当前版本不保存人员身份，也不提供说话人编号或说话人重排。"],
     ], widths=[2.6, 4.65], font_size=9.3)
-    _callout(document, "隐私边界", "会记是本地优先的会议记录工作台，不把“本地 ASR/翻译”和“纪要服务调用”混写成同一条链路；服务级地址、授权和模型下载策略由部署配置控制。", fill="E8F3F1", border=TEAL, label_color=TEAL)
+    _callout(document, "隐私边界", "会记是本地优先的会议记录工作台，不把“本地 ASR/翻译”和“纪要服务调用”混写成同一条链路；服务级地址、授权和模型下载策略由部署配置控制。平台请求只在用户明确点击后发起一次。", fill="E8F3F1", border=TEAL, label_color=TEAL)
 
     _heading(document, "5.2 运行要求", level=2)
     _table(document, ["项目", "当前要求"], [
@@ -442,30 +442,35 @@ def build_document(source: Path, output: Path) -> Path:
         ["MEETING_ASR_SECONDARY_RETRY_CONFIDENCE_THRESHOLD", "0.42（置信度触发阈值）"],
         ["MEETING_ASR_SECONDARY_RETRY_QUALITY_THRESHOLD", "0.50（文本质量触发阈值）"],
         ["TRANSCRIPT_SCHEMA_VERSION", "2.0"],
+        ["JIMO_API_URL", "唯一的平台智能体 API 地址（仅服务端配置）"],
+        ["JIMO_AUTHORIZATION", "服务端授权头；不进入浏览器，也不写入前端结果"],
+        ["JIMO_MAX_RETRIES", "平台请求失败时重试；业务入口仍是一次手动触发"],
+        ["JIMO_UPLOAD_*", "可选的本地音频转公网 URL 辅助链，不等于第二个智能体请求"],
     ], widths=[2.75, 4.5], font_size=9.5)
 
     _page_break(document)
 
     # Version notes and source of truth.
     _heading(document, "6. 当前版本变更摘要", level=1)
-    _paragraph(document, "本版产品介绍已按会记 v2 的当前实现重新整理，重点修正了模型、结果契约和界面描述之间的不一致。")
+    _paragraph(document, "本版产品介绍已按会记 v2 的当前实现重新整理，重点修正了模型、结果契约、平台调用和界面描述之间的不一致。")
     _table(document, ["已更新项", "当前版本描述"], [
         ["模型链路", "移除旧 Whisper、large-v3、Resemblyzer、0.6B 第二模型和会后第二套 ASR 的产品描述，统一改为 Qwen3-ASR-1.7B 单模型架构。"],
         ["模型选择文案", "取消两套实时架构选择，明确 Qwen3-ASR-1.7B 同时承担主识别、语言/方言确认和冲突重识别；旧配置字段仅作兼容别名。"],
         ["设置页面", "删除参数模板概念，合并普通/高级设置为一个页面，保留核心稳定性参数和本次会议生效范围。"],
         ["交互行为", "设置弹窗点击外部取消且不保存；深浅色切换使用无文字图标，并放在左侧品牌区域右上角。"],
         ["存储与展示", "以连续段落和 paragraph_update 为核心，使用 transcript schema 2.0，支持原文、译文、纪要、To-do 和文件下载。"],
-        ["实时回放测试", "项目内保留制造业月会音频、文字稿、manifest 和流程说明；按 1.0 倍速模拟实时输入，回放结束后依次请求会议纪要与 To-do API，并对比识别、翻译和接口结果。"],
+        ["平台结果链", "删除旧的分离式 summary/todo 调用与自动触发；改为用户手动触发一次平台智能体请求，由固定区块返回精修转写、会议纪要和 To-do-list。"],
+        ["实时回放测试", "项目内保留制造业月会音频、文字稿、manifest 和流程说明；按 1.0 倍速模拟实时输入，回放结束后模拟用户点击一次三段结果请求，并核验三段结果和前端展示。"],
         ["低质量段处理", "最终段遇到空结果、短片段或弱质量信号时，同一个 1.7B 清空上文重试一次；pipeline_metrics 保存重试、替换、失败和 VAD/分段诊断。"],
     ], widths=[1.45, 5.8], font_size=9.2)
-    _callout(document, "阅读提示", "产品能力以当前代码和配置为准：README.md、DEPLOYMENT.md、realtime_meeting/config.py、runtime.py、session.py、storage.py 以及 web 目录是本版本的实现依据。", fill="EAF2FC", border=BRIGHT_BLUE, label_color=BLUE)
+    _callout(document, "阅读提示", "产品能力以当前代码和配置为准：README.md、.env.example、realtime_meeting/config.py、jimo.py、prompts.py、session.py、server.py 以及 web 目录是本版本的实现依据。", fill="EAF2FC", border=BRIGHT_BLUE, label_color=BLUE)
 
     _heading(document, "验收重点", level=2)
     _bullet(document, "中英德切换、中文方言代表类别、短暂 unknown、连续长语音和中英混合段落。")
     _bullet(document, "同一 segment_id 的多次 partial 修订、稳定前缀翻译、过期结果丢弃和失败重试。")
-    _bullet(document, "停录顺序、schema 2.0 文件输出、会议纪要和 To-do 生成前置状态。")
+    _bullet(document, "停录顺序、schema 2.0 文件输出、手动生成按钮和三段结果完成状态。")
     _bullet(document, "浅色/深色主题、设置单页、弹窗外部取消不保存、模型选择文案和输入文字可读性。")
-    _bullet(document, "制造业月会实时回放：以 tests/fixtures/manufacturing_role_meeting_v3/ 的 manuscript.jsonl 对照段落、语言/方言类别、翻译状态，并确认 summary 与 todo 两次 API 请求均有结果。")
+    _bullet(document, "制造业月会实时回放：以 tests/fixtures/manufacturing_role_meeting_v3/ 的 manuscript.jsonl 对照段落、语言/方言类别、翻译状态，并确认一次平台请求返回三段结果。")
     _bullet(document, "内部四川方言 WSC-Eval-ASR Easy 50 条回放：低质量段二次识别后覆盖率由 96% 提升到 98%，字符准确率由 82.38% 提升到 89.05%；该结果仅代表当前评测样本，不构成产品 SLA。")
     _paragraph(document, "文档版本：会记 v2 · 当前版本说明。", style="Small Note", after=0)
 

@@ -64,8 +64,6 @@ const state = {
   draft: null,
   draftNode: null,
   transcriptNearBottom: true,
-  summaryStreaming: false,
-  summaryRenderFrame: null,
   timer: null,
   renameMeetingId: null,
   confirmResolver: null,
@@ -113,15 +111,14 @@ const dom = {
   inputDeviceTrigger: $("#inputDeviceTrigger"),
   inputDeviceOptions: $("#inputDeviceOptions"),
   notice: $("#notice"),
+  refinedBadge: $("#refinedBadge"),
+  refinedTranscriptText: $("#refinedTranscriptText"),
   summaryBadge: $("#summaryBadge"),
-  summaryProgress: $("#summaryProgress"),
-  summaryProgressBar: $("#summaryProgressBar"),
   summaryText: $("#summaryText"),
   retrySummary: $("#retrySummary"),
   downloadSummary: $("#downloadSummary"),
   todoBadge: $("#todoBadge"),
   todoText: $("#todoText"),
-  retryTodo: $("#retryTodo"),
   downloadTodo: $("#downloadTodo"),
   filesCard: $("#filesCard"),
   fileLinks: $("#fileLinks"),
@@ -193,8 +190,9 @@ const recordingLabels = {
   complete: "录音完成",
   error: "录音异常",
 };
-const summaryLabels = { idle: "等待会议结束", queued: "排队中", running: "生成中", complete: "已完成", error: "生成失败" };
-const todoLabels = { waiting_summary: "等待会议纪要", queued: "排队中", running: "提取中", complete: "已完成", stale: "纪要已更新", error: "生成失败" };
+const summaryLabels = { idle: "等待手动生成", queued: "排队中", running: "生成中", complete: "已完成", error: "生成失败" };
+const todoLabels = { waiting_summary: "等待手动生成", queued: "排队中", running: "生成中", complete: "已完成", stale: "等待重新生成", error: "生成失败" };
+const refinedLabels = { idle: "等待手动生成", queued: "排队中", running: "精修中", complete: "已完成", error: "生成失败" };
 const languageLabels = { zh: "中文", en: "英文", de: "德文", unknown: "自动判断" };
 const variantLabels = {
   mandarin: "普通话",
@@ -794,54 +792,77 @@ function renderTranscript(autoScroll = false) {
   updateTranscriptViewport(autoScroll, items.length);
 }
 
+function renderRefinedTranscript(items, summaryState = "idle", markdown = "") {
+  const values = Array.isArray(items) ? items : [];
+  const markdownValue = String(markdown || "").trim();
+  if (dom.refinedBadge) {
+    dom.refinedBadge.textContent = refinedLabels[summaryState] || stateText(summaryState);
+    dom.refinedBadge.className = `badge ${summaryState === "complete" ? "success" : summaryState === "error" ? "danger" : summaryState === "running" ? "live" : "neutral"}`;
+  }
+  if (!dom.refinedTranscriptText) return;
+  dom.refinedTranscriptText.replaceChildren();
+  dom.refinedTranscriptText.classList.toggle("empty-result", !values.length && !markdownValue);
+  if (markdownValue) {
+    dom.refinedTranscriptText.innerHTML = markdownToHtml(markdownValue);
+    return;
+  }
+  if (!values.length) {
+    dom.refinedTranscriptText.textContent = summaryState === "running" || summaryState === "queued"
+      ? "智能体正在处理录音，请稍候。"
+      : summaryState === "error"
+        ? "精修转写生成失败，请重试。"
+        : "会议停止并完成翻译后，点击“生成三段结果”查看精修转写。";
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "refined-list";
+  for (const item of values) {
+    const row = document.createElement("article");
+    row.className = "refined-item";
+    const start = Number(item.start);
+    const end = Number(item.end);
+    const time = Number.isFinite(start) && Number.isFinite(end)
+      ? `${formatTime(start).slice(3)} – ${formatTime(end).slice(3)}`
+      : "时间待确认";
+    row.innerHTML = `<div class="refined-meta"><strong></strong><span class="refined-language"></span><time></time></div><div class="refined-source"><span>原文</span><p></p></div><div class="refined-translation"><span>中文翻译</span><p></p></div>`;
+    row.querySelector("strong").textContent = item[["spea", "ker"].join("")] || "待确认";
+    row.querySelector(".refined-language").textContent = String(item.language || "unknown").toUpperCase();
+    row.querySelector("time").textContent = time;
+    row.querySelector(".refined-source p").textContent = item.original || "";
+    row.querySelector(".refined-translation p").textContent = item.translation_zh || "";
+    list.append(row);
+  }
+  dom.refinedTranscriptText.append(list);
+}
+
 function renderSummary(summary, summaryState) {
   const value = String(summary || "").trim();
   const preprocessingReady = state.meeting?.recording_state === "complete" && state.meeting?.translation_pending !== true;
   dom.summaryBadge.textContent = summaryLabels[summaryState] || stateText(summaryState);
   dom.summaryBadge.className = `badge ${summaryState === "complete" ? "success" : summaryState === "error" ? "danger" : summaryState === "running" ? "live" : "neutral"}`;
   dom.summaryText.classList.toggle("empty-result", !value);
-  dom.summaryText.classList.toggle("is-streaming", state.summaryStreaming && summaryState === "running");
   dom.summaryText.innerHTML = value
     ? markdownToHtml(value)
       : preprocessingReady
-      ? "转写和翻译已经完成，可以生成会议纪要和 To-do-list。"
-      : "停止会议并完成翻译后，可以生成会议纪要和 To-do-list。";
-  if (state.summaryStreaming && summaryState === "running" && value) {
-    const cursor = document.createElement("span");
-    cursor.className = "streaming-cursor summary-cursor";
-    cursor.setAttribute("aria-label", "正在生成");
-    dom.summaryText.append(cursor);
-  }
+      ? "转写和翻译已经完成，请点击下方“生成三段结果”按钮。"
+      : "停止会议并完成翻译后，可以手动生成三段结果。";
   dom.retrySummary.hidden = !(preprocessingReady && ["idle", "error", "complete"].includes(summaryState));
   dom.retrySummary.disabled = !preprocessingReady || summaryState === "running";
-  dom.retrySummary.textContent = summaryState === "complete" ? "重新生成纪要和 To-do-list" : "生成纪要和 To-do-list";
+  dom.retrySummary.textContent = summaryState === "complete" ? "重新生成三段结果" : "生成三段结果";
   dom.downloadSummary.hidden = !value || !state.meeting?.files?.includes("meeting_minutes.md");
-  dom.summaryProgress.hidden = !["queued", "running"].includes(summaryState);
 }
 
-function scheduleSummaryRender(summaryState = "running") {
-  if (state.summaryRenderFrame != null) return;
-  state.summaryRenderFrame = window.requestAnimationFrame(() => {
-    state.summaryRenderFrame = null;
-    renderSummary(state.meeting?.summary, summaryState);
-  });
-}
-
-function cancelSummaryRender() {
-  if (state.summaryRenderFrame != null) {
-    window.cancelAnimationFrame(state.summaryRenderFrame);
-    state.summaryRenderFrame = null;
-  }
-}
-
-function renderTodo(todo, todoState) {
+function renderTodo(todo, todoState, markdown = "") {
   dom.todoBadge.textContent = todoLabels[todoState] || stateText(todoState);
   dom.todoBadge.className = `badge ${todoState === "complete" ? "success" : todoState === "error" ? "danger" : "neutral"}`;
   const items = todo?.items || [];
+  const markdownValue = String(markdown || "").trim();
   dom.todoText.replaceChildren();
-  dom.todoText.classList.toggle("empty-result", !todo);
-  if (!todo) {
-    dom.todoText.textContent = "会议纪要完成后，系统会从中提取明确的行动项。";
+  dom.todoText.classList.toggle("empty-result", !todo && !markdownValue);
+  if (markdownValue) {
+    dom.todoText.innerHTML = markdownToHtml(markdownValue);
+  } else if (!todo) {
+    dom.todoText.textContent = "会议停止并完成翻译后，请点击“生成三段结果”。";
   } else if (!items.length) {
     dom.todoText.textContent = "没有提取到明确行动项。";
   } else {
@@ -862,7 +883,6 @@ function renderTodo(todo, todoState) {
     }
     dom.todoText.append(list);
   }
-  dom.retryTodo.hidden = todoState !== "error";
   dom.downloadTodo.hidden = !todo || !state.meeting?.files?.includes("todo_list.json");
 }
 
@@ -889,10 +909,6 @@ function applySnapshot(snapshot, replace = false) {
   const changed = state.meeting?.id !== snapshot.id;
   state.meeting = { ...(state.meeting || {}), ...snapshot };
   if (changed || replace || state.meeting.recording_state !== "recording") clearDraft();
-  if (state.meeting.summary_state !== "running") {
-    state.summaryStreaming = false;
-    cancelSummaryRender();
-  }
   if (changed && snapshot.volume_threshold_percent != null) setVolumeThreshold(snapshot.volume_threshold_percent, false);
   if (snapshot.asr_settings) {
     state.asrSettings = { ...RECOMMENDED_ASR_SETTINGS, ...snapshot.asr_settings };
@@ -938,12 +954,13 @@ function applySnapshot(snapshot, replace = false) {
   dom.recordingHint.textContent = state.meeting.error || (
     isCreated ? "请先确认输入设备和背景声过滤设置，再点击“开始录音”。"
       : state.meeting.recording_state === "recording" ? "正在接收麦克风音频，连续语音会合并为段落。"
-        : "录音已经结束，可以查看转写并生成会议纪要。"
+        : "录音已经结束，翻译完成后请点击“生成三段结果”。"
   );
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
   if (transcriptChanged) renderTranscript();
+  renderRefinedTranscript(state.meeting?.refined_transcript, state.meeting?.summary_state, state.meeting?.refined_transcript_markdown);
   renderSummary(state.meeting.summary, state.meeting.summary_state);
-  renderTodo(state.meeting.todo, state.meeting.todo_state);
+  renderTodo(state.meeting.todo, state.meeting.todo_state, state.meeting.todo_markdown);
   renderFiles(state.meeting.files || []);
   renderMeetings();
   updateTimer();
@@ -1557,48 +1574,42 @@ async function handleEvent(payload, sourceSocket = null, meetingId = null, sourc
     await loadFullTranscript(payload.meeting?.id, sourceGeneration).catch(() => {});
     closeStream(true);
     setConnection("录音已完成", "success");
-  } else if (type === "summary_progress") {
-    dom.summaryProgress.hidden = false;
-    if (payload.total) dom.summaryProgressBar.style.width = `${Math.round((payload.current / payload.total) * 100)}%`;
-  } else if (type === "summary_delta") {
-    if (state.meeting) state.meeting.summary = `${state.meeting.summary || ""}${payload.content || ""}`;
-    state.summaryStreaming = true;
-    scheduleSummaryRender("running");
-  } else if (type === "summary_reset") {
-    cancelSummaryRender();
-    if (state.meeting) state.meeting.summary = "";
-    state.summaryStreaming = true;
-    renderSummary("", "running");
-  } else if (type === "summary_complete") {
-    cancelSummaryRender();
-    if (state.meeting) Object.assign(state.meeting, { summary: payload.content, summary_revision: payload.summary_revision, summary_state: "complete", files: payload.files || state.meeting.files, todo_state: "queued" });
-    state.summaryStreaming = false;
-    renderSummary(payload.content, "complete");
-    renderTodo(null, "queued");
-    renderFiles(state.meeting?.files || []);
-  } else if (type === "todo_progress") {
-    if (state.meeting) state.meeting.todo_state = "running";
-    renderTodo(null, "running");
-  } else if (type === "todo_complete") {
-    if (state.meeting) Object.assign(state.meeting, { todo: payload.todo, todo_state: "complete", files: payload.files || state.meeting.files });
-    renderTodo(payload.todo, "complete");
+  } else if (type === "agent_progress") {
+    if (payload.phase === "request") setNotice("正在调用会议智能体…", "info");
+  } else if (type === "agent_complete") {
+    const result = payload.result || {};
+    if (state.meeting) Object.assign(state.meeting, {
+      summary: payload.summary || result.summary_markdown || state.meeting.summary,
+      summary_state: "complete",
+      todo: payload.todo || { schema_version: "1.0", items: result.todo || [] },
+      todo_state: "complete",
+      refined_transcript: payload.refined_transcript || result.transcript || [],
+      refined_transcript_markdown: payload.refined_transcript_markdown || result.transcript_markdown || state.meeting.refined_transcript_markdown,
+      todo_markdown: payload.todo_markdown || result.todo_markdown || state.meeting.todo_markdown,
+      summary_revision: payload.summary_revision ?? state.meeting.summary_revision,
+      files: payload.files || state.meeting.files,
+    });
+    renderRefinedTranscript(state.meeting?.refined_transcript, "complete", state.meeting?.refined_transcript_markdown);
+    renderSummary(state.meeting?.summary, "complete");
+    renderTodo(state.meeting?.todo, "complete", state.meeting?.todo_markdown);
     renderFiles(state.meeting?.files || []);
   } else if (type === "warning") {
     setNotice(payload.message || "处理出现警告", "warning");
   } else if (type === "error") {
     setNotice(payload.message || "处理失败", "error");
-    if (state.meeting && payload.code === "summary_failed") Object.assign(state.meeting, {
+    if (state.meeting && payload.code === "agent_failed") Object.assign(state.meeting, {
       summary_state: "error",
       summary: payload.summary ?? state.meeting.summary,
       summary_revision: payload.summary_revision ?? state.meeting.summary_revision,
+      todo_state: payload.agent ? "error" : state.meeting.todo_state,
+      refined_transcript: payload.agent ? [] : state.meeting.refined_transcript,
+      refined_transcript_markdown: payload.agent ? "" : state.meeting.refined_transcript_markdown,
+      todo_markdown: payload.agent ? "" : state.meeting.todo_markdown,
     });
-    if (state.meeting && payload.code === "todo_failed") state.meeting.todo_state = "error";
-    if (payload.code === "summary_failed") {
-      state.summaryStreaming = false;
-      cancelSummaryRender();
-    }
+    if (state.meeting && payload.code === "agent_failed") state.meeting.todo_state = "error";
+    if (payload.agent) renderRefinedTranscript(state.meeting?.refined_transcript, "error", state.meeting?.refined_transcript_markdown);
     renderSummary(state.meeting?.summary, state.meeting?.summary_state || "error");
-    renderTodo(state.meeting?.todo, state.meeting?.todo_state || "error");
+    renderTodo(state.meeting?.todo, state.meeting?.todo_state || "error", state.meeting?.todo_markdown);
   }
   renderMeetings();
 }
@@ -1677,15 +1688,24 @@ async function stopMeeting() {
 }
 
 async function retrySummary() {
-  if (!state.meeting) return;
-  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" }); state.meeting.summary_state = "running"; state.summaryStreaming = true; renderSummary(state.meeting.summary, "running"); setNotice("正在生成会议纪要，完成后会自动生成 To-do-list。", "info"); }
-  catch (error) { setNotice(error.message, "error"); }
-}
-
-async function retryTodo() {
-  if (!state.meeting) return;
-  try { await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/todo`, { method: "POST" }); state.meeting.todo_state = "running"; renderTodo(state.meeting.todo, "running"); }
-  catch (error) { setNotice(error.message, "error"); }
+  if (!state.meeting || state.meeting.summary_state === "running") return;
+  dom.retrySummary.disabled = true;
+  try {
+    await requestJson(`/api/v2/meetings/${encodeURIComponent(state.meeting.id)}/summary`, { method: "POST" });
+    state.meeting.summary_state = "running";
+    state.meeting.todo_state = "running";
+    state.meeting.refined_transcript = [];
+    state.meeting.refined_transcript_markdown = "";
+    state.meeting.todo_markdown = "";
+    renderRefinedTranscript([], "running");
+    renderSummary(state.meeting.summary, "running");
+    renderTodo(null, "running");
+    setNotice("正在生成精修转写、会议纪要和 To-do-list。", "info");
+  }
+  catch (error) {
+    dom.retrySummary.disabled = false;
+    setNotice(error.message, "error");
+  }
 }
 
 function openRenameDialog(meeting) {
@@ -1738,6 +1758,7 @@ async function deleteMeeting(meetingId = state.meeting?.id, meetingTitle = state
       dom.meetingPanel.hidden = true;
       dom.pageTitle.textContent = "";
       dom.pageSubtitle.textContent = "";
+      renderRefinedTranscript([], "idle");
       renderSummary("", "idle");
       renderTodo(null, "waiting_summary");
       dom.filesCard.hidden = true;
@@ -1811,7 +1832,6 @@ function bindEvents() {
     applyTheme(current === "dark" ? "light" : "dark");
   });
   dom.retrySummary.addEventListener("click", retrySummary);
-  dom.retryTodo.addEventListener("click", retryTodo);
   dom.downloadSummary.addEventListener("click", () => downloadFile("meeting_minutes.md"));
   dom.downloadTodo.addEventListener("click", () => downloadFile("todo_list.json"));
   dom.openAsrSettings.addEventListener("click", openAsrSettings);
@@ -1908,6 +1928,7 @@ async function init() {
     await refreshDevices();
   } catch (error) { setNotice(error.message || "无法连接本机服务", "error"); }
   renderSummary("", "idle");
+  renderRefinedTranscript([], "idle");
   renderTodo(null, "waiting_summary");
 }
 

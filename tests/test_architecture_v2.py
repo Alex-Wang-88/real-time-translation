@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from realtime_meeting.audio import SegmentEvent
 from realtime_meeting.config import Settings, default_meeting_settings, normalize_meeting_settings
 from realtime_meeting.exporter import export_live_result
-from realtime_meeting.jimo import JimoClient, TodoGenerator, transcript_chunks
+from realtime_meeting.jimo import JimoClient
 from realtime_meeting.language import (
     OFFICIAL_SPEECH_VARIANTS,
     has_sichuan_dialect_evidence,
@@ -289,25 +289,6 @@ async def test_load_transcript_rebinds_active_paragraph(settings) -> None:
     loaded = meeting.load_transcript()
     assert loaded and meeting.active_paragraph is loaded[0]
     assert meeting.active_paragraph is not original
-
-
-@pytest.mark.asyncio
-async def test_todo_request_is_bounded_by_jimo_request_limit(settings) -> None:
-    settings.jimo_max_request_chars = 1_200
-
-    class CapturingClient:
-        def __init__(self) -> None:
-            self.messages = None
-
-        async def complete(self, messages, _session_id, **_kwargs):
-            self.messages = messages
-            return '{"items": []}'
-
-    client = CapturingClient()
-    result = await TodoGenerator(settings, client).generate("meeting-1", 1, "行动项内容。" * 2_000)
-    assert result.items == []
-    assert client.messages is not None
-    assert JimoClient.request_chars(client.messages) <= settings.jimo_max_request_chars
 
 
 class FakeRuntime:
@@ -613,21 +594,6 @@ async def test_mixed_chinese_english_paragraph_is_translated_without_changing_la
             if task and not task.done():
                 task.cancel()
         await asyncio_gather_cancelled(meeting.worker_task, meeting.translation_worker_task)
-
-
-def test_jimo_reads_latest_paragraph_projection_not_revision_events(tmp_path) -> None:
-    path = tmp_path / "transcript.jsonl"
-    store = TranscriptStore(path)
-    item = Utterance(1, "p-000001", 0.0, 2.0, "en", None, 0.9, "We ship", source_revision=1)
-    store.append(item)
-    item.text = "We ship the beta"
-    item.source_revision = 2
-    item.revision = 2
-    store.append(item)
-    chunks = list(transcript_chunks(path, 10_000))
-    assert len(chunks) == 1
-    assert "We ship the beta" in chunks[0][3]
-    assert chunks[0][3].count("We ship") == 1
 
 
 def test_export_is_paragraph_based_and_does_not_write_identity_artifacts(tmp_path) -> None:
