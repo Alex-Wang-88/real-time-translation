@@ -114,8 +114,24 @@ def score_text(reference: str, hypothesis: str, language: str) -> dict[str, floa
         "chrf": chrf(normalized_reference, normalized_hypothesis),
     }
 
+def _reference_surface_text(sample: dict[str, Any]) -> str:
+    """Return the spoken surface form, keeping Sichuan wording intact."""
+
+    return str(sample.get("text_sichuan") or sample.get("reference_text") or sample.get("text") or "")
+
+
 def _reference_text(sample: dict[str, Any]) -> str:
-    return str(sample.get("reference_text") or sample.get("text") or "")
+    return _reference_surface_text(sample)
+
+
+def _reference_mandarin_text(sample: dict[str, Any]) -> str:
+    """Return an optional meaning-normalized Mandarin reference.
+
+    WSC-Eval-ASR does not publish this field.  It is therefore optional and is
+    never inferred from the Sichuan surface transcript.
+    """
+
+    return str(sample.get("text_mandarin") or sample.get("reference_mandarin_text") or "")
 
 
 def _reference_translation(sample: dict[str, Any]) -> str:
@@ -143,6 +159,14 @@ def _duration(paragraph: dict[str, Any]) -> float:
 
 def _group_text(paragraphs: Sequence[dict[str, Any]], field: str) -> str:
     return " ".join(str(item.get(field) or "").strip() for item in paragraphs if str(item.get(field) or "").strip())
+
+
+def _group_first_available_text(paragraphs: Sequence[dict[str, Any]], fields: Sequence[str]) -> str:
+    for field in fields:
+        value = _group_text(paragraphs, field)
+        if value:
+            return value
+    return ""
 
 
 def _group_duration(paragraphs: Sequence[dict[str, Any]]) -> float:
@@ -317,6 +341,48 @@ def _translation_result(sample: dict[str, Any], paragraphs: Sequence[dict[str, A
     }
 
 
+def _mandarin_semantic_result(sample: dict[str, Any], paragraphs: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Score optional Mandarin meaning text without requiring another model.
+
+    This is a character-level proxy, not a semantic-model judgment.  The
+    report clearly distinguishes the result so a later human or embedding
+    based evaluator can replace it without changing the reference schema.
+    """
+
+    reference = _reference_mandarin_text(sample)
+    if not reference:
+        return {
+            "needed": False,
+            "scored": False,
+            "reference": "",
+            "actual": "",
+            "status": "not_annotated",
+            "error_rate": None,
+            "chrf": None,
+        }
+    actual = _group_first_available_text(paragraphs, ("mandarin_text", "semantic_text"))
+    if not actual:
+        return {
+            "needed": True,
+            "scored": False,
+            "reference": reference,
+            "actual": "",
+            "status": "missing_hypothesis",
+            "error_rate": None,
+            "chrf": None,
+        }
+    score = score_text(reference, actual, "zh")
+    return {
+        "needed": True,
+        "scored": True,
+        "reference": reference,
+        "actual": actual,
+        "status": "scored",
+        "error_rate": score["error_rate"],
+        "chrf": score["chrf"],
+    }
+
+
 def _evaluate_entry(entry: dict[str, Any]) -> dict[str, Any]:
     sample = entry["sample"]
     paragraphs = entry["actual_paragraphs"]
@@ -334,6 +400,7 @@ def _evaluate_entry(entry: dict[str, Any]) -> dict[str, Any]:
     language_result = _language_result(sample, paragraphs)
     variant_result = _variant_result(sample, paragraphs)
     translation_result = _translation_result(sample, paragraphs)
+    mandarin_semantic_result = _mandarin_semantic_result(sample, paragraphs)
     return {
         "expected_index": entry["expected_index"],
         "sample_id": str(sample.get("sample_id") or sample.get("segment_id") or entry["expected_index"]),
@@ -347,9 +414,11 @@ def _evaluate_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "reference_language": language,
         "reference_speech_variant": normalize_variant(sample.get("speech_variant")),
         "asr": asr,
+        "surface_asr": asr,
         "language": language_result,
         "speech_variant": variant_result,
         "translation": translation_result,
+        "mandarin_semantic": mandarin_semantic_result,
     }
 
 
@@ -413,6 +482,8 @@ def evaluate_realtime_replay(
     language_records = [item for item in scored if item["reference_language"] in SUPPORTED_LANGUAGES]
     translation_records = [item for item in scored if item["translation"]["needed"]]
     sichuan_records = [item for item in scored if item["reference_speech_variant"] == "sichuan"]
+    mandarin_reference_records = [item for item in sichuan_records if item["mandarin_semantic"]["needed"]]
+    mandarin_scored_records = [item for item in mandarin_reference_records if item["mandarin_semantic"]["scored"]]
     matched = [item for item in scored if item["alignment_status"] == "matched"]
 
     summary = {
@@ -443,6 +514,16 @@ def evaluate_realtime_replay(
             sum(bool(item["speech_variant"]["correct"]) for item in sichuan_records) / max(1, len(sichuan_records)),
             6,
         ),
+        "sichuan_surface_error_rate": _mean(float(item["surface_asr"]["error_rate"]) for item in sichuan_records),
+        "sichuan_surface_chrf_mean": _mean(float(item["surface_asr"]["chrf"]) for item in sichuan_records),
+        "sichuan_mandarin_reference_samples": len(mandarin_reference_records),
+        "sichuan_mandarin_scored_samples": len(mandarin_scored_records),
+        "sichuan_mandarin_error_rate": _mean(
+            float(item["mandarin_semantic"]["error_rate"]) for item in mandarin_scored_records
+        ),
+        "sichuan_mandarin_chrf_mean": _mean(
+            float(item["mandarin_semantic"]["chrf"]) for item in mandarin_scored_records
+        ),
         "translation_samples": len(translation_records),
         "translation_success_rate": round(
             sum(bool(item["translation"]["success"]) for item in translation_records) / max(1, len(translation_records)),
@@ -454,10 +535,12 @@ def evaluate_realtime_replay(
     }
     api = evaluate_postprocess_api(replay_report.get("postprocess_api"))
     runtime_metrics = replay_report.get("runtime_metrics") or {}
+    evaluation_contract = manifest.get("evaluation_contract") or {}
+    postprocess_api_required = bool(evaluation_contract.get("postprocess_api_required", True))
     contract_checks = {
         "recording_complete": replay_report.get("recording_state") == "complete",
         "reference_samples_aligned": len(matched) == len(samples),
-        "postprocess_api_complete": api["passed"],
+        "postprocess_api_complete": api["passed"] if postprocess_api_required else True,
         "runtime_stage_failures_empty": not runtime_metrics.get("stage_failures"),
     }
     return {
@@ -465,12 +548,14 @@ def evaluate_realtime_replay(
         "evaluator": {
             "alignment": "ordered_dynamic_programming",
             "max_actual_paragraphs_per_reference": 3,
-            "reference_text_field": "reference_text_or_text",
+            "reference_text_field": "text_sichuan_or_reference_text_or_text",
+            "mandarin_reference_field": "text_mandarin_or_reference_mandarin_text",
             "translation_reference_field": "reference_translation_or_translation",
         },
         "summary": summary,
         "contract": {
             "passed": all(contract_checks.values()),
+            "postprocess_api_required": postprocess_api_required,
             "checks": contract_checks,
         },
         "postprocess_api": api,

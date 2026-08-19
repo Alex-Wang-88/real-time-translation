@@ -129,6 +129,16 @@ class StreamSegmenter:
         self._revision = self._last_partial_frame_count = 0
         self._speech_since_partial = False
         self._audio_since_partial = False
+        self._diagnostics: dict[str, int | float | bool] = {
+            "segments_opened": 0,
+            "segments_emitted": 0,
+            "partial_events_emitted": 0,
+            "final_events_emitted": 0,
+            "forced_final_events_emitted": 0,
+            "admission_rejections": 0,
+            "max_rms": 0.0,
+            "last_rms": 0.0,
+        }
 
     @property
     def elapsed_seconds(self) -> float:
@@ -145,6 +155,8 @@ class StreamSegmenter:
     def _is_speech(self, frame: bytes) -> bool:
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
+        self._diagnostics["last_rms"] = round(rms, 3)
+        self._diagnostics["max_rms"] = max(float(self._diagnostics["max_rms"]), rms)
         near_zero = max(8.0, self.noise_floor * 1.25)
         energy_speech = rms >= max(self.minimum_rms, self.noise_floor * 3.0)
 
@@ -175,10 +187,13 @@ class StreamSegmenter:
             rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
             if rms >= self.minimum_rms:
                 speech_frames += 1
-        return (
+        admitted = (
             speech_frames >= self.minimum_speech_frames
             and speech_frames / len(frames) >= self.minimum_speech_ratio
         )
+        if not admitted:
+            self._diagnostics["admission_rejections"] = int(self._diagnostics["admission_rejections"]) + 1
+        return admitted
 
     def feed(self, data: bytes) -> list[SegmentEvent]:
         if len(data) % SAMPLE_WIDTH:
@@ -206,6 +221,7 @@ class StreamSegmenter:
             if self._speech_run >= self.speech_start_frames:
                 self._revision += 1
                 self._active = list(self._pre_roll)
+                self._diagnostics["segments_opened"] = int(self._diagnostics["segments_opened"]) + 1
                 self._last_partial_frame_count = len(self._active)
                 self._silence_run = 0
                 self._speech_since_partial = True
@@ -268,6 +284,13 @@ class StreamSegmenter:
                 float(np.sqrt(np.mean(np.frombuffer(frame, dtype=np.int16).astype(np.float32) ** 2))) >= max(self.minimum_rms, 8.0)
                 for _, frame in frames
             )
+        self._diagnostics["segments_emitted"] = int(self._diagnostics["segments_emitted"]) + 1
+        if kind == "partial":
+            self._diagnostics["partial_events_emitted"] = int(self._diagnostics["partial_events_emitted"]) + 1
+        else:
+            self._diagnostics["final_events_emitted"] = int(self._diagnostics["final_events_emitted"]) + 1
+            if forced:
+                self._diagnostics["forced_final_events_emitted"] = int(self._diagnostics["forced_final_events_emitted"]) + 1
         return SegmentEvent(
             kind=kind,
             pcm=b"".join(frame for _, frame in frames),
@@ -299,6 +322,18 @@ class StreamSegmenter:
         event = self._make_event("final", self._active, has_new_speech=self._speech_since_partial) if self._admitted(self._active) else None
         self._reset()
         return [event] if event else []
+
+    def diagnostics_snapshot(self) -> dict[str, int | float | bool]:
+        """Return bounded VAD/segmentation evidence for replay diagnostics."""
+
+        return {
+            **self._diagnostics,
+            "frames_processed": self._frames_processed,
+            "speech_frames": self._speech_frames,
+            "speech_ratio": round(self.speech_ratio, 4),
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "active": self.active,
+        }
 
 
 @dataclass(slots=True)

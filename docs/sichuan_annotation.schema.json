@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/realtime-meeting/sichuan-annotation.schema.json",
+  "title": "Realtime Meeting Sichuan Dialect Reference Sample",
+  "description": "双文本四川方言 ASR 评测样本。text_mandarin 可以暂时为 null。",
+  "type": "object",
+  "required": [
+    "sample_id",
+    "audio_path",
+    "language",
+    "speech_variant",
+    "text_sichuan",
+    "text_mandarin"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_id": {
+      "type": "string"
+    },
+    "audio_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "language": {
+      "const": "zh"
+    },
+    "speech_variant": {
+      "const": "sichuan"
+    },
+    "text_sichuan": {
+      "type": "string",
+      "minLength": 1,
+      "description": "说话人实际说出的四川话表面转写，不做普通话改写。"
+    },
+    "text_mandarin": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "人工整理的普通话释义；没有人工标注时为 null。"
+    },
+    "reference_text_normalization": {
+      "const": "wsc-eval-asr-v1"
+    },
+    "annotation_status": {
+      "enum": [
+        "surface_only",
+        "surface_and_mandarin_verified"
+      ]
+    },
+    "duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "speaker_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "uncertain_spans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "marker"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "marker": {
+            "const": "*"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "text_mandarin": {
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "annotation_status": {
+            "const": "surface_and_mandarin_verified"
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

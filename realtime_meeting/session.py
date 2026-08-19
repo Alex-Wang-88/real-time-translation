@@ -205,12 +205,23 @@ class LiveMeetingSession:
             "language_id_duration_ms": [],
             "translation_duration_ms": [],
             "final_translation_ms": [],
+            "asr_secondary_retry_duration_ms": [],
             "post_translation_duration_ms": [],
             "post_translation_candidates": 0,
             "post_translation_retranslated": 0,
             "post_translation_skipped": 0,
             "post_translation_failures": 0,
             "asr_quality_low_count": 0,
+            "asr_secondary_retry_attempts": 0,
+            "asr_secondary_retry_replaced": 0,
+            "asr_secondary_retry_non_improving": 0,
+            "asr_secondary_retry_failures": 0,
+            "asr_secondary_retry_empty_initial": 0,
+            "asr_secondary_retry_short_segment": 0,
+            "asr_secondary_retry_low_confidence": 0,
+            "asr_secondary_retry_low_quality": 0,
+            "asr_segment_diagnostics": [],
+            "segmenter_diagnostics": {},
             "queue_max_depth": 0,
             "asr_queue_max_depth": 0,
             "translation_queue_max_depth": 0,
@@ -413,6 +424,14 @@ class LiveMeetingSession:
         values.append(round(float(value), 3))
         del values[:-2000]
 
+    def _sync_segmenter_diagnostics(self) -> None:
+        if self.segmenter is None:
+            return
+        snapshot = getattr(self.segmenter, "diagnostics_snapshot", None)
+        if callable(snapshot):
+            with suppress(Exception):
+                self.pipeline_metrics["segmenter_diagnostics"] = snapshot()
+
     def rename(self, title: str) -> None:
         self.title = str(title).strip() or "未命名会议"
         self._write_state()
@@ -580,6 +599,7 @@ class LiveMeetingSession:
             with suppress(Exception):
                 self._write_state()
         events = self.segmenter.feed(pcm)
+        self._sync_segmenter_diagnostics()
         for event in events:
             await self._enqueue_event(event)
 
@@ -804,6 +824,166 @@ class LiveMeetingSession:
         self.pipeline_metrics["language_switches"] = int(self.pipeline_metrics.get("language_switches", 0)) + 1
         return True
 
+    def _secondary_retry_reasons(
+        self,
+        event: SegmentEvent,
+        result: Any,
+    ) -> tuple[list[str], AsrQualityAssessment, str, float]:
+        """Return conservative reasons for a same-model final retry."""
+
+        text = str(getattr(result, "text", "") or "").strip() if result is not None else ""
+        confidence = _safe_float(getattr(result, "confidence", 0.0)) if result is not None else 0.0
+        assessment = assess_asr_quality(
+            text,
+            start=event.start,
+            end=event.end,
+            confidence=confidence,
+        )
+        reasons: list[str] = []
+        if event.kind != "final" or not bool(
+            self.meeting_settings.get(
+                "asr_secondary_retry_enabled",
+                getattr(self.settings, "asr_secondary_retry_enabled", True),
+            )
+        ):
+            return reasons, assessment, text, confidence
+        if result is None or not text:
+            reasons.append("empty_result")
+        short_seconds = _safe_float(
+            self.meeting_settings.get(
+                "asr_secondary_retry_short_seconds",
+                getattr(self.settings, "asr_secondary_retry_short_seconds", 1.8),
+            ),
+            1.8,
+        )
+        if max(0.0, event.end - event.start) <= short_seconds:
+            reasons.append("short_segment")
+        confidence_threshold = _safe_float(
+            self.meeting_settings.get(
+                "asr_secondary_retry_confidence_threshold",
+                getattr(self.settings, "asr_secondary_retry_confidence_threshold", 0.42),
+            ),
+            0.42,
+        )
+        if text and 0.0 < confidence < confidence_threshold:
+            reasons.append("low_confidence")
+        quality_threshold = _safe_float(
+            self.meeting_settings.get(
+                "asr_secondary_retry_quality_threshold",
+                getattr(self.settings, "asr_secondary_retry_quality_threshold", 0.50),
+            ),
+            0.50,
+        )
+        if text and assessment.score < quality_threshold:
+            reasons.append("low_quality")
+        return reasons, assessment, text, confidence
+
+    def _append_asr_segment_diagnostic(self, payload: dict[str, Any]) -> None:
+        values = self.pipeline_metrics.setdefault("asr_segment_diagnostics", [])
+        if not isinstance(values, list):
+            values = []
+            self.pipeline_metrics["asr_segment_diagnostics"] = values
+        values.append(payload)
+        del values[:-2000]
+
+    async def _maybe_retry_final_asr(
+        self,
+        event: SegmentEvent,
+        asr_event: SegmentEvent,
+        method: Any,
+        kwargs: dict[str, Any],
+        result: Any,
+    ) -> Any:
+        reasons, initial_assessment, initial_text, initial_confidence = self._secondary_retry_reasons(event, result)
+        if event.kind != "final":
+            return result
+
+        diagnostic: dict[str, Any] = {
+            "revision": int(event.revision),
+            "start": round(float(event.start), 3),
+            "end": round(float(event.end), 3),
+            "duration_seconds": round(max(0.0, event.end - event.start), 3),
+            "initial_text_empty": not bool(initial_text),
+            "initial_confidence": round(initial_confidence, 4),
+            "initial_quality": initial_assessment.to_dict(),
+            "reasons": list(reasons),
+            "attempted": False,
+            "replaced": False,
+        }
+        if not reasons:
+            self._append_asr_segment_diagnostic(diagnostic)
+            return result
+
+        self.pipeline_metrics["asr_secondary_retry_attempts"] = int(
+            self.pipeline_metrics.get("asr_secondary_retry_attempts", 0)
+        ) + 1
+        if not initial_text:
+            self.pipeline_metrics["asr_secondary_retry_empty_initial"] = int(
+                self.pipeline_metrics.get("asr_secondary_retry_empty_initial", 0)
+            ) + 1
+        for reason, metric in (
+            ("short_segment", "asr_secondary_retry_short_segment"),
+            ("low_confidence", "asr_secondary_retry_low_confidence"),
+            ("low_quality", "asr_secondary_retry_low_quality"),
+        ):
+            if reason in reasons:
+                self.pipeline_metrics[metric] = int(self.pipeline_metrics.get(metric, 0)) + 1
+        diagnostic["attempted"] = True
+
+        retry_kwargs = dict(kwargs)
+        # Do not let the previous paragraph bias a second pass over a short or
+        # empty clip. Keep the language/dialect constraint selected for the
+        # current segment, and mark the call for runtime diagnostics.
+        retry_kwargs["recent_text"] = ""
+        retry_kwargs["previous_language"] = None
+        retry_settings = dict(kwargs.get("decode_settings") or {})
+        retry_settings["_asr_secondary_retry"] = True
+        retry_kwargs["decode_settings"] = retry_settings
+        started_retry = time.perf_counter()
+        retry_result: Any = None
+        try:
+            retry_result = await self._transcribe_with_strategy(
+                method,
+                asr_event,
+                retry_kwargs,
+                is_final=True,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Secondary realtime ASR failed for %s", self.id)
+        self._record_metric("asr_secondary_retry_duration_ms", (time.perf_counter() - started_retry) * 1000)
+
+        retry_text = str(getattr(retry_result, "text", "") or "").strip() if retry_result is not None else ""
+        retry_confidence = _safe_float(getattr(retry_result, "confidence", 0.0)) if retry_result is not None else 0.0
+        retry_assessment = assess_asr_quality(
+            retry_text,
+            start=event.start,
+            end=event.end,
+            confidence=retry_confidence,
+        )
+        diagnostic["retry_text_empty"] = not bool(retry_text)
+        diagnostic["retry_confidence"] = round(retry_confidence, 4)
+        diagnostic["retry_quality"] = retry_assessment.to_dict()
+        if retry_result is None or not retry_text:
+            self.pipeline_metrics["asr_secondary_retry_failures"] = int(
+                self.pipeline_metrics.get("asr_secondary_retry_failures", 0)
+            ) + 1
+        else:
+            confidence_gain = retry_confidence - initial_confidence
+            quality_gain = retry_assessment.score - initial_assessment.score
+            improved = not initial_text or confidence_gain >= 0.03 or quality_gain >= 0.02
+            if improved:
+                result = retry_result
+                diagnostic["replaced"] = True
+                self.pipeline_metrics["asr_secondary_retry_replaced"] = int(
+                    self.pipeline_metrics.get("asr_secondary_retry_replaced", 0)
+                ) + 1
+            else:
+                self.pipeline_metrics["asr_secondary_retry_non_improving"] = int(
+                    self.pipeline_metrics.get("asr_secondary_retry_non_improving", 0)
+                ) + 1
+        self._append_asr_segment_diagnostic(diagnostic)
+        return result
+
     async def _handle_event(self, event: SegmentEvent) -> None:
         is_final = event.kind == "final" and not event.forced
         paragraph_start: float | None = None
@@ -863,6 +1043,7 @@ class LiveMeetingSession:
             LOGGER.exception("Realtime ASR failed for %s", self.id)
             result = None
         self._record_metric("asr_duration_ms", (time.perf_counter() - started_asr) * 1000)
+        result = await self._maybe_retry_final_asr(event, asr_event, method, kwargs, result)
         if result is None:
             if is_final:
                 await self._close_active(event.end)
@@ -1753,6 +1934,7 @@ class LiveMeetingSession:
             if self.segmenter:
                 for event in self.segmenter.flush():
                     await self._enqueue_event(event)
+                self._sync_segmenter_diagnostics()
             await self._wait_for_queue(self.queue, self.worker_task, label="ASR")
             if self.worker_task and not self.worker_task.done():
                 self.worker_task.cancel()

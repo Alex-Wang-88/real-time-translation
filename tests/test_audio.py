@@ -127,3 +127,7 @@ def test_short_noise_burst_does_not_pass_utterance_admission() -> None:
     for _ in range(10):
         events.extend(segmenter.feed(silence))
     assert not [event for event in events if event.kind == "final"]
+    diagnostics = segmenter.diagnostics_snapshot()
+    assert diagnostics["segments_opened"] == 1
+    assert diagnostics["segments_emitted"] == 0
+    assert diagnostics["admission_rejections"] >= 1

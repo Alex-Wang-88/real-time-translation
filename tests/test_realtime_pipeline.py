@@ -202,6 +202,58 @@ async def test_timestamped_language_switch_resegments_old_and_new_windows(settin
         await asyncio.gather(meeting.worker_task, meeting.translation_worker_task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_empty_final_asr_retries_same_model_and_records_diagnostics(settings) -> None:
+    class RetryingRuntime:
+        ready = True
+        capabilities_ready = True
+        device = "cpu"
+        status = "ready"
+        metrics: dict[str, object] = {}
+
+        def __init__(self) -> None:
+            self.transcribe_calls = 0
+
+        def new_vad(self):
+            return None
+
+        def detect_language(self, _pcm: bytes, **_kwargs):
+            return None
+
+        def transcribe_final(self, event, **_kwargs):
+            self.transcribe_calls += 1
+            text = "" if self.transcribe_calls == 1 else "莫得问题"
+            return PartialResult(event.revision, event.start, event.end, text, "zh", 0.8, "fake-1.7b")
+
+        def transcribe_partial(self, event, **kwargs):
+            return self.transcribe_final(event, **kwargs)
+
+        def translate_text(self, text, language, **_kwargs):
+            return TranslationResult(text, "not_needed", "fake") if language == "zh" else TranslationResult("", "failed", "fake")
+
+    runtime = RetryingRuntime()
+    meeting = LiveMeetingSession(settings, runtime, LocalMeetingStore(settings.results_dir))
+    await meeting.start()
+    event = SegmentEvent("final", b"\x01\x00" * 1_600, 0.0, 0.1, 1)
+    try:
+        await meeting._handle_event(event)
+        paragraphs = meeting.load_transcript()
+        assert runtime.transcribe_calls == 2
+        assert [item.text for item in paragraphs] == ["莫得问题"]
+        assert meeting.pipeline_metrics["asr_secondary_retry_attempts"] == 1
+        assert meeting.pipeline_metrics["asr_secondary_retry_replaced"] == 1
+        assert meeting.pipeline_metrics["asr_secondary_retry_empty_initial"] == 1
+        diagnostic = meeting.pipeline_metrics["asr_segment_diagnostics"][0]
+        assert diagnostic["attempted"] is True
+        assert diagnostic["replaced"] is True
+        assert diagnostic["initial_text_empty"] is True
+    finally:
+        for task in (meeting.worker_task, meeting.translation_worker_task):
+            if task and not task.done():
+                task.cancel()
+        await asyncio.gather(meeting.worker_task, meeting.translation_worker_task, return_exceptions=True)
+
+
 def test_asr_quality_flags_unstable_final_hypothesis() -> None:
     state = AsrQualityState()
     state.observe("we will ship the beta", 0.9, is_final=False, is_partial=True)

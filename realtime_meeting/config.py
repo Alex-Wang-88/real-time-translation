@@ -102,6 +102,12 @@ class Settings:
     realtime_pipeline: bool = True
     audio_drain_timeout_seconds: float = 3.0
     asr_timeout_seconds: float = 45.0
+    # Retry only questionable final segments with the same resident 1.7B
+    # model. The retry changes prompt context, not the model architecture.
+    asr_secondary_retry_enabled: bool = True
+    asr_secondary_retry_short_seconds: float = 1.8
+    asr_secondary_retry_confidence_threshold: float = 0.42
+    asr_secondary_retry_quality_threshold: float = 0.50
     translation_timeout_seconds: float = 90.0
     translation_deadline_seconds: float = 4.5
     translation_warmup: bool = True
@@ -132,6 +138,17 @@ class Settings:
     jimo_timeout_seconds: float = 180.0
     jimo_connect_timeout_seconds: float = 20.0
     jimo_max_retries: int = 3
+    # Jimo public-share audio upload.  Uploading is explicit; merely setting
+    # these values does not send any file until the audio-url API is called.
+    jimo_upload_base_url: str = "https://jimoai-bot-api.xiaohuodui.cn"
+    jimo_upload_share_id: str = ""
+    jimo_upload_tenant_id: str = ""
+    jimo_upload_create_by: str = ""
+    jimo_upload_cos_authorization: str = ""
+    jimo_upload_download_ttl_seconds: int = 900
+    jimo_upload_timeout_seconds: float = 180.0
+    jimo_upload_connect_timeout_seconds: float = 20.0
+    jimo_upload_max_retries: int = 3
 
     @property
     def jimo_configured(self) -> bool:
@@ -140,6 +157,10 @@ class Settings:
     @property
     def todo_configured(self) -> bool:
         return bool(self.jimo_todo_api_url.strip() and self.jimo_authorization.strip())
+
+    @property
+    def jimo_upload_configured(self) -> bool:
+        return bool(self.jimo_upload_base_url.strip() and self.jimo_upload_share_id.strip())
 
     @property
     def api_auth_required(self) -> bool:
@@ -163,9 +184,12 @@ MEETING_SETTING_LIMITS: dict[str, tuple[float, float]] = {
     "translation_beam_size": (1.0, 8.0),
     "translation_max_decoding_length": (64.0, 1024.0),
     "translation_repetition_penalty": (1.0, 2.0),
+    "asr_secondary_retry_short_seconds": (0.4, 4.0),
+    "asr_secondary_retry_confidence_threshold": (0.0, 1.0),
+    "asr_secondary_retry_quality_threshold": (0.0, 1.0),
 }
 
-MEETING_BOOLEAN_SETTINGS = ("keep_audio",)
+MEETING_BOOLEAN_SETTINGS = ("keep_audio", "asr_secondary_retry_enabled")
 ASR_HOTWORDS_MAX_ITEMS = 100
 ASR_HOTWORD_MAX_CHARS = 64
 ASR_HOTWORDS_MAX_TOTAL_CHARS = 4_000
@@ -227,6 +251,10 @@ def default_meeting_settings(settings: Settings) -> dict[str, Any]:
         "translation_max_decoding_length": 384,
         "translation_repetition_penalty": 1.05,
         "keep_audio": settings.keep_audio,
+        "asr_secondary_retry_enabled": settings.asr_secondary_retry_enabled,
+        "asr_secondary_retry_short_seconds": settings.asr_secondary_retry_short_seconds,
+        "asr_secondary_retry_confidence_threshold": settings.asr_secondary_retry_confidence_threshold,
+        "asr_secondary_retry_quality_threshold": settings.asr_secondary_retry_quality_threshold,
         "asr_hotwords": normalize_asr_hotwords(settings.asr_hotwords),
     }
 
@@ -351,6 +379,43 @@ def load_settings() -> Settings:
         realtime_pipeline=_bool("MEETING_REALTIME_PIPELINE", defaults.realtime_pipeline),
         audio_drain_timeout_seconds=max(0.5, _float("MEETING_AUDIO_DRAIN_TIMEOUT_SECONDS", defaults.audio_drain_timeout_seconds, 0.5)),
         asr_timeout_seconds=max(1.0, _float("MEETING_ASR_TIMEOUT_SECONDS", defaults.asr_timeout_seconds, 1.0)),
+        asr_secondary_retry_enabled=_bool(
+            "MEETING_ASR_SECONDARY_RETRY_ENABLED",
+            defaults.asr_secondary_retry_enabled,
+        ),
+        asr_secondary_retry_short_seconds=min(
+            4.0,
+            max(
+                0.4,
+                _float(
+                    "MEETING_ASR_SECONDARY_RETRY_SHORT_SECONDS",
+                    defaults.asr_secondary_retry_short_seconds,
+                    0.4,
+                ),
+            ),
+        ),
+        asr_secondary_retry_confidence_threshold=min(
+            1.0,
+            max(
+                0.0,
+                _float(
+                    "MEETING_ASR_SECONDARY_RETRY_CONFIDENCE_THRESHOLD",
+                    defaults.asr_secondary_retry_confidence_threshold,
+                    0.0,
+                ),
+            ),
+        ),
+        asr_secondary_retry_quality_threshold=min(
+            1.0,
+            max(
+                0.0,
+                _float(
+                    "MEETING_ASR_SECONDARY_RETRY_QUALITY_THRESHOLD",
+                    defaults.asr_secondary_retry_quality_threshold,
+                    0.0,
+                ),
+            ),
+        ),
         translation_timeout_seconds=max(1.0, _float("MEETING_TRANSLATION_TIMEOUT_SECONDS", defaults.translation_timeout_seconds, 1.0)),
         translation_deadline_seconds=min(30.0, max(1.0, _float("MEETING_TRANSLATION_DEADLINE_SECONDS", defaults.translation_deadline_seconds, 1.0))),
         translation_warmup=_bool("MEETING_TRANSLATION_WARMUP", defaults.translation_warmup),
@@ -417,4 +482,33 @@ def load_settings() -> Settings:
         jimo_timeout_seconds=max(1.0, _float("JIMO_TIMEOUT_SECONDS", defaults.jimo_timeout_seconds, 1.0)),
         jimo_connect_timeout_seconds=max(1.0, _float("JIMO_CONNECT_TIMEOUT_SECONDS", defaults.jimo_connect_timeout_seconds, 1.0)),
         jimo_max_retries=min(8, max(1, _int("JIMO_MAX_RETRIES", defaults.jimo_max_retries, 1))),
+        jimo_upload_base_url=os.getenv("JIMO_UPLOAD_BASE_URL", defaults.jimo_upload_base_url),
+        jimo_upload_share_id=os.getenv("JIMO_UPLOAD_SHARE_ID", defaults.jimo_upload_share_id),
+        jimo_upload_tenant_id=os.getenv("JIMO_UPLOAD_TENANT_ID", defaults.jimo_upload_tenant_id),
+        jimo_upload_create_by=os.getenv("JIMO_UPLOAD_CREATE_BY", defaults.jimo_upload_create_by),
+        jimo_upload_cos_authorization=os.getenv(
+            "JIMO_UPLOAD_COS_AUTHORIZATION",
+            defaults.jimo_upload_cos_authorization,
+        ),
+        jimo_upload_download_ttl_seconds=_int(
+            "JIMO_UPLOAD_DOWNLOAD_TTL_SECONDS",
+            defaults.jimo_upload_download_ttl_seconds,
+            60,
+        ),
+        jimo_upload_timeout_seconds=max(
+            1.0,
+            _float("JIMO_UPLOAD_TIMEOUT_SECONDS", defaults.jimo_upload_timeout_seconds, 1.0),
+        ),
+        jimo_upload_connect_timeout_seconds=max(
+            1.0,
+            _float(
+                "JIMO_UPLOAD_CONNECT_TIMEOUT_SECONDS",
+                defaults.jimo_upload_connect_timeout_seconds,
+                1.0,
+            ),
+        ),
+        jimo_upload_max_retries=min(
+            8,
+            max(1, _int("JIMO_UPLOAD_MAX_RETRIES", defaults.jimo_upload_max_retries, 1)),
+        ),
     )

@@ -1,6 +1,7 @@
 .env
 result/
 models/
+data/external/
 .venv/
 __pycache__/
 *.pyc

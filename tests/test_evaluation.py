@@ -130,3 +130,44 @@ def test_replay_evaluation_reports_translation_variant_and_contract_metrics() ->
     assert evaluation["summary"]["sichuan_variant_accuracy"] == 1.0
     assert evaluation["summary"]["translation_success_rate"] == 1.0
     assert evaluation["summary"]["asr_token_weighted_error_rate"] == 0.0
+
+
+def test_sichuan_evaluation_keeps_surface_text_and_scores_optional_mandarin_text() -> None:
+    manifest = {
+        "evaluation_contract": {"postprocess_api_required": False},
+        "samples": [
+            {
+                "sample_id": "sc-1",
+                "language": "zh",
+                "speech_variant": "sichuan",
+                "duration_seconds": 2.0,
+                "text_sichuan": "莫得问题，明天给你回话",
+                "text_mandarin": "没有问题，明天回复你",
+            }
+        ],
+    }
+    report = {
+        "recording_state": "complete",
+        "runtime_metrics": {"stage_failures": 0},
+        "paragraphs": [
+            {
+                "segment_id": "p-1",
+                "start": 0,
+                "end": 2,
+                "language": "zh",
+                "speech_variant": "sichuan",
+                "text": "莫得问题，明天给你回话",
+                "mandarin_text": "没有问题，明天回复你",
+                "translation_status": "not_needed",
+            }
+        ],
+    }
+
+    evaluation = evaluate_realtime_replay(manifest, report)
+
+    assert evaluation["contract"]["passed"] is True
+    assert evaluation["contract"]["postprocess_api_required"] is False
+    assert evaluation["summary"]["sichuan_surface_error_rate"] == 0.0
+    assert evaluation["summary"]["sichuan_mandarin_reference_samples"] == 1
+    assert evaluation["summary"]["sichuan_mandarin_scored_samples"] == 1
+    assert evaluation["segments"][0]["mandarin_semantic"]["status"] == "scored"

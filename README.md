@@ -36,6 +36,8 @@ Copy-Item .env.example .env
 
 生产环境建议设置 `MEETING_ASR_AUTODOWNLOAD=0` 和 `MEETING_TRANSLATION_AUTODOWNLOAD=0`，启动时只读取本地模型缓存。
 
+最终 ASR 段默认启用同模型二次识别：空结果、短于 1.8 秒或低质量段会清空上一段上下文后再次调用同一个 `Qwen/Qwen3-ASR-1.7B`，不会加载第二个 ASR 模型。每场会议的 `pipeline_metrics` 会记录触发原因、替换次数、失败次数以及 VAD/分段诊断；可通过 `MEETING_ASR_SECONDARY_RETRY_*` 调整或关闭。
+
 ## 输出
 
 每场会议位于 `result/meetings/<meeting-id>/`，主要文件为：
@@ -95,3 +97,7 @@ WebSocket 实时事件统一为：
 uv run pytest -q
 uv run python -m compileall -q realtime_meeting
 ```
+
+四川方言真实评测集的下载、双文本标注和实时回放流程见
+[`docs/SICHUAN_EVAL.md`](docs/SICHUAN_EVAL.md)。项目使用 WSC-Eval-ASR 的 `text_sichuan` 作为表面
+识别参考；人工补充 `text_mandarin` 后，才会启用普通话语义保持评测。
