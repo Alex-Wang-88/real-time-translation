@@ -131,8 +131,10 @@ async def test_jimo_client_reads_complete_json_and_file_message(settings) -> Non
         assert request.headers["Accept"] == "application/json"
         body = json.loads((await request.aread()).decode("utf-8"))
         content = body["messages"][1]["content"]
-        assert content[0]["type"] == "text"
-        assert content[1]["file_url"]["fileId"] == "file-1"
+        # 与积墨网页聊天 UI 一致：文件卡片在前，文字提示在后。
+        assert content[0]["type"] == "file_url"
+        assert content[0]["file_url"]["fileId"] == "file-1"
+        assert content[1]["type"] == "text"
         return httpx.Response(
             200,
             json={"content": json.dumps(_payload(), ensure_ascii=False)},

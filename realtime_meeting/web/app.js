@@ -64,6 +64,8 @@ const state = {
   draft: null,
   draftNode: null,
   transcriptNearBottom: true,
+  refinedActive: false,
+  refinedSignature: "",
   timer: null,
   renameMeetingId: null,
   confirmResolver: null,
@@ -96,11 +98,13 @@ const dom = {
   meetingTitle: $("#meetingTitle"),
   transcriptList: $("#transcriptList"),
   transcriptEmpty: $("#transcriptEmpty"),
+  transcriptModeTag: $("#transcriptModeTag"),
   utteranceCount: $("#utteranceCount"),
   jumpLatest: $("#jumpLatest"),
   recordingIndicator: $("#recordingIndicator"),
   recordingState: $("#recordingState"),
   recordingHint: $("#recordingHint"),
+  saveRecording: $("#saveRecording"),
   timer: $("#timer"),
   startRecordingButton: $("#startRecordingButton"),
   recordButton: $("#recordButton"),
@@ -113,6 +117,7 @@ const dom = {
   notice: $("#notice"),
   refinedBadge: $("#refinedBadge"),
   refinedTranscriptText: $("#refinedTranscriptText"),
+  refinedCard: $("#refinedCard"),
   summaryBadge: $("#summaryBadge"),
   summaryText: $("#summaryText"),
   retrySummary: $("#retrySummary"),
@@ -779,7 +784,7 @@ function removeTranscriptItem(segmentId) {
 
 function renderTranscript(autoScroll = false) {
   clearDraft();
-  const items = [...state.transcript.values()].sort((a, b) => (a.start || 0) - (b.start || 0));
+  const items = getTranscriptBubbleSource().sort((a, b) => (a.start || 0) - (b.start || 0));
   state.transcriptNodes.clear();
   dom.transcriptList.replaceChildren();
   if (!items.length) dom.transcriptList.append(dom.transcriptEmpty);
@@ -790,6 +795,50 @@ function renderTranscript(autoScroll = false) {
     dom.transcriptList.append(article);
   }
   updateTranscriptViewport(autoScroll, items.length);
+}
+
+// Map a refined-transcript item (from the agent result) into the same shape
+// that updateTranscriptNode expects, so the polished transcript reuses the
+// exact live-transcript bubble styling.
+function toBubbleItem(item) {
+  const hasZh = Boolean(item.translation_zh);
+  return {
+    segment_id: String(item.id || `refined-${item.index}`),
+    index: item.index,
+    start: item.start,
+    end: item.end,
+    language: item.language || "unknown",
+    speech_variant: item.speech_variant || "unknown",
+    text: item.original || "",
+    translation_zh: item.translation_zh || "",
+    translation_status: hasZh ? "done" : "not_needed",
+  };
+}
+
+// The bubble area shows the refined (polished) transcript once it is ready,
+// otherwise it falls back to the live real-time transcript.
+function getTranscriptBubbleSource() {
+  const refined = state.meeting?.refined_transcript;
+  if (state.refinedActive && Array.isArray(refined) && refined.length) {
+    return refined.map(toBubbleItem);
+  }
+  return [...state.transcript.values()];
+}
+
+// Swap the main bubble area between live and refined transcript, and toggle the
+// redundant right-side "精修" card. Returns true when a re-render is needed.
+function syncRefinedTranscriptView() {
+  const refined = state.meeting?.refined_transcript;
+  const active = state.meeting?.summary_state === "complete"
+    && Array.isArray(refined) && refined.length > 0;
+  const signature = active ? refined.map((r) => r.id || r.index).join("|") : "";
+  const changed = active !== state.refinedActive || signature !== state.refinedSignature;
+  state.refinedActive = active;
+  state.refinedSignature = signature;
+  if (dom.refinedCard) dom.refinedCard.hidden = active;
+  if (dom.transcriptModeTag) dom.transcriptModeTag.hidden = !active;
+  if (changed) renderTranscript();
+  return changed;
 }
 
 function renderRefinedTranscript(items, summaryState = "idle", markdown = "") {
@@ -951,13 +1000,21 @@ function applySnapshot(snapshot, replace = false) {
   dom.recordButton.hidden = !canStop;
   dom.recordButton.disabled = !canStop;
   dom.recordButton.setAttribute("aria-label", "停止会议");
-  dom.recordingHint.textContent = state.meeting.error || (
-    isCreated ? "请先确认输入设备和背景声过滤设置，再点击“开始录音”。"
-      : state.meeting.recording_state === "recording" ? "正在接收麦克风音频，连续语音会合并为段落。"
-        : "录音已经结束，翻译完成后请点击“生成三段结果”。"
-  );
+  const audioSegments = Array.isArray(state.meeting.audio_segments) ? state.meeting.audio_segments : [];
+  const hasAudioFiles = audioSegments.some((seg) => seg && typeof seg.file === "string" && seg.file.trim());
+  const showSaveAudio = state.meeting.recording_state === "complete" && hasAudioFiles;
+  dom.saveRecording.hidden = !showSaveAudio;
+  dom.recordingHint.hidden = showSaveAudio;
+  if (!showSaveAudio) {
+    dom.recordingHint.textContent = state.meeting.error || (
+      isCreated ? "请先确认输入设备和背景声过滤设置，再点击“开始录音”。"
+        : state.meeting.recording_state === "recording" ? "正在接收麦克风音频，连续语音会合并为段落。"
+          : "录音已经结束，翻译完成后请点击“生成三段结果”。"
+    );
+  }
   dom.levelBar.style.width = `${Math.round((state.meeting.audio_level || 0) * 100)}%`;
   if (transcriptChanged) renderTranscript();
+  syncRefinedTranscriptView();
   renderRefinedTranscript(state.meeting?.refined_transcript, state.meeting?.summary_state, state.meeting?.refined_transcript_markdown);
   renderSummary(state.meeting.summary, state.meeting.summary_state);
   renderTodo(state.meeting.todo, state.meeting.todo_state, state.meeting.todo_markdown);
@@ -1590,6 +1647,7 @@ async function handleEvent(payload, sourceSocket = null, meetingId = null, sourc
       files: payload.files || state.meeting.files,
     });
     renderRefinedTranscript(state.meeting?.refined_transcript, "complete", state.meeting?.refined_transcript_markdown);
+    syncRefinedTranscriptView();
     renderSummary(state.meeting?.summary, "complete");
     renderTodo(state.meeting?.todo, "complete", state.meeting?.todo_markdown);
     renderFiles(state.meeting?.files || []);
@@ -1608,6 +1666,7 @@ async function handleEvent(payload, sourceSocket = null, meetingId = null, sourc
     });
     if (state.meeting && payload.code === "agent_failed") state.meeting.todo_state = "error";
     if (payload.agent) renderRefinedTranscript(state.meeting?.refined_transcript, "error", state.meeting?.refined_transcript_markdown);
+    syncRefinedTranscriptView();
     renderSummary(state.meeting?.summary, state.meeting?.summary_state || "error");
     renderTodo(state.meeting?.todo, state.meeting?.todo_state || "error", state.meeting?.todo_markdown);
   }
@@ -1708,6 +1767,42 @@ async function retrySummary() {
   }
 }
 
+function downloadAudioSegment(meetingId, fileName) {
+  const encodedMeetingId = encodeURIComponent(meetingId);
+  const encodedFileName = String(fileName).split("/").map(encodeURIComponent).join("/");
+  const url = `/api/v2/meetings/${encodedMeetingId}/files/audio/${encodedFileName}`;
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = String(fileName).split("/").pop() || fileName;
+  link.rel = "noopener";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+async function saveRecording() {
+  if (!state.meeting) return;
+  const segments = Array.isArray(state.meeting.audio_segments) ? state.meeting.audio_segments : [];
+  const files = segments
+    .filter((seg) => seg && typeof seg.file === "string" && seg.file.trim())
+    .map((seg) => seg.file.trim());
+  if (!files.length) {
+    setNotice("当前没有可下载的本地录音文件。", "warning");
+    return;
+  }
+  if (files.length > 1) {
+    const confirmed = await requestConfirmation(
+      "保存会议录音",
+      `本次会议共 ${files.length} 段录音，将依次触发下载。是否继续？`,
+      "继续下载"
+    );
+    if (!confirmed) return;
+  }
+  files.forEach((file, index) => {
+    setTimeout(() => downloadAudioSegment(state.meeting.id, file), index * 900);
+  });
+}
+
 function openRenameDialog(meeting) {
   if (!meeting || !dom.renameDialog || !dom.renameDialogTitle) return;
   state.renameMeetingId = meeting.id;
@@ -1762,6 +1857,8 @@ async function deleteMeeting(meetingId = state.meeting?.id, meetingTitle = state
       renderSummary("", "idle");
       renderTodo(null, "waiting_summary");
       dom.filesCard.hidden = true;
+      dom.saveRecording.hidden = true;
+      dom.recordingHint.hidden = false;
     }
     renderMeetings();
     setNotice("会议已删除。", "success");
@@ -1832,6 +1929,7 @@ function bindEvents() {
     applyTheme(current === "dark" ? "light" : "dark");
   });
   dom.retrySummary.addEventListener("click", retrySummary);
+  dom.saveRecording?.addEventListener("click", saveRecording);
   dom.downloadSummary.addEventListener("click", () => downloadFile("meeting_minutes.md"));
   dom.downloadTodo.addEventListener("click", () => downloadFile("todo_list.json"));
   dom.openAsrSettings.addEventListener("click", openAsrSettings);

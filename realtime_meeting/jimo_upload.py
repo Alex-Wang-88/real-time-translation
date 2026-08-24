@@ -558,17 +558,15 @@ class JimoUploadClient:
         register_payload: dict[str, Any] = {
             "url": object_url,
             "name": path.name,
-            "size": path.stat().st_size,
-            # Jimo's browser client uses the extension for both fields, not
-            # the MIME string returned by File.type.
-            "sizeType": extension,
+            "size": round(path.stat().st_size / 1024, 3),
+            "sizeType": "KB",
             "type": extension,
-            "source": "web",
-            "shareId": resolved_share_id,
+            "source": "api",
         }
         registration = await self._request_json(
             "POST",
             "/v2/upload/file/share",
+            params={"shareId": resolved_share_id},
             json_body=register_payload,
         )
         file_id_value = _find_value(registration, {"fileid", "file_id"})

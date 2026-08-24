@@ -112,3 +112,25 @@ uv run python -m compileall -q realtime_meeting
 四川方言真实评测集的下载、双文本标注和实时回放流程见
 [`docs/SICHUAN_EVAL.md`](docs/SICHUAN_EVAL.md)。项目使用 WSC-Eval-ASR 的 `text_sichuan` 作为表面
 识别参考；人工补充 `text_mandarin` 后，才会启用普通话语义保持评测。
+
+## AI 生成内容声明
+
+> **会议纪要与 To-do-list 由积墨（Jimo）AI 自动生成，仅供参考，不构成权威记录。**
+
+- 纪要与待办事项由 AI 模型基于转写文本后处理生成，可能存在遗漏、误读或事实性偏差。
+- 正式场景（如会议纪要归档、任务派发、法律依据）**必须经过人工复核与确认**。
+- 实时转写 / 翻译结果本身同样由模型产出，关键内容请以原始录音为准。
+- 本声明在单节点「生成精修转写、纪要和 To-do-list」入口处同样适用。
+
+## 安全与隐私模型（local-first）
+
+> **本应用默认仅在本机运行，属于 local-first 设计，不应直接暴露于公网。**
+
+- 服务默认监听 `127.0.0.1:8765`（仅本机回环），不对外网开放；前端通过同源（same-origin）访问，未启用 CORS 中间件。
+- **默认无鉴权**：当运行主机为 `localhost` 且未配置 `MEETING_API_TOKEN` 时，HTTP 接口不要求任何令牌。WebSocket 通过一次性 ticket 接入。
+- **暴露到网络前必须启用鉴权**：若需在非本机访问，必须配置 `MEETING_API_TOKEN`，并通过 `Host` 头白名单防御 DNS 重绑定。未配置令牌且绑定到非本地地址时，健康检查等接口将返回 `503` 以阻止明文暴露。
+- 所有下载 / 读取路径均经 `resolve() + relative_to` 做目录穿越（path-traversal）防护。
+- 录音上传至第三方（积墨 COS）属于显式用户操作，受审计日志（`AUDIT upload_meeting_audio`）记录；未配置 `JIMO_UPLOAD_SHARE_ID` 时不会上传。
+- 删除会议、生成纪要、上传录音三类敏感操作均写入审计日志（`AUDIT delete_meeting` / `AUDIT request_summary` / `AUDIT upload_meeting_audio`），便于本地追溯。
+
+> 生产环境部署的网络暴露鉴权方案（令牌 + Host 白名单 + 反 DNS 重绑定）属于 POC 之后的待办项，当前 POC 阶段仅保证「本机能跑通」。

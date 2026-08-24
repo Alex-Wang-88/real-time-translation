@@ -154,7 +154,10 @@ async def replay(
 
     meeting_id = "manufacturing-role-meeting-v3-realtime"
     store = LocalMeetingStore(settings.results_dir)
-    store.delete(meeting_id)
+    try:
+        store.delete(meeting_id)
+    except Exception as _del_err:  # 沙箱安全删除可能因无回收站失败，忽略以继续
+        print(f"[warn] store.delete skipped: {_del_err}")
     meeting = LiveMeetingSession(
         settings,
         runtime,

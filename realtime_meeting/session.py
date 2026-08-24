@@ -300,6 +300,38 @@ class LiveMeetingSession:
         )
         self.next_paragraph_id = max((_safe_int(item.id) for item in self.paragraphs), default=0) + 1
         self.active_paragraph = next((item for item in reversed(self.paragraphs) if not item.closed), None)
+        self._recover_audio_segments()
+
+    def _recover_audio_segments(self) -> None:
+        """服务重启后从磁盘恢复可下载的录音片段。
+
+        录音完成时 audio_segments 仅保存在内存中，服务重启后 _restore_state
+        不会带出该字段，导致“保存录音”按钮无法显示、下载接口返回 404。这里在
+        录音已结束且当前内存片段为空时，扫描 audio 目录补齐片段信息。
+        """
+        if self.recording_state == "recording":
+            return
+        if self.audio_segments:
+            return
+        audio_root = (self.output_dir / "audio").resolve()
+        if not audio_root.is_dir():
+            return
+        recovered: list[dict[str, Any]] = []
+        for candidate in sorted(audio_root.iterdir()):
+            if not candidate.is_file():
+                continue
+            suffix = candidate.suffix.casefold()
+            if suffix not in {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".webm"}:
+                continue
+            recovered.append({
+                "file": candidate.name,
+                "start_seconds": 0.0,
+                "end_seconds": 0.0,
+                "samples": 0,
+                "format": suffix.lstrip("."),
+            })
+        if recovered:
+            self.audio_segments = recovered
 
     @property
     def elapsed_seconds(self) -> float:
@@ -423,6 +455,7 @@ class LiveMeetingSession:
             "language_evidence": self.language_evidence.snapshot(),
             "paragraph_count": len(self.paragraphs),
             "files": self.files,
+            "audio_segments": self.audio_segments,
             "model_metadata": self.model_metadata,
         }
 
@@ -2058,6 +2091,15 @@ class LiveMeetingSession:
                 continue
             if candidate.is_file():
                 paths.append(candidate)
+        # 当 segments/manifest 为空时（例如服务重启后从磁盘恢复），直接扫描音频目录。
+        if not paths and audio_root.is_dir():
+            for candidate in sorted(audio_root.iterdir()):
+                if candidate.is_file() and candidate.suffix.casefold() in {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".webm"}:
+                    try:
+                        candidate.resolve().relative_to(audio_root)
+                    except ValueError:
+                        continue
+                    paths.append(candidate)
         return paths
 
     def _write_agent_artifacts(self, result: Any) -> None:

@@ -10,3 +10,15 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.lnk
+
+# 本地 agent 数据与生成产物（非源码，勿提交）
+.workbuddy/
+docx_qa_*/
+
+# 含明文凭据 / 本地探测调试脚本（切勿提交真实 token / shareId / Authorization）
+scripts/jimo_web_upload.py
+scripts/jimo_web_recon.py
+scripts/jimo_web_upload_probe.py
+scripts/_probe_get.py
+scripts/_probe_health.py
+scripts/_probe_tr.py

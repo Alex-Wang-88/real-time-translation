@@ -5,6 +5,7 @@ import ast
 import json
 import math
 import re
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -780,13 +781,17 @@ class MeetingAgent:
         on_status: Callable[[str], Any] | None = None,
     ) -> MeetingAgentResult:
         files = [dict(item) for item in (audio_files or []) if str(item.get("url", "")).strip()]
-        context = (
-            f"MEETING_ID={meeting_id}\nTITLE={title}\nSTARTED_AT={started_at}\nENDED_AT={ended_at}\n\n"
-            "请完成逐句转写（精修）、会议纪要和 To-do-list 三个步骤，并严格遵循平台智能体配置的三个分隔区块输出格式。\n"
-        )
         if files:
-            context += "音视频文件的链接列表为：\n" + "\n".join(str(item["url"]) for item in files)
+            context = (
+                "请处理这个多语言会议录音，完成完整逐句转写（精修）、会议纪要和待办事项。\n"
+                "音视频文件的链接列表为：" + "\n".join(str(item["url"]) for item in files)
+            )
         else:
+            context = (
+                f"MEETING_ID={meeting_id}\nTITLE={title}\nSTARTED_AT={started_at}\nENDED_AT={ended_at}\n\n"
+                "请完成逐句转写（精修）、会议纪要和 To-do-list 三个步骤，并严格遵循平台智能体配置的三个分隔区块输出格式。\n"
+                "未提供公网音频链接，以下是本地实时转写上下文，请据此完成精修和整理：\n"
+            )
             source_lines = [paired_text(item) for item in (transcript or []) if item.text.strip()]
             source = "\n\n".join(source_lines)
             budget = max(
@@ -799,15 +804,17 @@ class MeetingAgent:
                 source = source[: max(0, source_limit - len(marker))] + marker
             if not source:
                 raise ValueError("没有可发送给单节点智能体的音频链接或本地转写")
-            context += "未提供公网音频链接，以下是本地实时转写上下文，请据此完成精修和整理：\n" + source
+            context += source
 
-        content: list[dict[str, Any]] = [{"type": "text", "text": context}]
+        # 与积墨网页聊天 UI 一致：文件卡片在前，文字提示在后；每次新会话。
+        content: list[dict[str, Any]] = []
         for item in files:
             file_url: dict[str, Any] = {"url": str(item["url"])}
             file_id = item.get("file_id") or item.get("fileId")
             if file_id:
                 file_url["fileId"] = str(file_id)
             content.append({"type": "file_url", "file_url": file_url})
+        content.append({"type": "text", "text": context})
 
         if on_status:
             status_result = on_status("request")
@@ -818,6 +825,6 @@ class MeetingAgent:
                 {"role": "system", "content": MEETING_AGENT_REQUEST_PROMPT},
                 {"role": "user", "content": content},
             ],
-            f"meeting:{meeting_id}:agent",
+            str(uuid.uuid4()),
         )
         return parse_meeting_agent_result(raw, meeting_id, summary_revision)

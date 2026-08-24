@@ -74,9 +74,11 @@ async def test_upload_audio_mirrors_jimo_cos_put_and_registration(settings, tmp_
     assert [request.method for request in requests] == ["GET", "GET", "PUT", "POST"]
     assert registered["url"] == result.object_url
     assert registered["name"] == "会议 录音.wav"
-    assert registered["sizeType"] == "wav"
+    assert registered["sizeType"] == "KB"
     assert registered["type"] == "wav"
-    assert registered["shareId"] == "share-123"
+    # shareId 通过 POST /v2/upload/file/share 的 URL query 参数传递，而非请求体。
+    post_request = requests[3]
+    assert post_request.url.params["shareId"] == "share-123"
     assert result.file_id == "file-1"
     assert result.url == result.object_url
     assert result.expires_at is None

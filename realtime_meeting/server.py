@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import secrets
 import shutil
 import time
@@ -10,6 +11,8 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger("realtime_meeting.server")
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
@@ -401,6 +404,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not deleted:
             raise HTTPException(status_code=404, detail="会议不存在")
+        LOGGER.info("AUDIT delete_meeting meeting_id=%s", meeting_id)
         return {"deleted": True, "meeting_id": meeting_id}
 
     @app.post("/api/v2/meetings/{meeting_id}/stream-ticket", status_code=status.HTTP_201_CREATED)
@@ -435,6 +439,11 @@ def create_app(
         audio_paths = meeting_audio_paths(meeting)
         if not audio_paths:
             raise HTTPException(status_code=409, detail="会议没有可上传的本地音频文件")
+        LOGGER.info(
+            "AUDIT upload_meeting_audio meeting_id=%s files=%d -> third_party_cos",
+            meeting_id,
+            len(audio_paths),
+        )
         try:
             async with JimoUploadClient(config) as uploader:
                 results = await uploader.upload_many(audio_paths)
@@ -450,6 +459,7 @@ def create_app(
     @app.post("/api/v2/meetings/{meeting_id}/summary", status_code=status.HTTP_202_ACCEPTED)
     async def request_summary(meeting_id: str, _principal: str = Depends(authenticate_request)) -> dict[str, str]:
         meeting = require_meeting(meeting_id)
+        LOGGER.info("AUDIT request_summary meeting_id=%s", meeting_id)
         if not await meeting.request_summary():
             raise HTTPException(status_code=409, detail="当前会议不可生成或重试会议纪要；请先等待翻译队列完成")
         return {"status": "accepted", "meeting_id": meeting_id}
