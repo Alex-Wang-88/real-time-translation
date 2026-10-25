@@ -22,3 +22,5 @@ scripts/jimo_web_upload_probe.py
 scripts/_probe_get.py
 scripts/_probe_health.py
 scripts/_probe_tr.py
+scripts/_get.txt
+scripts/_h.txt
